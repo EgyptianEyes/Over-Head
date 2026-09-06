@@ -1,0 +1,148 @@
+FlightAware AeroAPI setup for Over-Head
+=========================================
+
+FlightAware AeroAPI is optional.
+
+When configured, Over-Head uses FlightAware as the first route resolver for the
+currently displayed aircraft. Without a FlightAware key, Over-Head still runs
+and uses the free live-position-aware route fallbacks.
+
+Route resolution order
+----------------------
+1. FlightAware AeroAPI, when configured
+2. adsb.im routeset using callsign + live latitude/longitude
+3. ADSB.lol routeset using callsign + live latitude/longitude
+4. ADSB.lol route GET using callsign + live latitude/longitude
+
+ADSBDB is never used as route authority. It is used only for aircraft identity
+and registered-owner metadata.
+
+Configure an AeroAPI key
+------------------------
+Create/get an AeroAPI key from FlightAware.
+
+Configure ONE of these methods.
+
+Recommended for the current Windows PowerShell session:
+
+    $env:FLIGHTAWARE_AEROAPI_KEY="YOUR_KEY_HERE"
+    py monitor.py --open
+
+Or add this optional property to your existing config.json:
+
+    "flightaware_api_key": "YOUR_KEY_HERE"
+
+If both are present, FLIGHTAWARE_AEROAPI_KEY wins.
+
+Do not commit a real API key to GitHub. The key is used by the Python server and
+is never sent to the browser page/status payload.
+
+What happens without a FlightAware key?
+---------------------------------------
+Over-Head continues normally.
+
+It tries adsb.im first, then ADSB.lol's routeset endpoint, then the ADSB.lol
+route GET endpoint. Each free-provider result is independently validated against
+the aircraft's current ADS-B position before it is displayed.
+
+A provider's own "plausible" value is retained for diagnostics but is not the
+final authority.
+
+Route validation
+----------------
+A route is accepted only when Over-Head can resolve both airport coordinates and
+the aircraft's live position is geographically compatible with the
+origin-destination corridor.
+
+Additional protection applies below 10,000 ft: an otherwise plausible route is
+rejected when the aircraft is more than 120 NM from both route endpoints.
+
+This is intended to reject stale/reused callsign mappings while still accepting
+a current route that is consistent with the aircraft's actual position.
+
+Caching and retry behaviour
+---------------------------
+Route cache:
+
+    cache/flight-routes-v6.json
+
+The route cache is keyed by callsign + registration.
+
+Successful routes expire after 15 minutes and are revalidated against the
+aircraft's current position before reuse.
+
+A failed route lookup is retried after 30 seconds.
+
+If FlightAware returns HTTP 401, 402 or 403, AeroAPI lookups are temporarily
+disabled for one hour so an invalid, unauthorised or unsuitable key is not
+hammered repeatedly. The free route fallbacks remain available.
+
+Data roles
+----------
+- ADSB.lol: live ADS-B position/state and direct callsign lookup for TRACK mode
+- FlightAware AeroAPI: optional primary commercial-flight identity and route
+- adsb.im routeset: first free route fallback
+- ADSB.lol routeset: second free route fallback
+- ADSB.lol route GET: final free route fallback
+- OurAirports: airport coordinates and country metadata used by FlightAware routes
+- ADSBDB: aircraft identity/registered-owner metadata only, never route authority
+
+Persistent TRACK mode
+---------------------
+The radar TRACK field accepts a commercial flight number such as BA703 or an
+ICAO/ADS-B callsign such as BAW703.
+
+For two-letter commercial flight numbers, Over-Head uses its airline index to
+derive likely ICAO callsign candidates before querying the ADSB.lol callsign API.
+
+TRACK mode is separate from route resolution: it locks which aircraft is
+displayed. The route resolver then determines that aircraft's trustworthy
+origin/destination using the provider stack above.
+
+Diagnostics
+-----------
+Keep Over-Head running in one PowerShell window, then use a second PowerShell
+window.
+
+Current route decision:
+
+    Invoke-RestMethod "http://127.0.0.1:8765/route-debug" |
+        ConvertTo-Json -Depth 8
+
+The response includes the current callsign, registration, route, route source,
+aircraft position, configured FlightAware state, provider attempts, raw route
+summaries, geographic-validation values and the final resolver decision.
+
+Example raw adsb.im routeset request:
+
+    $body = @{
+        planes = @(
+            @{
+                callsign = "BAW703"
+                lat = 51.35
+                lng = -1.15
+            }
+        )
+    } | ConvertTo-Json -Depth 4
+
+    Invoke-RestMethod `
+        -Method Post `
+        -Uri "https://adsb.im/api/0/routeset" `
+        -ContentType "application/json" `
+        -Body $body |
+        ConvertTo-Json -Depth 8
+
+Example raw ADSB.lol routeset request:
+
+    Invoke-RestMethod `
+        -Method Post `
+        -Uri "https://api.adsb.lol/api/0/routeset" `
+        -ContentType "application/json" `
+        -Body $body |
+        ConvertTo-Json -Depth 8
+
+Example ADSB.lol route GET:
+
+    Invoke-RestMethod `
+        "https://api.adsb.lol/api/0/route/CALLSIGN/LATITUDE/LONGITUDE" |
+        ConvertTo-Json -Depth 8

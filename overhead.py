@@ -58,6 +58,22 @@ DEMO = {
 }
 
 
+def validate_location(latitude: Any, longitude: Any) -> tuple[float, float]:
+    """Return validated geographic coordinates or raise ValueError."""
+    if isinstance(latitude, bool) or isinstance(longitude, bool):
+        raise ValueError("Latitude and longitude must be numeric coordinates")
+    try:
+        latitude_value = float(latitude)
+        longitude_value = float(longitude)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Latitude and longitude must be numeric coordinates") from exc
+    if not math.isfinite(latitude_value) or not -90 <= latitude_value <= 90:
+        raise ValueError("Latitude must be between -90 and 90")
+    if not math.isfinite(longitude_value) or not -180 <= longitude_value <= 180:
+        raise ValueError("Longitude must be between -180 and 180")
+    return latitude_value, longitude_value
+
+
 def load_settings(path: Path, allow_missing: bool = False) -> Settings:
     """Load settings, refusing to guess a live location when config is missing."""
     if not path.exists():
@@ -68,14 +84,21 @@ def load_settings(path: Path, allow_missing: bool = False) -> Settings:
             "Live mode requires an explicit config.json with the display location."
         )
     raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("Configuration must be a JSON object")
+    if not allow_missing and ("latitude" not in raw or "longitude" not in raw):
+        raise ValueError("Live configuration requires explicit latitude and longitude values")
     allowed = Settings.__dataclass_fields__.keys()
-    return Settings(**{k: raw[k] for k in allowed if k in raw})
+    settings = Settings(**{k: raw[k] for k in allowed if k in raw})
+    settings.latitude, settings.longitude = validate_location(settings.latitude, settings.longitude)
+    return settings
 
 
 def fetch_aircraft(settings: Settings) -> list[dict[str, Any]]:
+    query_radius = min(250.0, max(1.0, float(settings.radius_nm)))
     url = (
         "https://api.adsb.lol/v2/point/"
-        f"{settings.latitude}/{settings.longitude}/{settings.radius_nm}"
+        f"{settings.latitude}/{settings.longitude}/{query_radius:g}"
     )
     request = urllib.request.Request(
         url,
