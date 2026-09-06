@@ -5,5 +5,5 @@
   "refresh_seconds": 10,
   "output_rgb": "output/frame.rgb",
   "output_png": "output/frame.png",
-  "demo_on_failure": true
+  "demo_on_failure": false
 }
