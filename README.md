@@ -300,16 +300,106 @@ until the page has received a user interaction.
 
 ## Install
 
-Python 3.10 or later is recommended.
+Python 3.10 or later is required.
 
-### Linux
+### Recommended Linux platform
+
+The reference Linux platform for Over-Head is **Ubuntu 26.04 LTS**.
+
+A clean **Ubuntu 26.04 LTS Server x86_64** installation has been tested from
+scratch on DigitalOcean with Python 3.14. The complete clone, virtual-environment
+setup, dependency installation and first-run location setup all work without
+application-specific system changes.
+
+For a physical machine connected directly to the wall display, Ubuntu 26.04 LTS
+Desktop is the more convenient choice because it already provides a graphical
+desktop and browser. For a VPS, server or other headless host, Ubuntu Server is
+appropriate.
+
+Modern Ubuntu protects the system Python environment, so Over-Head should be
+installed inside a Python virtual environment rather than installing packages
+directly into the operating system's Python installation.
+
+Install the required system packages:
+
+```bash
+sudo apt update
+sudo apt install -y git python3 python3-venv python3-pip
+```
+
+Clone Over-Head and create its virtual environment:
 
 ```bash
 git clone https://github.com/egyptianeyes/Over-Head.git
 cd Over-Head
+
+python3 -m venv .venv
+source .venv/bin/activate
+
 python3 -m pip install -r requirements.txt
+```
+
+#### Linux desktop / directly connected display
+
+On a Linux desktop with a graphical browser available:
+
+```bash
 python3 monitor.py --open
 ```
+
+Over-Head opens locally at:
+
+```text
+http://127.0.0.1:8765/
+```
+
+On the first run, if `config.json` does not exist, the browser opens the location
+setup screen. Save the home location and Over-Head will continue into the normal
+live monitor.
+
+#### Headless Linux server
+
+On a server with no local graphical browser, omit `--open`.
+
+To keep Over-Head private to the server itself:
+
+```bash
+python3 monitor.py
+```
+
+It will listen on:
+
+```text
+http://127.0.0.1:8765/
+```
+
+For administration through an SSH tunnel, leave Over-Head bound to localhost and
+forward the port from your own computer:
+
+```bash
+ssh -L 8765:127.0.0.1:8765 user@SERVER-IP
+```
+
+Then open `http://127.0.0.1:8765/` in the browser on your own computer.
+
+If Over-Head is intentionally being made available on the server's network
+interfaces, start it with:
+
+```bash
+python3 monitor.py --host 0.0.0.0
+```
+
+and browse to:
+
+```text
+http://SERVER-IP:8765/
+```
+
+The built-in HTTP server does not provide TLS or authentication, so port 8765
+should **not** be exposed directly to the public Internet. Use an SSH tunnel,
+reverse proxy or another appropriately secured access method for remote use.
+
+Press `Ctrl+C` in the terminal to stop Over-Head.
 
 ### Windows PowerShell
 
@@ -325,8 +415,10 @@ stop it.
 
 ## Configure live aircraft
 
-On first normal start, if `config.json` does not exist, use the location setup
-screen to save the home position.
+On first normal start, if `config.json` does not exist, Over-Head starts a
+temporary location-setup service instead of guessing a default position. Open
+the displayed URL, choose the home location and press **SAVE LOCATION**. The
+saved `config.json` is then used by the normal live monitor.
 
 You can also create or edit `config.json` manually:
 
@@ -353,11 +445,15 @@ commit a real API key.
 
 See `FLIGHTAWARE_SETUP.txt` for details.
 
-For a dedicated monitor, Chromium can be started in kiosk mode:
+For a dedicated Linux display machine, Chromium can be launched in kiosk mode
+after Over-Head is running:
 
 ```bash
 chromium --kiosk --noerrdialogs --disable-infobars http://127.0.0.1:8765/
 ```
+
+A headless server does not need Chromium installed unless it is also providing a
+local graphical display.
 
 ## Standalone RGB output
 
