@@ -41,12 +41,14 @@ HIGH_RES_LOGO_URL = (
     "https://raw.githubusercontent.com/sexym0nk3y/airline-logos/"
     "master/logos/{code}.png"
 )
-TWEMOJI_FLAG_URL = (
-    "https://raw.githubusercontent.com/jdecked/twemoji/"
-    "main/assets/svg/{codepoints}.svg"
+COUNTRY_FLAG_URL = (
+    "https://purecatamphetamine.github.io/country-flag-icons/"
+    "{ratio}/{code}.svg"
 )
+SQUARE_FLAG_COUNTRIES = frozenset({"CH", "VA"})
 USER_AGENT = "Over-Head/0.2 (+personal wall display)"
 MAX_LOGO_BYTES = 1_000_000
+HOUSE_GREY = "#6c9aac"
 RADAR_RANGES = (5, 10, 15, 25, 40, 60, 100)
 
 PRECISE_MODEL_NAMES = {
@@ -276,9 +278,9 @@ class LogoStore:
 
 
 class FlagStore:
-    """Retrieve country flags as safe Twemoji SVGs and cache them locally."""
+    """Retrieve standardized 3:2 country flags as safe SVGs and cache them locally."""
 
-    def __init__(self, cache_dir: Path = Path("cache/flags")) -> None:
+    def __init__(self, cache_dir: Path = Path("cache/flags-v2")) -> None:
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._missing: set[str] = set()
@@ -298,8 +300,9 @@ class FlagStore:
                 return path.read_bytes()
             except OSError:
                 pass
+            ratio = "1x1" if code in SQUARE_FLAG_COUNTRIES else "3x2"
             request = urllib.request.Request(
-                TWEMOJI_FLAG_URL.format(codepoints=self._codepoints(code)),
+                COUNTRY_FLAG_URL.format(ratio=ratio, code=code),
                 headers={"User-Agent": USER_AGENT},
             )
             try:
@@ -483,6 +486,35 @@ class FlightRouteStore:
             return route
 
 
+CONFIG_REQUIRED_PAGE = b"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Over-Head - Location Required</title>
+  <style>
+    :root { color-scheme: dark; --bg:#02050a; --line:#123846; --cyan:#14ecff; --white:#e8f6ff; --muted:#6c9aac; }
+    * { box-sizing:border-box; }
+    html,body { width:100%; height:100%; margin:0; background:var(--bg); }
+    body { display:grid; place-items:center; padding:32px; color:var(--white); font-family:"Segoe UI",Arial,sans-serif; }
+    main { width:min(900px,100%); padding:clamp(32px,6vw,72px); border:1px solid var(--line); border-radius:28px; background:rgba(0,2,7,.78); text-align:center; box-shadow:inset 0 0 60px rgba(20,236,255,.025),0 28px 80px rgba(0,0,0,.34); }
+    h1 { margin:0; color:var(--cyan); font-size:clamp(42px,7vw,92px); letter-spacing:-.055em; line-height:.95; }
+    h2 { margin:clamp(28px,4vh,48px) 0 12px; font-size:clamp(24px,3vw,40px); }
+    p { margin:0 auto; max-width:700px; color:var(--muted); font-size:clamp(16px,1.5vw,22px); line-height:1.55; }
+    code { color:var(--white); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>OVER-HEAD</h1>
+    <h2>LOCATION NOT CONFIGURED</h2>
+    <p>Live aircraft tracking is disabled until a home location has been set. No default location, live traffic, or demonstration aircraft will be shown.</p>
+  </main>
+</body>
+</html>
+"""
+
+
 PAGE = b"""<!doctype html>
 <html lang="en">
 <head>
@@ -520,12 +552,13 @@ PAGE = b"""<!doctype html>
     .flight-copy { min-width:0; }
     .callsign { overflow:visible; color:var(--white); font-size:clamp(64px,10.5vw,198px); font-weight:800; letter-spacing:-.065em; line-height:.88; white-space:nowrap; display:flex; align-items:center; gap:.12em; }
     .callsign.route-unknown { color:var(--muted); }
-    .route-airport.flag-fill { color:transparent; background-position:center; background-size:cover; background-repeat:no-repeat; background-clip:text; -webkit-background-clip:text; -webkit-text-fill-color:transparent; filter:drop-shadow(0 0 8px rgba(108,154,172,.16)); }
+    .route-airport { width:1.32em; height:.88em; flex:0 0 1.32em; min-width:1.32em; min-height:.88em; max-width:1.32em; max-height:.88em; overflow:visible; filter:drop-shadow(0 0 8px rgba(108,154,172,.16)); }
+    .route-airport-outline { fill:none; stroke:#6c9aac; stroke-width:2.1; stroke-linejoin:round; paint-order:stroke; vector-effect:non-scaling-stroke; }
     .route-join { color:var(--muted); font-size:.45em; font-weight:650; letter-spacing:0; }
     .identity { margin-top:clamp(18px,2.2vh,34px); min-width:0; display:flex; flex-direction:column; gap:.24em; }
     .registration { color:var(--muted); font-size:clamp(22px,2.5vw,44px); font-weight:700; letter-spacing:.1em; }
     .aircraft-name { color:var(--white); font-size:clamp(17px,1.55vw,28px); font-weight:650; letter-spacing:.065em; }
-    .logo-box { width:clamp(190px,17vw,330px); height:clamp(100px,14vh,180px); display:grid; place-items:center; overflow:visible; transition:width .2s ease,height .2s ease; }
+    .logo-box { width:clamp(190px,17vw,330px); height:clamp(100px,14vh,180px); display:grid; place-items:center; overflow:visible; margin-right:clamp(40px,3.2vw,68px); transition:width .2s ease,height .2s ease; }
     .logo-box.wide { width:clamp(240px,19vw,370px); height:clamp(80px,10vh,125px); }
     .logo-box.square { width:clamp(110px,10vw,180px); height:clamp(110px,12vh,180px); }
     .logo-box.tall { width:clamp(100px,9vw,160px); height:clamp(125px,16vh,205px); }
@@ -607,14 +640,56 @@ PAGE = b"""<!doctype html>
     const number=(value,digits=0)=>value==null?'--':Number(value).toFixed(digits);
     const altitude=value=>typeof value==='number'?Math.round(value).toLocaleString()+' FT':String(value||'--').toUpperCase();
     function vertical(value){ if(typeof value!=='number')return 'LEVEL'; if(value>150)return '\\u2191 '+Math.abs(Math.round(value)).toLocaleString(); if(value<-150)return '\\u2193 '+Math.abs(Math.round(value)).toLocaleString(); return 'LEVEL'; }
+    function normaliseAirportHeights(heading){
+      const airports=[...heading.querySelectorAll('.route-airport')];
+      if(airports.length!==2)return;
+      const maskTexts=airports.map(svg=>svg.querySelector('.route-airport-text'));
+      if(maskTexts.some(text=>!text))return;
+      for(const text of maskTexts)text.removeAttribute('transform');
+      const boxes=maskTexts.map(text=>text.getBBox());
+      const targetHeight=Math.max(...boxes.map(box=>box.height));
+      if(!Number.isFinite(targetHeight)||targetHeight<=0)return;
+      airports.forEach((svg,index)=>{
+        const box=boxes[index];
+        if(!box.height)return;
+        const scaleY=targetHeight/box.height;
+        const centreY=box.y+box.height/2;
+        const transform='translate(0 '+centreY+') scale(1 '+scaleY+') translate(0 '+(-centreY)+')';
+        maskTexts[index].setAttribute('transform',transform);
+        const outline=svg.querySelector('.route-airport-outline');
+        if(outline)outline.setAttribute('transform',transform);
+      });
+    }
     function renderHeading(d,hasAircraft){
       const heading=byId('callsign'); heading.replaceChildren(); const routeKnown=Boolean(d.route); heading.classList.toggle('route-unknown',hasAircraft&&!routeKnown);
       if(!hasAircraft){ heading.textContent='-'; return; }
       if(!routeKnown){ heading.textContent='N/A to N/A'; return; }
-      const airport=(side,code,available,revision)=>{ const element=document.createElement('span'); element.className='route-airport'+(available?' flag-fill':''); element.textContent=code; if(available)element.style.backgroundImage='url(/'+side+'-flag?v='+encodeURIComponent(revision||'')+')'; heading.appendChild(element); };
-      airport('origin',d.origin,d.origin_flag_available,d.origin_flag_revision);
+      const airport=(side,code,country,available,revision)=>{
+        const svg=document.createElementNS(svgNS,'svg'); svg.setAttribute('class','route-airport'); svg.setAttribute('viewBox','0 0 150 100'); svg.setAttribute('role','img'); svg.setAttribute('aria-label',String(code||''));
+        const makeText=className=>{ const element=document.createElementNS(svgNS,'text'); element.setAttribute('class',className); element.setAttribute('x','75'); element.setAttribute('y','90'); element.setAttribute('text-anchor','middle'); element.setAttribute('font-family','Segoe UI,Arial,sans-serif'); element.setAttribute('font-size','112'); element.setAttribute('font-weight','800'); element.setAttribute('letter-spacing','-4'); element.setAttribute('textLength','144'); element.setAttribute('lengthAdjust','spacingAndGlyphs'); element.textContent=String(code||''); return element; };
+        const text=makeText('route-airport-text');
+        if(available){
+          const maskId='route-mask-'+side+'-'+String(revision||'').replace(/[^A-Za-z0-9_-]/g,'');
+          const defs=document.createElementNS(svgNS,'defs'),mask=document.createElementNS(svgNS,'mask'); mask.setAttribute('id',maskId); mask.setAttribute('maskUnits','userSpaceOnUse'); mask.setAttribute('x','0'); mask.setAttribute('y','0'); mask.setAttribute('width','150'); mask.setAttribute('height','100'); text.setAttribute('fill','white'); mask.appendChild(text); defs.appendChild(mask); svg.appendChild(defs);
+          const href='/'+side+'-flag?v='+encodeURIComponent(revision||'');
+          const squareFlag=country==='CH'||country==='VA';
+          if(squareFlag){
+            const underlay=document.createElementNS(svgNS,'image'); underlay.setAttribute('href',href); underlay.setAttribute('x','0'); underlay.setAttribute('y','0'); underlay.setAttribute('width','150'); underlay.setAttribute('height','100'); underlay.setAttribute('preserveAspectRatio','none'); underlay.setAttribute('mask','url(#'+maskId+')'); svg.appendChild(underlay);
+            const image=document.createElementNS(svgNS,'image'); image.setAttribute('href',href); image.setAttribute('x','25'); image.setAttribute('y','0'); image.setAttribute('width','100'); image.setAttribute('height','100'); image.setAttribute('preserveAspectRatio','xMidYMid meet'); image.setAttribute('mask','url(#'+maskId+')'); svg.appendChild(image);
+          }else{
+            const image=document.createElementNS(svgNS,'image'); image.setAttribute('href',href); image.setAttribute('x','0'); image.setAttribute('y','0'); image.setAttribute('width','150'); image.setAttribute('height','100'); image.setAttribute('preserveAspectRatio','none'); image.setAttribute('mask','url(#'+maskId+')'); svg.appendChild(image);
+          }
+          const outline=makeText('route-airport-outline'); svg.appendChild(outline);
+        }else{
+          text.setAttribute('fill','currentColor'); svg.appendChild(text);
+          const outline=makeText('route-airport-outline'); svg.appendChild(outline);
+        }
+        heading.appendChild(svg);
+      };
+      airport('origin',d.origin,d.origin_country,d.origin_flag_available,d.origin_flag_revision);
       const join=document.createElement('span'); join.className='route-join'; join.textContent='to'; heading.appendChild(join);
-      airport('destination',d.destination,d.destination_flag_available,d.destination_flag_revision);
+      airport('destination',d.destination,d.destination_country,d.destination_flag_available,d.destination_flag_revision);
+      normaliseAirportHeights(heading);
     }
     function updateSoundButton(){ const button=byId('sound-toggle'); button.classList.toggle('muted',!soundEnabled); button.classList.toggle('blocked',audioBlocked&&soundEnabled); button.setAttribute('aria-pressed',String(soundEnabled)); button.setAttribute('aria-label',!soundEnabled?'Enable aircraft change sound':audioBlocked?'Enable aircraft sound':'Mute aircraft change sound'); }
     async function playTone(){ if(!soundEnabled)return; const tone=byId('alert-tone'); try{ tone.currentTime=0; await tone.play(); audioBlocked=false; }catch(_){ audioBlocked=true; } updateSoundButton(); }
@@ -691,6 +766,7 @@ class FrameState:
             "callsign": str(plane.get("flight") or "").strip(),
             "route": route.get("route", ""),
             "origin": route.get("origin", ""), "destination": route.get("destination", ""),
+            "origin_country": route.get("origin_country", ""), "destination_country": route.get("destination_country", ""),
             "origin_flag_available": bool(origin_flag), "destination_flag_available": bool(destination_flag),
             "origin_flag_revision": hashlib.sha256(origin_flag).hexdigest()[:12] if origin_flag else "",
             "destination_flag_revision": hashlib.sha256(destination_flag).hexdigest()[:12] if destination_flag else "",
@@ -752,6 +828,32 @@ def refresh_loop(state: FrameState, settings, demo: bool, logos: LogoStore, iden
                 state.payload["error"] = type(exc).__name__
 
 
+def configuration_required_handler():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if urlsplit(self.path).path == "/":
+                body = CONFIG_REQUIRED_PAGE
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                body = b"Location not configured"
+                self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, fmt, *args) -> None:
+            return
+
+    return Handler
+
+
 def handler_factory(state: FrameState, settings, refresh_event: threading.Event, tone_path: Path):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -805,15 +907,45 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config.json"); parser.add_argument("--host", default="127.0.0.1"); parser.add_argument("--port", type=int, default=8765); parser.add_argument("--demo", action="store_true"); parser.add_argument("--open", action="store_true", dest="open_browser")
-    args = parser.parse_args(); settings = load_settings(Path(args.config)); state = FrameState(); logos = LogoStore(); identities = AircraftIdentityStore(); routes = FlightRouteStore(); flags = FlagStore(); refresh_event = threading.Event(); update_state(state, settings, args.demo, logos, identities, routes, flags)
+    args = parser.parse_args()
+    config_path = Path(args.config)
+    url = f"http://{args.host}:{args.port}/"
+
+    if not args.demo and not config_path.exists():
+        server = ThreadingHTTPServer((args.host, args.port), configuration_required_handler())
+        print(f"Over-Head monitor running at {url}")
+        print(f"Location not configured: {config_path}")
+        if args.open_browser:
+            webbrowser.open(url)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.server_close()
+        return 0
+
+    settings = load_settings(config_path, allow_missing=args.demo)
+    state = FrameState()
+    logos = LogoStore()
+    identities = AircraftIdentityStore()
+    routes = FlightRouteStore()
+    flags = FlagStore()
+    refresh_event = threading.Event()
+    update_state(state, settings, args.demo, logos, identities, routes, flags)
     threading.Thread(target=refresh_loop, args=(state, settings, args.demo, logos, identities, routes, flags, refresh_event), daemon=True).start()
     tone_path = Path(__file__).resolve().with_name("beep-tone.mp3")
-    server = ThreadingHTTPServer((args.host, args.port), handler_factory(state, settings, refresh_event, tone_path)); url = f"http://{args.host}:{args.port}/"
-    print(f"Over-Head monitor running at {url}"); print("Double-click the display to enter browser full-screen mode.")
-    if args.open_browser: webbrowser.open(url)
-    try: server.serve_forever()
-    except KeyboardInterrupt: pass
-    finally: server.server_close()
+    server = ThreadingHTTPServer((args.host, args.port), handler_factory(state, settings, refresh_event, tone_path))
+    print(f"Over-Head monitor running at {url}")
+    print("Double-click the display to enter browser full-screen mode.")
+    if args.open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
     return 0
 
 

@@ -41,9 +41,10 @@ the IATA airport pair, such as `LHR to LAX`, and the flight number moves to the
 identity line beside the registration. Routes are cached for six hours in
 `cache/flight-routes.json`. When no verified route is available, the heading
 shows a muted `N/A to N/A` placeholder and the flight number or registration
-stays on the identity line below. Known routes use the cached Twemoji SVG flags
-as the colour fill inside each airport code, with a muted lowercase `to` between
-them. Neither ADSB.lol nor ADSBDB supplies trustworthy
+stays on the identity line below. Known routes use cached vector country flags as the colour fill inside each airport
+code, with a muted lowercase `to` between them. Airport letters receive a subtle
+Over-Head house-grey outline for contrast. Switzerland and Vatican City retain
+their official square flag proportions inside the standard route-code width. Neither ADSB.lol nor ADSBDB supplies trustworthy
 departure, arrival, or remaining-flight times, so Over-Head does not invent or
 estimate them. If no airline artwork is available, the logo area remains empty.
 
@@ -178,10 +179,9 @@ Over-Head's MIT licence.
 Over-Head is an independent project and is not affiliated with or endorsed by
 TheFlightWall, ADSB.lol, ADSBDB, Soaring Symbols, Jxck-S, or any airline.
 
-Country flag artwork is provided by the maintained
-[Twemoji](https://github.com/jdecked/twemoji) project under the
-[CC-BY 4.0 licence](https://creativecommons.org/licenses/by/4.0/) and cached
-locally after first use.
+Country flag artwork is provided by the MIT-licensed
+[country-flag-icons](https://github.com/catamphetamine/country-flag-icons) project
+and cached locally after first use.
 
 ### Sound effect
 

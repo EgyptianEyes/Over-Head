@@ -58,9 +58,15 @@ DEMO = {
 }
 
 
-def load_settings(path: Path) -> Settings:
+def load_settings(path: Path, allow_missing: bool = False) -> Settings:
+    """Load settings, refusing to guess a live location when config is missing."""
     if not path.exists():
-        return Settings()
+        if allow_missing:
+            return Settings()
+        raise FileNotFoundError(
+            f"Configuration file not found: {path}. "
+            "Live mode requires an explicit config.json with the display location."
+        )
     raw = json.loads(path.read_text(encoding="utf-8"))
     allowed = Settings.__dataclass_fields__.keys()
     return Settings(**{k: raw[k] for k in allowed if k in raw})
@@ -197,16 +203,10 @@ def fetch_snapshot(
 def fetch_traffic_snapshot(
     settings: Settings, demo: bool = False
 ) -> tuple[list[dict[str, Any]], str]:
-    """Return the full nearby traffic list and its live/demo status."""
-    status = "demo" if demo else "live"
-    try:
-        aircraft = DEMO["ac"] if demo else fetch_aircraft(settings)
-    except (OSError, ValueError, urllib.error.URLError, TimeoutError):
-        if not settings.demo_on_failure:
-            raise
-        aircraft = DEMO["ac"]
-        status = "demo"
-    return aircraft, status
+    """Return live traffic, or bundled sample traffic only when demo is explicit."""
+    if demo:
+        return DEMO["ac"], "demo"
+    return fetch_aircraft(settings), "live"
 
 
 def produce_frame(settings: Settings, demo: bool = False) -> tuple[Image.Image, str]:
@@ -222,7 +222,7 @@ def main() -> int:
     parser.add_argument("--demo", action="store_true", help="render bundled sample aircraft")
     parser.add_argument("--watch", action="store_true", help="refresh continuously")
     args = parser.parse_args()
-    settings = load_settings(Path(args.config))
+    settings = load_settings(Path(args.config), allow_missing=args.demo)
     while True:
         _, status = produce_frame(settings, demo=args.demo)
         print(f"Rendered {status} frame to {settings.output_rgb} and {settings.output_png}")

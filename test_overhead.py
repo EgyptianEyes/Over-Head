@@ -122,10 +122,14 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn(b"route-unknown", PAGE)
 
     def test_route_flags_fill_airport_letters(self):
-        self.assertIn(b"background-clip:text", PAGE)
+        self.assertIn(b"viewBox','0 0 150 100", PAGE)
+        self.assertIn(b"textLength','144", PAGE)
+        self.assertIn(b"lengthAdjust','spacingAndGlyphs", PAGE)
+        self.assertIn(b"route-mask-", PAGE)
+        self.assertIn(b"preserveAspectRatio','none", PAGE)
         self.assertIn(b"airport('origin'", PAGE)
         self.assertIn(b"airport('destination'", PAGE)
-        self.assertNotIn(b"addFlag(", PAGE)
+        self.assertNotIn(b"route-letter", PAGE)
         self.assertEqual(FlagStore._codepoints("GB"), "1f1ec-1f1e7")
 
     def test_radar_centres_aircraft_at_home(self):
@@ -138,6 +142,70 @@ class OverHeadTests(unittest.TestCase):
     def test_radar_ranges_are_ordered_and_include_default(self):
         self.assertEqual(tuple(sorted(RADAR_RANGES)), RADAR_RANGES)
         self.assertIn(25, RADAR_RANGES)
+
+    def test_live_mode_requires_explicit_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "config.json"
+            with self.assertRaises(FileNotFoundError):
+                from overhead import load_settings
+                load_settings(missing)
+
+    def test_explicit_demo_may_run_without_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "config.json"
+            from overhead import load_settings
+            settings = load_settings(missing, allow_missing=True)
+            self.assertIsInstance(settings, Settings)
+
+    def test_live_fetch_never_falls_back_to_demo(self):
+        settings = Settings(demo_on_failure=True)
+        from overhead import fetch_traffic_snapshot
+        with patch("overhead.fetch_aircraft", side_effect=OSError("offline")):
+            with self.assertRaises(OSError):
+                fetch_traffic_snapshot(settings, demo=False)
+
+    def test_demo_data_requires_explicit_demo_flag(self):
+        settings = Settings()
+        from overhead import fetch_traffic_snapshot
+        aircraft, status = fetch_traffic_snapshot(settings, demo=True)
+        self.assertEqual(status, "demo")
+        self.assertEqual(aircraft, DEMO["ac"])
+
+    def test_monitor_has_clean_configuration_required_state(self):
+        from monitor import CONFIG_REQUIRED_PAGE
+        self.assertIn(b"LOCATION NOT CONFIGURED", CONFIG_REQUIRED_PAGE)
+        self.assertIn(b"No default location", CONFIG_REQUIRED_PAGE)
+        self.assertNotIn(b"51.5074", CONFIG_REQUIRED_PAGE)
+        self.assertNotIn(b"BAW283", CONFIG_REQUIRED_PAGE)
+
+    def test_route_airports_are_fixed_to_identical_flag_proportions(self):
+        self.assertIn(b"min-width:1.32em", PAGE)
+        self.assertIn(b"max-width:1.32em", PAGE)
+        self.assertIn(b"min-height:.88em", PAGE)
+        self.assertIn(b"max-height:.88em", PAGE)
+
+    def test_route_airport_visible_heights_are_normalised(self):
+        self.assertIn(b"route-airport-text", PAGE)
+        self.assertIn(b"normaliseAirportHeights", PAGE)
+        self.assertIn(b"Math.max(...boxes.map(box=>box.height))", PAGE)
+        self.assertIn(b"scale(1 '+scaleY+')", PAGE)
+
+    def test_only_square_national_flags_use_square_source_artwork(self):
+        from monitor import SQUARE_FLAG_COUNTRIES
+        self.assertEqual(SQUARE_FLAG_COUNTRIES, frozenset({"CH", "VA"}))
+        self.assertIn(b"country==='CH'||country==='VA'", PAGE)
+        self.assertIn(b"image.setAttribute('x','25')", PAGE)
+        self.assertIn(b"image.setAttribute('width','100')", PAGE)
+
+    def test_square_flags_extend_edge_colours_to_standard_route_width(self):
+        self.assertIn(b"underlay.setAttribute('width','150')", PAGE)
+        self.assertIn(b"underlay.setAttribute('preserveAspectRatio','none')", PAGE)
+        self.assertIn(b"image.setAttribute('preserveAspectRatio','xMidYMid meet')", PAGE)
+
+    def test_airport_letters_have_house_grey_outline_and_preserve_flag_black(self):
+        self.assertIn(b"route-airport-outline", PAGE)
+        self.assertIn(b"stroke:#6c9aac", PAGE)
+        self.assertNotIn(b"recolour_flag_black", PAGE)
 
 
 if __name__ == "__main__":
