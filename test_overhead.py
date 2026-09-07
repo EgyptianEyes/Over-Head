@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from monitor import AircraftIdentityStore, AirportStore, CONFIG_REQUIRED_PAGE, FlagStore, FlightRouteStore, FlightTrackingState, FrameState, LogoStore, PAGE, RADAR_RANGES, TRACK_RADAR_RANGES, aircraft_identity, aircraft_name, automatic_tracking_radius, flight_details, merge_tracked_aircraft, normalise_flight_query, operator_code, overhead_logo_asset, radar_contacts, safe_svg, save_location_config, tracking_distance_nm, update_live_location_config, update_state, flightaware_api_key
+from monitor import APIHealthMonitor, AircraftIdentityStore, AirportStore, CONFIG_REQUIRED_PAGE, FlagStore, FlightRouteStore, FlightTrackingState, FrameState, LogoStore, PAGE, RADAR_RANGES, TRACK_RADAR_RANGES, aircraft_identity, aircraft_name, automatic_tracking_radius, flight_details, merge_tracked_aircraft, normalise_flight_query, operator_code, overhead_logo_asset, radar_contacts, safe_svg, save_location_config, tracking_distance_nm, update_live_location_config, update_state, flightaware_api_key
 from overhead import DEMO, HEIGHT, WIDTH, Settings, load_settings, produce_frame, select_nearest
 
 
@@ -314,12 +314,16 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn(b".callsign.route-known { font-size:clamp(64px,7.2vw,138px)", PAGE)
         self.assertIn(b"heading.classList.toggle('route-known',hasAircraft&&routeKnown)", PAGE)
 
-    def test_radar_defaults_open_with_fresh_preference_key(self):
+    def test_desktop_radar_still_defaults_open_while_mobile_defaults_to_flight(self):
         self.assertIn(b"overhead-radar-v2", PAGE)
-        self.assertIn(b"setRadar(localStorage.getItem('overhead-radar-v2')!=='closed')", PAGE)
+        self.assertIn(b"overhead-mobile-radar-v1", PAGE)
+        self.assertIn(
+            b"setRadar(isMobileViewport()?initialRadarPreference==='open':initialRadarPreference!=='closed');",
+            PAGE,
+        )
 
     def test_ui_revision_identifies_header_logo_map_layout(self):
-        self.assertIn(b'overhead-ui-revision" content="persistent-flight-tracking-v46"', PAGE)
+        self.assertIn(b'overhead-ui-revision" content="mobile-footer-three-lines-v52"', PAGE)
         self.assertIn(b'<div class="brand"><img class="brand-logo" id="brand-logo" alt="Over-Head"></div>', PAGE)
         self.assertIn(b'class="route-brand-logo" id="operator-logo"', PAGE)
         self.assertNotIn(b'id="logo-box"', PAGE)
@@ -688,7 +692,7 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn(b">FlightAware<", PAGE)
         self.assertIn(b">OpenStreetMap<", PAGE)
         self.assertIn(b">TheFlightWall<", PAGE)
-        self.assertIn(b"For Sam &#x1F9E1;", PAGE)
+        self.assertIn(b'For Sam <span class="api-heart api-unhealthy" id="api-heart"', PAGE)
         self.assertIn(b">Connecting<", PAGE)
         self.assertIn(b"'Updated '+d.updated", PAGE)
 
@@ -696,7 +700,7 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn(b"let radarWasOpenBeforeSettings=false", PAGE)
         self.assertIn(b"radarWasOpenBeforeSettings=wall.classList.contains('radar-open')", PAGE)
         self.assertIn(b"wall.classList.toggle('radar-open',radarWasOpenBeforeSettings)", PAGE)
-        self.assertIn(b"localStorage.setItem('overhead-radar-v2',radarWasOpenBeforeSettings?'open':'closed')", PAGE)
+        self.assertIn(b"localStorage.setItem(radarPreferenceKey(),radarWasOpenBeforeSettings?'open':'closed')", PAGE)
 
     def test_escape_closes_settings_and_restores_previous_panel(self):
         self.assertIn(b"else if(byId('wall').classList.contains('settings-open'))setSettings(false)", PAGE)
@@ -902,7 +906,7 @@ class OverHeadTests(unittest.TestCase):
         )
 
     def test_expansive_footer_and_sam_dedication(self):
-        self.assertIn(b"For Sam &#x1F9E1;", PAGE)
+        self.assertIn(b'For Sam <span class="api-heart api-unhealthy" id="api-heart"', PAGE)
         self.assertIn(b"Data: ", PAGE)
         self.assertIn(b">ADSB.lol<", PAGE)
         self.assertIn(b">ADSBDB<", PAGE)
@@ -923,19 +927,25 @@ class OverHeadTests(unittest.TestCase):
 
     def test_for_sam_is_first_footer_credit(self):
         footer_start = PAGE.index(b'<footer><span class="footer-credits">')
-        self.assertEqual(
-            PAGE[footer_start:footer_start + len(b'<footer><span class="footer-credits">For Sam &#x1F9E1;')],
-            b'<footer><span class="footer-credits">For Sam &#x1F9E1;'
+        self.assertTrue(
+            PAGE[footer_start:].startswith(
+                b'<footer><span class="footer-credits"><span class="footer-credit-line footer-credit-line-1">For Sam <span class="api-heart'
+            )
         )
 
     def test_for_sam_has_no_separator_after_heart(self):
-        self.assertIn(b"For Sam &#x1F9E1;&nbsp;&nbsp;&nbsp;&nbsp;Data:", PAGE)
-        self.assertNotIn(b"For Sam &#x1F9E1;&nbsp;&nbsp;/&nbsp;&nbsp;Data:", PAGE)
+        footer = PAGE[PAGE.index(b'<footer><span class="footer-credits">'):]
+        heart_end = footer.index(b'</span>&nbsp;&nbsp;&nbsp;&nbsp;Data:')
+        self.assertGreater(heart_end, 0)
+        self.assertNotIn(b'</span>&nbsp;&nbsp;/&nbsp;&nbsp;Data:', footer)
 
     def test_for_sam_stays_first_with_expanded_credits(self):
         footer = PAGE[PAGE.index(b'<footer><span class="footer-credits">'):]
-        self.assertTrue(footer.startswith(b'<footer><span class="footer-credits">For Sam &#x1F9E1;&nbsp;&nbsp;&nbsp;&nbsp;Data:'))
-        self.assertNotIn(b"For Sam &#x1F9E1;&nbsp;&nbsp;/", PAGE)
+        self.assertTrue(footer.startswith(
+            b'<footer><span class="footer-credits"><span class="footer-credit-line footer-credit-line-1">For Sam '
+        ))
+        self.assertIn(b'&nbsp;&nbsp;&nbsp;&nbsp;Data:', footer)
+        self.assertNotIn(b'&nbsp;&nbsp;/&nbsp;&nbsp;Data:', footer)
 
     def test_browser_title_keeps_over_head_brand_and_plane_first(self):
         self.assertIn(b"<title>Over-Head &#x2708;&#xFE0F;</title>", PAGE)
@@ -1191,6 +1201,216 @@ class OverHeadTests(unittest.TestCase):
             "BAW": {"name": "British Airways", "iata": "BA", "icao": "BAW", "slug": "british-airways"},
         }
         self.assertEqual(store.tracking_callsigns("BAW703"), ("BAW703",))
+
+    def test_mobile_layout_is_scoped_to_phone_viewports_only(self):
+        self.assertIn(
+            b"@media (max-width:700px), (max-width:950px) and (max-height:500px) {",
+            PAGE,
+        )
+        self.assertIn(b"height:100dvh;", PAGE)
+        self.assertIn(b"overflow:hidden;", PAGE)
+
+    def test_mobile_radar_replaces_flight_panel_instead_of_sitting_beside_it(self):
+        self.assertIn(b".wall.radar-open main,", PAGE)
+        self.assertIn(b".wall.settings-open main { display:none; }", PAGE)
+        self.assertIn(b".wall.radar-open .radar-panel,", PAGE)
+        self.assertIn(b"width:100%;", PAGE)
+        self.assertIn(b"grid-template-columns:minmax(0,1fr);", PAGE)
+
+    def test_mobile_main_view_compacts_route_map_and_metrics_without_scrolling(self):
+        self.assertIn(b"grid-template-rows:minmax(0,1fr) auto;", PAGE)
+        self.assertIn(b"grid-template-columns:repeat(2,minmax(0,1fr));", PAGE)
+        self.assertIn(b"height:calc(100% - 31px);", PAGE)
+        self.assertIn(b".footer-credits {", PAGE)
+        mobile = PAGE.split(b"/* Mobile is a single-view application", 1)[1]
+        self.assertNotIn(b"text-overflow:ellipsis;", mobile.split(b".location-backdrop", 1)[0])
+
+    def test_mobile_radar_toggle_is_flight_switch_and_has_separate_preference(self):
+        self.assertIn(
+            b"const radarPreferenceKey=()=>isMobileViewport()?'overhead-mobile-radar-v1':'overhead-radar-v2';",
+            PAGE,
+        )
+        self.assertIn(
+            b"radarButton.textContent=radarOpen&&!settingsOpen?(isMobileViewport()?'FLIGHT':'HIDE RADAR'):'RADAR';",
+            PAGE,
+        )
+        self.assertIn(
+            b"setRadar(isMobileViewport()?initialRadarPreference==='open':initialRadarPreference!=='closed');",
+            PAGE,
+        )
+
+    def test_mobile_track_returns_to_flight_view_without_cancelling_track(self):
+        self.assertIn(b"if(isMobileViewport()&&data.tracking)setRadar(false);", PAGE)
+        self.assertIn(b"tracker.start(query, candidates)", Path(__file__).with_name("monitor.py").read_bytes())
+
+    def test_desktop_radar_geometry_rules_are_still_present_unchanged(self):
+        self.assertIn(
+            b".wall.radar-open .route-map { width:clamp(567.6px,38.28vw,739.2px); height:clamp(277.2px,33vh,376.2px); }",
+            PAGE,
+        )
+        self.assertIn(
+            b".wall:not(.radar-open):not(.settings-open) .route-map { top:clamp(77.25px,8.78vh,84.27px); left:auto; right:0; transform:none; width:clamp(900px,64vw,1220px); height:clamp(316.8px,38.28vh,415.8px); border-radius:0; }",
+            PAGE,
+        )
+        self.assertIn(
+            b".wall:not(.radar-open):not(.settings-open) .header-tools { transform:translateY(clamp(-38px,-3.55vh,-27px)); }",
+            PAGE,
+        )
+
+    def test_mobile_flight_information_fills_entire_main_panel(self):
+        self.assertIn(b"main {\n        position:relative;", PAGE)
+        self.assertIn(b"width:100%;\n        height:100%;", PAGE)
+        self.assertIn(b".information {\n        position:absolute;\n        inset:0;", PAGE)
+        self.assertIn(b"width:100%;\n        height:100%;", PAGE)
+
+    def test_mobile_route_and_metrics_explicitly_use_full_width(self):
+        self.assertIn(b".flight-heading {\n        width:100%;", PAGE)
+        self.assertIn(b"width:100%;\n        max-width:none;", PAGE)
+        self.assertIn(
+            b".wall.settings-open .metrics {\n        width:100%;",
+            PAGE,
+        )
+        self.assertIn(b".metric { width:100%; min-width:0; padding-top:5px; }", PAGE)
+
+    def test_desktop_layout_remains_outside_mobile_fill_fix(self):
+        # Original desktop rules are still byte-for-byte present.
+        self.assertIn(
+            b"main { position:relative; min-height:0; border:1px solid var(--line); border-radius:clamp(16px,2vw,32px); background:rgba(0,2,7,.72); display:grid; grid-template-columns:1fr; overflow:visible;",
+            PAGE,
+        )
+        self.assertIn(
+            b".information { min-width:0; padding:clamp(26px,4vw,76px); display:flex; flex-direction:column; justify-content:space-between; }",
+            PAGE,
+        )
+
+    def test_mobile_information_grid_has_explicit_full_width_column(self):
+        self.assertIn(
+            b".information {\n        position:absolute;\n        inset:0;",
+            PAGE,
+        )
+        self.assertIn(
+            b"display:grid;\n        grid-template-columns:minmax(0,1fr);\n        grid-template-rows:minmax(0,1fr) auto;",
+            PAGE,
+        )
+
+    def test_mobile_footer_uses_three_explicit_credit_lines_without_truncation(self):
+        self.assertEqual(PAGE.count(b'class="footer-credit-line footer-credit-line-'), 3)
+        self.assertIn(b"grid-template-rows:34px minmax(0,1fr) 34px;", PAGE)
+        mobile = PAGE.split(b"/* Mobile is a single-view application", 1)[1]
+        self.assertIn(b"grid-template-rows:repeat(3,minmax(0,1fr));", mobile)
+        self.assertIn(b"font-size:clamp(6.2px,1.85vw,7.5px);", mobile)
+        self.assertIn(b".footer-credit-line-1 { grid-column:1 / -1; grid-row:1; }", mobile)
+        self.assertIn(b".footer-credit-line-2 { grid-column:1 / -1; grid-row:2; }", mobile)
+        self.assertIn(b".footer-credit-line-3 { grid-column:1; grid-row:3; }", mobile)
+        self.assertIn(b"overflow:visible;", mobile)
+        self.assertNotIn(b"text-overflow:ellipsis;", mobile.split(b".location-backdrop", 1)[0])
+
+    def test_footer_heart_has_health_states_and_pulse_animation(self):
+        self.assertIn(b'id="api-heart"', PAGE)
+        self.assertIn(b".api-heart.api-unhealthy", PAGE)
+        self.assertIn(b".api-heart.api-pulse { animation:api-heart-pulse 1.45s ease-out 1; }", PAGE)
+        self.assertIn(b"@keyframes api-heart-pulse", PAGE)
+        self.assertIn(b"function syncApiHeartbeat(d)", PAGE)
+        self.assertIn(b"if(healthy){", PAGE)
+
+    def test_api_health_monitor_checks_four_public_services(self):
+        monitor = APIHealthMonitor(Settings(latitude=51.5, longitude=-3.3))
+        with patch.object(monitor, "_probe_adsblol", return_value=True), \
+             patch.object(monitor, "_probe_adsbim", return_value=True), \
+             patch.object(monitor, "_probe_adsbdb", return_value=True), \
+             patch.object(monitor, "_probe_ourairports", return_value=True):
+            snapshot = monitor.check()
+        self.assertTrue(snapshot["ok"])
+        self.assertEqual(
+            snapshot["services"],
+            {"ADSB.lol": True, "adsb.im": True, "ADSBDB": True, "OurAirports": True},
+        )
+
+    def test_api_health_goes_unhealthy_if_any_core_service_fails(self):
+        monitor = APIHealthMonitor(Settings(latitude=51.5, longitude=-3.3))
+        with patch.object(monitor, "_probe_adsblol", return_value=True), \
+             patch.object(monitor, "_probe_adsbim", return_value=False), \
+             patch.object(monitor, "_probe_adsbdb", return_value=True), \
+             patch.object(monitor, "_probe_ourairports", return_value=True):
+            snapshot = monitor.check()
+        self.assertFalse(snapshot["ok"])
+        self.assertFalse(snapshot["services"]["adsb.im"])
+
+    def test_api_health_interval_is_thirty_seconds_and_flightaware_is_not_synthetically_probed(self):
+        source = Path(__file__).with_name("monitor.py").read_text(encoding="utf-8")
+        self.assertIn("API_HEALTH_INTERVAL_SECONDS = 30", source)
+        health_class = source.split("class APIHealthMonitor:", 1)[1].split("class LogoStore:", 1)[0]
+        self.assertNotIn("FLIGHTAWARE_AEROAPI_URL", health_class)
+        self.assertIn("time.sleep(API_HEALTH_INTERVAL_SECONDS)", source)
+
+    def test_status_payload_exposes_api_health_to_browser(self):
+        source = Path(__file__).with_name("monitor.py").read_text(encoding="utf-8")
+        self.assertIn('"api_health_ok": bool(api_health.get("ok"))', source)
+        self.assertIn('"api_health_checked_at": int(api_health.get("checked_at") or 0)', source)
+        self.assertIn('"api_health_services": dict(api_health.get("services") or {})', source)
+
+    def test_readme_documents_mobile_single_view_and_api_heartbeat(self):
+        readme = Path(__file__).with_name("README.md").read_text(encoding="utf-8")
+        self.assertIn("## Mobile view", readme)
+        self.assertIn("single non-scrolling screen", readme)
+        self.assertIn("Radar", readme)
+        self.assertIn("core API heartbeat", readme)
+        self.assertIn("Every 30 seconds", readme)
+        self.assertIn("FlightAware AeroAPI is deliberately not synthetically probed", readme)
+
+    def test_mobile_identity_is_large_centered_and_prominent(self):
+        mobile = PAGE.split(b"/* Mobile is a single-view application", 1)[1]
+        self.assertIn(b".flight-copy {", mobile)
+        self.assertIn(b"align-items:center;", mobile)
+        self.assertIn(b"text-align:center;", mobile)
+        self.assertIn(b"justify-content:center;", mobile)
+        self.assertIn(b"font-size:clamp(45px,14.4vw,62px);", mobile)
+        self.assertIn(b".callsign.route-known { font-size:clamp(40px,13.2vw,57px); }", mobile)
+        self.assertIn(b"font-size:clamp(17px,5.3vw,23px);", mobile)
+        self.assertIn(b"font-size:clamp(14px,4.35vw,19px);", mobile)
+
+    def test_mobile_airline_logo_and_map_are_reduced_to_make_identity_room(self):
+        mobile = PAGE.split(b"/* Mobile is a single-view application", 1)[1]
+        self.assertIn(b"height:31px;", mobile)
+        self.assertIn(b".route-brand-logo { max-height:31px; }", mobile)
+        self.assertIn(b"left:5%;", mobile)
+        self.assertIn(b"right:5%;", mobile)
+        self.assertIn(b"width:90%;", mobile)
+        self.assertIn(b"top:31px;", mobile)
+
+    def test_mobile_flight_heading_reserves_space_for_identity(self):
+        mobile = PAGE.split(b"/* Mobile is a single-view application", 1)[1]
+        self.assertIn(b"grid-template-rows:minmax(118px,30%) minmax(0,1fr);", mobile)
+
+    def test_desktop_airline_brand_and_map_sizes_remain_unchanged(self):
+        self.assertIn(
+            b".route-brand { position:absolute; top:0; left:50%; transform:translateX(-50%); width:100%; height:clamp(92px,10.5vh,108px);",
+            PAGE,
+        )
+        self.assertIn(
+            b".wall.radar-open .route-map { width:clamp(567.6px,38.28vw,739.2px); height:clamp(277.2px,33vh,376.2px); }",
+            PAGE,
+        )
+
+    def test_mobile_footer_balances_credit_groups_across_three_rows(self):
+        footer = PAGE[PAGE.index(b"<footer>"):PAGE.index(b"</footer>") + len(b"</footer>")]
+        self.assertIn(b'footer-credit-line-1">For Sam ', footer)
+        self.assertIn(b'Data: ', footer)
+        self.assertIn(b'footer-credit-line-2">Map: ', footer)
+        self.assertIn(b'Logos: ', footer)
+        self.assertIn(b'Flags: ', footer)
+        self.assertIn(b'footer-credit-line-3">Sound: ', footer)
+        self.assertIn(b'Inspired by: ', footer)
+
+    def test_mobile_update_timestamp_shares_third_footer_row(self):
+        mobile = PAGE.split(b"/* Mobile is a single-view application", 1)[1]
+        self.assertIn(b"#footer-status {", mobile)
+        self.assertIn(b"grid-column:2;", mobile)
+        self.assertIn(b"grid-row:3;", mobile)
+
+    def test_readme_documents_three_line_mobile_footer(self):
+        readme = Path(__file__).with_name("README.md").read_text(encoding="utf-8")
+        self.assertIn("three compact acknowledgement", readme)
 
 
 if __name__ == "__main__":

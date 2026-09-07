@@ -64,6 +64,8 @@ OURAIRPORTS_URL = "https://davidmegginson.github.io/ourairports-data/airports.cs
 ROUTE_CACHE_TTL_SECONDS = 900
 ROUTE_FAILURE_RETRY_SECONDS = 30
 OURAIRPORTS_TTL_SECONDS = 7 * 24 * 60 * 60
+API_HEALTH_INTERVAL_SECONDS = 30
+ADSBDB_HEALTH_URL = "https://api.adsbdb.com/v0/aircraft/G-STBH"
 
 PRECISE_MODEL_NAMES = {
     ("BOMBARDIER", "CHALLENGER 650"): "BOMBARDIER CL-600-2B16 CHALLENGER 650",
@@ -314,6 +316,116 @@ def radar_contacts(aircraft: list[dict[str, Any]], settings, selected: dict[str,
             "emergency": str(plane.get("squawk") or "") in {"7500", "7600", "7700"},
         })
     return contacts
+
+
+class APIHealthMonitor:
+    """Lightweight heartbeat for the public data services used by Over-Head."""
+
+    SERVICES = ("ADSB.lol", "adsb.im", "ADSBDB", "OurAirports")
+
+    def __init__(self, settings) -> None:
+        self.settings = settings
+        self.lock = threading.Lock()
+        self._snapshot: dict[str, Any] = {
+            "ok": False,
+            "checked_at": 0,
+            "services": {service: False for service in self.SERVICES},
+        }
+
+    @staticmethod
+    def _open_ok(request: urllib.request.Request, timeout: float = 5.0) -> bool:
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                status = int(getattr(response, "status", response.getcode()))
+                # Consume only a small response body when one is returned.
+                response.read(256)
+                return 200 <= status < 400
+        except urllib.error.HTTPError as exc:
+            # A 404 still proves that the service and API endpoint are answering.
+            return exc.code == 404
+        except (OSError, ValueError, urllib.error.URLError, TimeoutError):
+            return False
+
+    def _probe_adsblol(self) -> bool:
+        url = (
+            "https://api.adsb.lol/v2/point/"
+            f"{float(self.settings.latitude):.6f}/{float(self.settings.longitude):.6f}/1"
+        )
+        return self._open_ok(urllib.request.Request(url, headers={"User-Agent": USER_AGENT}))
+
+    def _probe_adsbim(self) -> bool:
+        body = json.dumps({
+            "planes": [{
+                "callsign": "ZZZ999",
+                "lat": float(self.settings.latitude),
+                "lng": float(self.settings.longitude),
+            }]
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            ADSBIM_ROUTESET_URL,
+            data=body,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        return self._open_ok(request)
+
+    def _probe_adsbdb(self) -> bool:
+        request = urllib.request.Request(ADSBDB_HEALTH_URL, headers={"User-Agent": USER_AGENT})
+        return self._open_ok(request)
+
+    def _probe_ourairports(self) -> bool:
+        request = urllib.request.Request(
+            OURAIRPORTS_URL,
+            headers={"User-Agent": USER_AGENT},
+            method="HEAD",
+        )
+        return self._open_ok(request)
+
+    def check(self) -> dict[str, Any]:
+        probes = {
+            "ADSB.lol": self._probe_adsblol,
+            "adsb.im": self._probe_adsbim,
+            "ADSBDB": self._probe_adsbdb,
+            "OurAirports": self._probe_ourairports,
+        }
+        services = {name: bool(probe()) for name, probe in probes.items()}
+        snapshot = {
+            "ok": all(services.values()),
+            "checked_at": int(time.time()),
+            "services": services,
+        }
+        with self.lock:
+            self._snapshot = snapshot
+        return snapshot
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "ok": bool(self._snapshot.get("ok")),
+                "checked_at": int(self._snapshot.get("checked_at") or 0),
+                "services": dict(self._snapshot.get("services") or {}),
+            }
+
+
+def api_health_loop(health: APIHealthMonitor, refresh_event: threading.Event) -> None:
+    while True:
+        try:
+            health.check()
+        except Exception:
+            # A heartbeat failure must never bring down the monitor.
+            with health.lock:
+                health._snapshot = {
+                    "ok": False,
+                    "checked_at": int(time.time()),
+                    "services": {service: False for service in health.SERVICES},
+                }
+        refresh_event.set()
+        time.sleep(API_HEALTH_INTERVAL_SECONDS)
+
 
 
 class LogoStore:
@@ -1276,7 +1388,7 @@ PAGE = b"""<!doctype html>
   <meta http-equiv="Expires" content="0">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Over-Head &#x2708;&#xFE0F;</title>
-  <meta name="overhead-ui-revision" content="persistent-flight-tracking-v46">
+  <meta name="overhead-ui-revision" content="mobile-footer-three-lines-v52">
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <style>
@@ -1455,11 +1567,291 @@ PAGE = b"""<!doctype html>
     .wall.loading .information { visibility:hidden; }
     footer { gap:clamp(12px,1.2vw,22px); color:#52717e; font:600 clamp(9px,.72vw,13px)/1.25 "Segoe UI",sans-serif; letter-spacing:.075em; }
     .footer-credits { min-width:0; flex:1 1 auto; }
+    .footer-credit-line { display:inline; }
+    .api-heart { display:inline-block; transform-origin:center; transition:filter 300ms ease,opacity 300ms ease; }
+    .api-heart.api-unhealthy { filter:grayscale(1); opacity:.42; }
+    .api-heart.api-pulse { animation:api-heart-pulse 1.45s ease-out 1; }
+    @keyframes api-heart-pulse {
+      0%,100% { transform:scale(1); filter:none; }
+      28% { transform:scale(1.42); filter:drop-shadow(0 0 5px rgba(255,140,48,.85)); }
+      55% { transform:scale(.94); filter:drop-shadow(0 0 2px rgba(255,140,48,.45)); }
+      76% { transform:scale(1.16); filter:drop-shadow(0 0 4px rgba(255,140,48,.65)); }
+    }
     .footer-attribution { color:inherit; text-decoration:none; white-space:nowrap; }
     .footer-attribution:hover { color:var(--muted); }
     #footer-status { flex:0 0 auto; white-space:nowrap; }
     @media (max-width:1150px) { .wall.radar-open .content,.wall.settings-open .content { grid-template-columns:minmax(0,1fr) minmax(280px,36vw); } .wall.radar-open .metrics,.wall.settings-open .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); } }
     @media (max-aspect-ratio:4/3) { .callsign { font-size:clamp(56px,15vw,130px); } }
+  
+    /* Mobile is a single-view application: flight, radar and settings replace
+       one another instead of being squeezed side-by-side. Desktop rules above
+       remain untouched. */
+    @media (max-width:700px), (max-width:950px) and (max-height:500px) {
+      html,body { width:100%; height:100%; min-height:100%; overflow:hidden; }
+      body { cursor:auto; }
+      .wall {
+        width:100vw;
+        height:100vh;
+        height:100dvh;
+        padding:max(8px,env(safe-area-inset-top)) max(8px,env(safe-area-inset-right)) max(7px,env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left));
+        grid-template-rows:34px minmax(0,1fr) 34px;
+        gap:7px;
+      }
+      header { min-width:0; gap:6px; }
+      .brand { flex:0 1 auto; width:clamp(94px,28vw,132px); height:32px; min-width:0; }
+      .header-tools { min-width:0; gap:5px; transform:none !important; }
+      .sound-toggle,.fullscreen-toggle,.settings-toggle { width:29px; height:29px; padding:6px; flex:0 0 29px; }
+      .radar-toggle { min-height:29px; padding:.52em .68em; flex:0 0 auto; font-size:9px; letter-spacing:.09em; }
+      .live { flex:0 0 auto; gap:.35em; font-size:9px; letter-spacing:.06em; }
+      .live #mode { display:none; }
+      .live-dot { width:8px; height:8px; }
+
+      .content,
+      .wall.radar-open .content,
+      .wall.settings-open .content {
+        min-height:0;
+        display:grid;
+        grid-template-columns:minmax(0,1fr);
+        gap:0;
+      }
+      main {
+        position:relative;
+        min-width:0;
+        min-height:0;
+        width:100%;
+        height:100%;
+        overflow:hidden;
+        border-radius:14px;
+      }
+      .information {
+        position:absolute;
+        inset:0;
+        width:100%;
+        height:100%;
+        min-width:0;
+        min-height:0;
+        padding:11px 12px;
+        display:grid;
+        grid-template-columns:minmax(0,1fr);
+        grid-template-rows:minmax(0,1fr) auto;
+        gap:8px;
+      }
+      .flight-heading {
+        width:100%;
+        min-width:0;
+        min-height:0;
+        display:grid;
+        grid-template-columns:minmax(0,1fr);
+        grid-template-rows:minmax(118px,30%) minmax(0,1fr);
+        align-items:stretch;
+        gap:7px;
+      }
+      .flight-copy {
+        width:100%;
+        min-width:0;
+        display:flex;
+        flex-direction:column;
+        align-items:center;
+        justify-content:center;
+        text-align:center;
+        padding:2px 0 3px;
+      }
+      .callsign,
+      .wall.radar-open .callsign,
+      .wall.settings-open .callsign {
+        width:100%;
+        justify-content:center;
+        font-size:clamp(45px,14.4vw,62px);
+        line-height:.88;
+      }
+      .callsign.route-known { font-size:clamp(40px,13.2vw,57px); }
+      .callsign.route-known .route-airport {
+        width:1.18em;
+        height:.78em;
+        flex-basis:1.18em;
+        min-width:1.18em;
+        min-height:.78em;
+        max-width:1.18em;
+        max-height:.78em;
+      }
+      .route-join { font-size:.40em; }
+      .identity {
+        width:100%;
+        margin-top:7px;
+        align-items:center;
+        gap:2px;
+      }
+      .registration {
+        width:100%;
+        text-align:center;
+        font-size:clamp(17px,5.3vw,23px);
+        letter-spacing:.06em;
+      }
+      .aircraft-name {
+        width:100%;
+        text-align:center;
+        font-size:clamp(14px,4.35vw,19px);
+        letter-spacing:.035em;
+      }
+
+      .route-visual,
+      .wall.radar-open .route-visual,
+      .wall.settings-open .route-visual,
+      .wall:not(.radar-open) .route-visual {
+        position:relative;
+        top:auto;
+        right:auto;
+        left:auto;
+        width:100%;
+        max-width:none;
+        height:100%;
+        min-height:0;
+        overflow:hidden;
+      }
+      .route-brand {
+        top:0;
+        width:100%;
+        height:31px;
+        background:linear-gradient(90deg,rgba(2,5,10,0) 0%,#02050a 7%,#02050a 93%,rgba(2,5,10,0) 100%);
+      }
+      .route-brand-name { font-size:clamp(15px,4.8vw,20px); }
+      .route-brand-logo { max-height:31px; }
+      .route-map,
+      .wall.radar-open .route-map,
+      .wall.settings-open .route-map,
+      .wall:not(.radar-open):not(.settings-open) .route-map {
+        top:31px;
+        left:5%;
+        right:5%;
+        transform:none;
+        width:90%;
+        height:calc(100% - 31px);
+        min-height:0;
+        border-radius:10px;
+      }
+      .route-map .leaflet-tooltip.route-label { font-size:8px; padding:2px 4px; }
+
+      .metrics,
+      .wall.radar-open .metrics,
+      .wall.settings-open .metrics {
+        width:100%;
+        margin-top:0;
+        display:grid;
+        grid-template-columns:repeat(2,minmax(0,1fr));
+        gap:5px 12px;
+      }
+      .metric { width:100%; min-width:0; padding-top:5px; }
+      .metric-label { font-size:8px; letter-spacing:.12em; }
+      .metric-value,
+      .wall.radar-open .metric-value,
+      .wall.settings-open .metric-value {
+        margin-top:.08em;
+        font-size:clamp(16px,5.1vw,22px);
+      }
+      .scan-message { padding:12px; font-size:18px; }
+
+      /* Radar and Settings become alternate full-size views on mobile. */
+      .wall.radar-open main,
+      .wall.settings-open main { display:none; }
+      .wall.radar-open .radar-panel,
+      .wall.settings-open .settings-panel {
+        width:100%;
+        height:100%;
+        min-height:0;
+        border-radius:14px;
+        padding:11px 12px;
+      }
+      .wall.radar-open .radar-panel { grid-template-rows:auto minmax(0,1fr) auto; }
+      .radar-heading strong { font-size:15px; }
+      .radar-heading span { font-size:9px; }
+      .radar-stage { min-height:0; overflow:hidden; }
+      #radar {
+        width:min(100%,calc(100dvh - 150px));
+        max-width:100%;
+        max-height:100%;
+      }
+      .radar-foot { gap:7px; font-size:9px; letter-spacing:.08em; }
+      .radar-track { gap:5px; }
+      .track-input { width:clamp(78px,25vw,112px); height:29px; padding:0 8px; font-size:10px; }
+      .track-button { height:29px; padding:0 8px; font-size:9px; }
+      .radar-zoom { gap:5px; }
+      .zoom-button { width:29px; height:29px; font-size:15px; }
+
+      .wall.settings-open .settings-panel { grid-template-rows:auto minmax(0,1fr) auto; }
+      .settings-heading strong { font-size:15px; }
+      .settings-heading span { font-size:9px; }
+      .settings-list { align-self:center; gap:5px; }
+      .setting-row { gap:5px; padding:7px 0; }
+      .setting-label { font-size:8px; }
+      .setting-control { gap:7px; font-size:13px; }
+      .setting-action { padding:.55em .75em; font-size:9px; }
+      .settings-location-value { font-size:11px; }
+      .settings-foot { font-size:8px; }
+
+      footer {
+        position:relative;
+        min-width:0;
+        min-height:0;
+        display:grid;
+        grid-template-columns:minmax(0,1fr) auto;
+        grid-template-rows:repeat(3,minmax(0,1fr));
+        column-gap:7px;
+        row-gap:0;
+        overflow:hidden;
+        align-items:center;
+        font-size:clamp(6.2px,1.85vw,7.5px);
+        line-height:1.08;
+        letter-spacing:.015em;
+      }
+      .footer-credits {
+        display:contents;
+        min-width:0;
+        white-space:normal;
+      }
+      .footer-credit-line {
+        display:block;
+        min-width:0;
+        white-space:nowrap;
+        overflow:visible;
+      }
+      .footer-credit-line-1 { grid-column:1 / -1; grid-row:1; }
+      .footer-credit-line-2 { grid-column:1 / -1; grid-row:2; }
+      .footer-credit-line-3 { grid-column:1; grid-row:3; }
+      #footer-status {
+        grid-column:2;
+        grid-row:3;
+        align-self:center;
+        justify-self:end;
+        flex:none;
+        white-space:nowrap;
+        font-size:clamp(5.8px,1.65vw,6.8px);
+        line-height:1;
+      }
+
+      /* Keep the location picker inside the mobile viewport too. */
+      .location-backdrop { padding:6px; }
+      .location-dialog {
+        width:calc(100vw - 12px);
+        height:calc(100dvh - 12px);
+        padding:9px 10px;
+        grid-template-rows:auto minmax(120px,1fr) auto auto auto;
+        gap:6px;
+        border-radius:14px;
+      }
+      .location-dialog-head { gap:8px; }
+      .location-dialog-head strong { font-size:16px; }
+      .location-dialog-head p { display:none; }
+      .location-close { width:30px; height:30px; font-size:16px; }
+      #location-map { border-radius:10px; }
+      .location-details { gap:6px; }
+      .location-coordinate { padding:6px 8px; }
+      .location-coordinate span { font-size:7px; }
+      .location-coordinate strong { font-size:12px; }
+      .location-status { min-height:1.2em; font-size:9px; }
+      .location-actions { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:5px; }
+      .location-actions .setting-action { min-width:0; padding:.55em .35em; font-size:8px; letter-spacing:.06em; }
+    }
+
   </style>
 </head>
 <body>
@@ -1497,7 +1889,7 @@ PAGE = b"""<!doctype html>
       <div class="settings-foot">SETTINGS ARE SAVED ON THIS DISPLAY</div>
     </aside>
     </div>
-    <footer><span class="footer-credits">For Sam &#x1F9E1;&nbsp;&nbsp;&nbsp;&nbsp;Data: <a class="footer-attribution" href="https://adsb.lol/" target="_blank" rel="noopener">ADSB.lol</a><span id="flightaware-credit" hidden> + <a class="footer-attribution" href="https://www.flightaware.com/commercial/aeroapi/" target="_blank" rel="noopener">FlightAware</a></span> + <a class="footer-attribution" href="https://www.adsbdb.com/" target="_blank" rel="noopener">ADSBDB</a> + <a class="footer-attribution" href="https://ourairports.com/data/" target="_blank" rel="noopener">OurAirports</a>&nbsp;&nbsp;/&nbsp;&nbsp;Map: <a class="footer-attribution" href="https://leafletjs.com/" target="_blank" rel="noopener">Leaflet</a> + &copy; <a class="footer-attribution" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>&nbsp;&nbsp;/&nbsp;&nbsp;Logos: <a class="footer-attribution" href="https://github.com/soaring-symbols/soaring-symbols" target="_blank" rel="noopener">Soaring Symbols</a>&nbsp;&nbsp;/&nbsp;&nbsp;Flags: <a class="footer-attribution" href="https://github.com/catamphetamine/country-flag-icons" target="_blank" rel="noopener">country-flag-icons</a>&nbsp;&nbsp;/&nbsp;&nbsp;Sound: arunangshubanerjee via <a class="footer-attribution" href="https://pixabay.com/" target="_blank" rel="noopener">Pixabay</a>&nbsp;&nbsp;/&nbsp;&nbsp;Inspired by: <a class="footer-attribution" href="https://github.com/AxisNimble/TheFlightWall_OSS" target="_blank" rel="noopener">TheFlightWall</a></span><span id="footer-status">Connecting</span></footer>
+    <footer><span class="footer-credits"><span class="footer-credit-line footer-credit-line-1">For Sam <span class="api-heart api-unhealthy" id="api-heart" aria-label="API heartbeat" title="API heartbeat awaiting first check">&#x1F9E1;</span>&nbsp;&nbsp;&nbsp;&nbsp;Data: <a class="footer-attribution" href="https://adsb.lol/" target="_blank" rel="noopener">ADSB.lol</a><span id="flightaware-credit" hidden> + <a class="footer-attribution" href="https://www.flightaware.com/commercial/aeroapi/" target="_blank" rel="noopener">FlightAware</a></span> + <a class="footer-attribution" href="https://www.adsbdb.com/" target="_blank" rel="noopener">ADSBDB</a> + <a class="footer-attribution" href="https://ourairports.com/data/" target="_blank" rel="noopener">OurAirports</a></span><span class="footer-credit-line footer-credit-line-2">Map: <a class="footer-attribution" href="https://leafletjs.com/" target="_blank" rel="noopener">Leaflet</a> + &copy; <a class="footer-attribution" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>&nbsp;&nbsp;/&nbsp;&nbsp;Logos: <a class="footer-attribution" href="https://github.com/soaring-symbols/soaring-symbols" target="_blank" rel="noopener">Soaring Symbols</a>&nbsp;&nbsp;/&nbsp;&nbsp;Flags: <a class="footer-attribution" href="https://github.com/catamphetamine/country-flag-icons" target="_blank" rel="noopener">country-flag-icons</a></span><span class="footer-credit-line footer-credit-line-3">Sound: arunangshubanerjee via <a class="footer-attribution" href="https://pixabay.com/" target="_blank" rel="noopener">Pixabay</a>&nbsp;&nbsp;/&nbsp;&nbsp;Inspired by: <a class="footer-attribution" href="https://github.com/AxisNimble/TheFlightWall_OSS" target="_blank" rel="noopener">TheFlightWall</a></span></span><span id="footer-status">Connecting</span></footer>
   </section>
   <div class="location-backdrop" id="location-backdrop" role="dialog" aria-modal="true" aria-labelledby="location-title">
     <div class="location-dialog">
@@ -1522,6 +1914,8 @@ PAGE = b"""<!doctype html>
     const svgNS='http://www.w3.org/2000/svg';
     const radarRanges=[5,10,15,25,40,60,100]; let currentRadarRange=25;
     let flightTrackingActive=false,flightTrackingQuery='';
+    let apiHealthRevision='';
+    let apiHeartPulseTimer=null;
     function loadHeaderLogo(){
       const target=byId('brand-logo');
       if(!target)return;
@@ -1869,11 +2263,13 @@ PAGE = b"""<!doctype html>
       byId('zoom-in').disabled=Boolean(trackingActive)||rangeIndex===0;
       byId('zoom-out').disabled=Boolean(trackingActive)||rangeIndex===radarRanges.length-1;
     }
+    const isMobileViewport=()=>window.matchMedia('(max-width:700px), (max-width:950px) and (max-height:500px)').matches;
+    const radarPreferenceKey=()=>isMobileViewport()?'overhead-mobile-radar-v1':'overhead-radar-v2';
     function refreshSidePanelButtons(){
       const wall=byId('wall'),settingsOpen=wall.classList.contains('settings-open'),radarOpen=wall.classList.contains('radar-open');
       const radarButton=byId('radar-toggle'),settingsButton=byId('settings-toggle');
       radarButton.setAttribute('aria-pressed',String(radarOpen&&!settingsOpen));
-      radarButton.textContent=radarOpen&&!settingsOpen?'HIDE RADAR':'RADAR';
+      radarButton.textContent=radarOpen&&!settingsOpen?(isMobileViewport()?'FLIGHT':'HIDE RADAR'):'RADAR';
       settingsButton.classList.toggle('active',settingsOpen);
       settingsButton.setAttribute('aria-pressed',String(settingsOpen));
       settingsButton.setAttribute('aria-label',settingsOpen?'Close settings':'Open settings');
@@ -1886,7 +2282,7 @@ PAGE = b"""<!doctype html>
       wall.classList.remove('settings-open');
       wall.classList.toggle('radar-open',open);
       radarWasOpenBeforeSettings=open;
-      localStorage.setItem('overhead-radar-v2',open?'open':'closed');
+      localStorage.setItem(radarPreferenceKey(),open?'open':'closed');
       refreshSidePanelButtons();
       afterPanelChange();
     }
@@ -1899,12 +2295,34 @@ PAGE = b"""<!doctype html>
       }else if(!open&&currentlyOpen){
         wall.classList.remove('settings-open');
         wall.classList.toggle('radar-open',radarWasOpenBeforeSettings);
-        localStorage.setItem('overhead-radar-v2',radarWasOpenBeforeSettings?'open':'closed');
+        localStorage.setItem(radarPreferenceKey(),radarWasOpenBeforeSettings?'open':'closed');
       }
       refreshSidePanelButtons();
       afterPanelChange();
     }
     function normaliseTrackInput(value){ return String(value||'').toUpperCase().replace(/[^A-Z0-9]/g,''); }
+    function syncApiHeartbeat(d){
+      const heart=byId('api-heart');
+      if(!heart)return;
+      const healthy=Boolean(d.api_health_ok);
+      const services=d.api_health_services&&typeof d.api_health_services==='object'?d.api_health_services:{};
+      const failed=Object.entries(services).filter(([,ok])=>!ok).map(([name])=>name);
+      heart.classList.toggle('api-unhealthy',!healthy);
+      heart.setAttribute('aria-label',healthy?'API heartbeat healthy':'API heartbeat unhealthy');
+      heart.title=healthy?'API heartbeat: ADSB.lol, adsb.im, ADSBDB and OurAirports responding':'API heartbeat unavailable: '+(failed.length?failed.join(', '):'check pending');
+      const revision=String(d.api_health_checked_at||'');
+      if(revision&&revision!==apiHealthRevision){
+        apiHealthRevision=revision;
+        clearTimeout(apiHeartPulseTimer);
+        heart.classList.remove('api-pulse');
+        if(healthy){
+          requestAnimationFrame(()=>{
+            heart.classList.add('api-pulse');
+            apiHeartPulseTimer=setTimeout(()=>heart.classList.remove('api-pulse'),1550);
+          });
+        }
+      }
+    }
     function syncFlightTracking(d){
       flightTrackingActive=Boolean(d.tracking_active);
       flightTrackingQuery=String(d.tracking_query||'');
@@ -1931,6 +2349,7 @@ PAGE = b"""<!doctype html>
         const data=await response.json();
         if(!response.ok)throw new Error(data.error||'Could not change flight tracking');
         if(data.flight)input.value=data.flight;
+        if(isMobileViewport()&&data.tracking)setRadar(false);
         await update();
       }catch(error){
         input.setCustomValidity(error.message||'Could not track flight');
@@ -1978,13 +2397,15 @@ PAGE = b"""<!doctype html>
         }
         renderRouteMap(d);
         syncFlightTracking(d);
+        syncApiHeartbeat(d);
         drawRadar(d.radar_contacts,d.radar_radius_nm,d.tracking_active);
         byId('flightaware-credit').hidden=!Boolean(d.flightaware_configured);
         byId('footer-status').textContent='Updated '+d.updated;
       }catch(_){ byId('live').className='live error'; byId('mode').textContent='RECONNECTING'; }
     }
     loadHeaderLogo();
-    setRadar(localStorage.getItem('overhead-radar-v2')!=='closed');
+    const initialRadarPreference=localStorage.getItem(radarPreferenceKey());
+    setRadar(isMobileViewport()?initialRadarPreference==='open':initialRadarPreference!=='closed');
     byId('radar-toggle').addEventListener('click',()=>setRadar(!byId('wall').classList.contains('radar-open')||byId('wall').classList.contains('settings-open')));
     byId('settings-toggle').addEventListener('click',()=>setSettings(!byId('wall').classList.contains('settings-open')));
     document.addEventListener('keydown',event=>{if(event.key.toLowerCase()==='r')setRadar(!byId('wall').classList.contains('radar-open')||byId('wall').classList.contains('settings-open'))});
@@ -2028,13 +2449,14 @@ class FrameState:
         self.last_live_aircraft: list[dict[str, Any]] = []
         self.payload: dict[str, Any] = {"mode": "starting", "updated": "never", "total": 0}
 
-    def update(self, image, mode: str, plane: dict[str, Any] | None, distance: float | None, aircraft: list[dict[str, Any]], settings, logo: tuple[bytes, str, str] | None, identity: dict[str, str] | None = None, route: dict[str, Any] | None = None, origin_flag: bytes | None = None, destination_flag: bytes | None = None, flightaware_configured: bool = False, tracking: dict[str, Any] | None = None) -> None:
+    def update(self, image, mode: str, plane: dict[str, Any] | None, distance: float | None, aircraft: list[dict[str, Any]], settings, logo: tuple[bytes, str, str] | None, identity: dict[str, str] | None = None, route: dict[str, Any] | None = None, origin_flag: bytes | None = None, destination_flag: bytes | None = None, flightaware_configured: bool = False, tracking: dict[str, Any] | None = None, api_health: dict[str, Any] | None = None) -> None:
         data = BytesIO()
         image.save(data, format="PNG")
         plane = plane or {}
         identity = identity or {}
         route = route or {}
         tracking = tracking or {}
+        api_health = api_health or {"ok": False, "checked_at": 0, "services": {}}
         registration = identity.get("registration") or str(plane.get("r") or "").strip()
         code = identity.get("operator_code") or operator_code(plane)
         logo_data, logo_type, logo_source = logo or (b"", "", "")
@@ -2048,6 +2470,9 @@ class FrameState:
             "route_source": route.get("route_source", ""),
             "commercial_flight": route.get("commercial_flight", ""),
             "flightaware_configured": bool(flightaware_configured),
+            "api_health_ok": bool(api_health.get("ok")),
+            "api_health_checked_at": int(api_health.get("checked_at") or 0),
+            "api_health_services": dict(api_health.get("services") or {}),
             "tracking_active": bool(tracking.get("active")),
             "tracking_query": str(tracking.get("query") or ""),
             "tracking_resolved_callsign": str(tracking.get("resolved_callsign") or ""),
@@ -2083,7 +2508,7 @@ class FrameState:
             self.payload = payload
 
 
-def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, identities: AircraftIdentityStore, routes: FlightRouteStore | None = None, flags: FlagStore | None = None, tracker: FlightTrackingState | None = None) -> None:
+def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, identities: AircraftIdentityStore, routes: FlightRouteStore | None = None, flags: FlagStore | None = None, tracker: FlightTrackingState | None = None, health: APIHealthMonitor | None = None) -> None:
     tracking = tracker.snapshot() if tracker else {"active": False, "query": "", "candidates": (), "resolved_callsign": "", "last_plane": None}
     if demo:
         aircraft, mode = DEMO["ac"], "demo"
@@ -2139,13 +2564,13 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
     image = render(plane, distance, mode)
     save_frame(image, settings)
     code = identity.get("operator_code") or operator_code(plane)
-    state.update(image, mode, plane, distance, aircraft, settings, logos.get(code, identity.get("airline_name", "")), identity, route, origin_flag, destination_flag, bool(routes and routes.api_key), tracking)
+    state.update(image, mode, plane, distance, aircraft, settings, logos.get(code, identity.get("airline_name", "")), identity, route, origin_flag, destination_flag, bool(routes and routes.api_key), tracking, health.snapshot() if health else None)
 
 
-def refresh_loop(state: FrameState, settings, demo: bool, logos: LogoStore, identities: AircraftIdentityStore, routes: FlightRouteStore, flags: FlagStore, refresh_event: threading.Event, tracker: FlightTrackingState | None = None) -> None:
+def refresh_loop(state: FrameState, settings, demo: bool, logos: LogoStore, identities: AircraftIdentityStore, routes: FlightRouteStore, flags: FlagStore, refresh_event: threading.Event, tracker: FlightTrackingState | None = None, health: APIHealthMonitor | None = None) -> None:
     while True:
         try:
-            update_state(state, settings, demo, logos, identities, routes, flags, tracker)
+            update_state(state, settings, demo, logos, identities, routes, flags, tracker, health)
         except Exception as exc:
             with state.lock:
                 state.payload["mode"] = "error"
@@ -2474,11 +2899,13 @@ def main() -> int:
     routes = FlightRouteStore(api_key=route_api_key)
     flags = FlagStore()
     tracker = FlightTrackingState(settings.radius_nm)
+    health = APIHealthMonitor(settings)
     refresh_event = threading.Event()
-    threading.Thread(target=refresh_loop, args=(state, settings, args.demo, logos, identities, routes, flags, refresh_event, tracker), daemon=True).start()
+    threading.Thread(target=api_health_loop, args=(health, refresh_event), daemon=True).start()
+    threading.Thread(target=refresh_loop, args=(state, settings, args.demo, logos, identities, routes, flags, refresh_event, tracker, health), daemon=True).start()
     tone_path = Path(__file__).resolve().with_name("beep-tone.mp3")
     server = ThreadingHTTPServer((args.host, args.port), handler_factory(state, settings, refresh_event, tone_path, config_path, routes, logos, tracker, args.demo))
-    print(f"Over-Head monitor running at {url}"); print("UI revision: persistent-flight-tracking-v46")
+    print(f"Over-Head monitor running at {url}"); print("UI revision: mobile-footer-three-lines-v52")
     if route_api_key:
         print("Route data: FlightAware AeroAPI primary / adsb.im + ADSB.lol live-validated fallbacks")
     else:

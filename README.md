@@ -36,6 +36,27 @@ Over-Head ✈️ TFS to NCL
 If an aircraft is present but its route is unknown, the title uses
 `N/A to N/A`. With no aircraft it simply shows `Over-Head ✈️`.
 
+
+## Mobile view
+
+Over-Head has a dedicated narrow-viewport layout rather than shrinking the
+desktop two-panel composition.
+
+On phone-sized portrait and landscape viewports, the display is constrained to
+a single non-scrolling screen. The normal **Flight** view uses the full panel
+width for the route, airline branding and a compact 2×2 metric grid. **Radar**
+and **Settings** are alternate full-screen panes: opening Radar replaces the
+Flight panel instead of placing it beside it, and the Radar button changes to
+**FLIGHT** so the user can switch directly back.
+
+Mobile keeps its own Radar-open preference and does not change the desktop
+Radar preference. Starting a persistent TRACK request from the mobile Radar
+returns to the Flight pane so the newly locked aircraft is visible immediately;
+the tracking lock itself remains active.
+
+The mobile footer is intentionally rendered as three compact acknowledgement
+lines so the complete credit set remains readable without making the page scroll.
+
 ## Persistent flight tracking
 
 The radar includes a flight-number/callsign field and **TRACK** control. Enter a
@@ -273,8 +294,20 @@ The live footer begins with:
 For Sam 🧡
 ```
 
-and keeps an intentionally expansive set of linked credits for the services and
-artwork visible in the display:
+The heart is also the **core API heartbeat**. Every 30 seconds the Python server
+checks the four public/non-billable data services used by the live display:
+ADSB.lol, adsb.im, ADSBDB and OurAirports. When all four respond, the orange
+heart pulses once. If any check fails, the heart turns grey and remains grey
+until a later check confirms that all four are responding again; recovery turns
+it orange and produces the next pulse.
+
+FlightAware AeroAPI is deliberately not synthetically probed by the heartbeat.
+It is optional and commercial, so Over-Head does not generate potentially
+billable AeroAPI requests merely to animate the footer. Normal FlightAware use
+and route-resolution failures continue to be handled by the route resolver.
+
+The footer keeps an intentionally expansive set of linked credits for the
+services and artwork visible in the display:
 
 - ADSB.lol
 - FlightAware, only when AeroAPI is configured
