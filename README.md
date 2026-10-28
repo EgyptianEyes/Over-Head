@@ -492,6 +492,118 @@ reverse proxy or another appropriately secured access method for remote use.
 
 Press `Ctrl+C` in the terminal to stop Over-Head.
 
+#### Public HTTPS domain on a headless Ubuntu server (Caddy + systemd)
+
+For a public browser display, use a domain such as `demodomain.name` and place
+Caddy in front of Over-Head. **Replace `demodomain.name` with your own domain**
+throughout these instructions. These commands assume the Linux installation
+above is in `/root/Over-Head` and the commands are run as `root`. Adjust the
+paths and service user if you installed the application elsewhere.
+
+Before starting, create an **A record** pointing `demodomain.name` to your
+server's public IPv4 address (and an AAAA record only if IPv6 is configured and
+reachable). Allow inbound **TCP 80 and 443** in the cloud firewall and any host
+firewall. Do **not** open port 8765 publicly. HTTPS certificate issuance requires
+the domain to resolve to the server and be reachable.
+
+Install Caddy:
+
+```bash
+apt update
+apt install -y caddy
+```
+
+Create `/etc/caddy/Caddyfile`:
+
+```bash
+cat > /etc/caddy/Caddyfile <<'EOF'
+demodomain.name {
+    reverse_proxy 127.0.0.1:8765
+}
+EOF
+
+caddy validate --config /etc/caddy/Caddyfile
+systemctl enable --now caddy
+systemctl reload caddy
+```
+
+Run Over-Head with **systemd**, so it starts automatically after a reboot.
+**First stop any manually started instance** with `Ctrl+C` in its terminal.
+Check that nothing else is listening on port 8765 before starting the service:
+
+```bash
+ss -ltnp | grep ':8765' || true
+pgrep -af '[m]onitor.py' || true
+```
+
+If an old instance is still running, identify and stop that specific process
+before proceeding. Running the manual instance and the service together will
+cause a port-binding error and repeated service restarts.
+
+Create `/etc/systemd/system/over-head.service`:
+
+```bash
+cat > /etc/systemd/system/over-head.service <<'EOF'
+[Unit]
+Description=Over-Head Aircraft Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Over-Head
+ExecStart=/root/Over-Head/.venv/bin/python /root/Over-Head/monitor.py --host 127.0.0.1
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now over-head
+```
+
+The application listens **only on localhost**; Caddy serves it to browsers via
+`https://demodomain.name/` with automatic HTTPS certificate management.
+
+Verify the services and website:
+
+```bash
+systemctl status over-head caddy --no-pager
+curl -s -o /dev/null -w 'HTTPS status: %{http_code}\n' https://demodomain.name/
+curl -s http://127.0.0.1:8765/status
+echo
+curl -s http://127.0.0.1:8765/provider-status
+echo
+```
+
+A successful website request normally returns HTTP `200`. Do not use `curl -I`
+to test the application's root URL: it sends an HTTP `HEAD` request, which the
+built-in Python server may reject with `501`, even when ordinary browser `GET`
+requests work.
+
+If the service fails to start, inspect its logs and check for an existing
+listener on port 8765:
+
+```bash
+journalctl -u over-head -n 60 --no-pager
+ss -ltnp | grep ':8765' || true
+journalctl -u caddy -n 60 --no-pager
+```
+
+Open `https://demodomain.name/` in an active browser tab to begin monitoring.
+When no active display is connected, the status may remain `starting`, with API
+request counts at zero; that alone does not indicate a provider failure. The
+existing `config.json` is preserved across Git updates, so verify that
+`"refresh_seconds"` is set to `300` on older installations.
+
+For later application updates, run `git pull --ff-only` from `/root/Over-Head`,
+update dependencies inside `.venv` if needed, and restart the service with
+`systemctl restart over-head`.
+
 ### Windows PowerShell
 
 ```powershell
