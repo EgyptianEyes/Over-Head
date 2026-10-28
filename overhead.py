@@ -34,7 +34,7 @@ class Settings:
     latitude: float = 51.5074
     longitude: float = -0.1278
     radius_nm: float = 25.0
-    refresh_seconds: float = 10.0
+    refresh_seconds: float = 300.0
     output_rgb: str = "output/frame.rgb"
     output_png: str = "output/frame.png"
     demo_on_failure: bool = False
