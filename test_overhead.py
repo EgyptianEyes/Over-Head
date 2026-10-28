@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from monitor import APIHealthMonitor, AircraftIdentityStore, AirportStore, CONFIG_REQUIRED_PAGE, FlagStore, FlightRouteStore, FlightTrackingState, FrameState, LogoStore, PAGE, RADAR_RANGES, TRACK_RADAR_RANGES, aircraft_identity, aircraft_name, automatic_tracking_radius, flight_details, merge_tracked_aircraft, normalise_flight_query, operator_code, overhead_logo_asset, radar_contacts, safe_svg, save_location_config, tracking_distance_nm, update_live_location_config, update_state, flightaware_api_key
+from monitor import APIHealthMonitor, AircraftIdentityStore, AirportStore, CONFIG_REQUIRED_PAGE, FlagStore, FlightRouteStore, FlightTrackingState, FrameState, LogoStore, PAGE, RADAR_RANGES, TRACK_RADAR_RANGES, SnapshotStore, aircraft_identity, aircraft_name, automatic_tracking_radius, flight_details, merge_tracked_aircraft, normalise_flight_query, operator_code, overhead_logo_asset, radar_contacts, safe_svg, save_location_config, tracking_distance_nm, update_live_location_config, update_state, flightaware_api_key
 from overhead import DEMO, HEIGHT, WIDTH, Settings, load_settings, produce_frame, select_nearest
 
 
@@ -318,12 +318,12 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn(b"overhead-radar-v2", PAGE)
         self.assertIn(b"overhead-mobile-radar-v1", PAGE)
         self.assertIn(
-            b"setRadar(isMobileViewport()?initialRadarPreference==='open':initialRadarPreference!=='closed');",
+            b"setRadar(snapshotId?snapshotRadar:(isMobileViewport()?initialRadarPreference==='open':initialRadarPreference!=='closed'));",
             PAGE,
         )
 
     def test_ui_revision_identifies_header_logo_map_layout(self):
-        self.assertIn(b'overhead-ui-revision" content="mobile-footer-three-lines-v52"', PAGE)
+        self.assertIn(b'overhead-ui-revision" content="flight-snapshots-v54"', PAGE)
         self.assertIn(b'<div class="brand"><img class="brand-logo" id="brand-logo" alt="Over-Head"></div>', PAGE)
         self.assertIn(b'class="route-brand-logo" id="operator-logo"', PAGE)
         self.assertNotIn(b'id="logo-box"', PAGE)
@@ -1235,7 +1235,7 @@ class OverHeadTests(unittest.TestCase):
             PAGE,
         )
         self.assertIn(
-            b"setRadar(isMobileViewport()?initialRadarPreference==='open':initialRadarPreference!=='closed');",
+            b"setRadar(snapshotId?snapshotRadar:(isMobileViewport()?initialRadarPreference==='open':initialRadarPreference!=='closed'));",
             PAGE,
         )
 
@@ -1411,6 +1411,221 @@ class OverHeadTests(unittest.TestCase):
     def test_readme_documents_three_line_mobile_footer(self):
         readme = Path(__file__).with_name("README.md").read_text(encoding="utf-8")
         self.assertIn("three compact acknowledgement", readme)
+
+    def test_desktop_footer_restores_separators_between_mobile_credit_chunks(self):
+        self.assertIn(
+            b'.footer-credit-line-2::before,.footer-credit-line-3::before { content:"  /  "; white-space:pre; }',
+            PAGE,
+        )
+
+    def test_mobile_footer_suppresses_desktop_generated_separators(self):
+        mobile = PAGE.split(b"/* Mobile is a single-view application", 1)[1]
+        self.assertIn(
+            b".footer-credit-line-2::before,.footer-credit-line-3::before { content:none; }",
+            mobile,
+        )
+
+    def test_desktop_footer_credit_order_matches_original_continuous_sequence(self):
+        footer = PAGE[PAGE.index(b"<footer>"):PAGE.index(b"</footer>") + len(b"</footer>")]
+        positions = [
+            footer.index(b"For Sam "),
+            footer.index(b"Data: "),
+            footer.index(b">ADSB.lol<"),
+            footer.index(b">ADSBDB<"),
+            footer.index(b">OurAirports<"),
+            footer.index(b"Map: "),
+            footer.index(b">Leaflet<"),
+            footer.index(b">OpenStreetMap<"),
+            footer.index(b"Logos: "),
+            footer.index(b">Soaring Symbols<"),
+            footer.index(b"Flags: "),
+            footer.index(b">country-flag-icons<"),
+            footer.index(b"Sound: "),
+            footer.index(b">Pixabay<"),
+            footer.index(b"Inspired by: "),
+            footer.index(b">TheFlightWall<"),
+        ]
+        self.assertEqual(positions, sorted(positions))
+
+
+    def test_snapshot_camera_and_gallery_are_present_without_widening_desktop(self):
+        self.assertIn(b'class="camera-toggle" id="camera-toggle"', PAGE)
+        self.assertIn(b'id="settings-snapshots"', PAGE)
+        self.assertIn(b'id="snapshot-backdrop"', PAGE)
+        self.assertIn(b'id="snapshot-grid"', PAGE)
+        self.assertIn(b'id="snapshot-viewer"', PAGE)
+        self.assertIn(b"DESKTOP + MOBILE SNAPSHOTS SAVED", PAGE)
+        self.assertIn(b"grid-template-columns:minmax(0,1fr) clamp(320px,29vw,560px);", PAGE)
+
+    def test_snapshot_render_uses_canonical_desktop_and_mobile_viewports(self):
+        self.assertEqual(SnapshotStore.DESKTOP_VIEWPORT, (1920, 1080))
+        self.assertEqual(SnapshotStore.MOBILE_VIEWPORT, (390, 844))
+        self.assertIn(b"setRadar(snapshotId?snapshotRadar:", PAGE)
+        self.assertIn(b"window.__overheadSnapshotReady=true", PAGE)
+        self.assertIn(b"/snapshot-state?id=", PAGE)
+        self.assertIn(b"snapshotAssetSuffix", PAGE)
+        self.assertIn(b"snapshot_sound_enabled", PAGE)
+        self.assertIn(b"if(!snapshotId){ if(soundEnabled)pulseBrandLogo(); playTone(); }", PAGE)
+        self.assertIn(b".snapshot-render .route-direction-flow { animation:none; }", PAGE)
+
+    def test_snapshot_capture_preserves_full_footer_and_radar_state(self):
+        self.assertIn(b"const radar=wall.classList.contains('radar-open');", PAGE)
+        self.assertIn(b"body:JSON.stringify({radar,sound_enabled:soundEnabled})", PAGE)
+        self.assertIn(b"footer-credit-line footer-credit-line-1", PAGE)
+        self.assertIn(b"footer-credit-line footer-credit-line-3", PAGE)
+        readme = Path(__file__).with_name("README.md").read_text(encoding="utf-8")
+        self.assertIn("The screenshots are full Over-Head viewport captures", readme)
+        self.assertIn("If Radar was open when the camera was pressed", readme)
+
+    def test_snapshot_store_persists_and_deletes_a_paired_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "screenshots")
+            state = FrameState()
+            with state.lock:
+                state.payload = {
+                    "aircraft_id": "406B82",
+                    "callsign": "BAW283",
+                    "commercial_flight": "BA283",
+                    "registration": "G-STBH",
+                    "aircraft_name": "BOEING 777-300ER",
+                    "aircraft_type": "B77W",
+                    "origin": "LHR",
+                    "destination": "LAX",
+                    "mode": "live",
+                }
+                state.logo = b"logo"
+                state.logo_type = "image/png"
+                state.origin_flag = b"origin"
+                state.destination_flag = b"destination"
+
+            def fake_render(snapshot_id, radar, base_url, desktop_path, mobile_path):
+                self.assertTrue(radar)
+                self.assertEqual(base_url, "http://127.0.0.1:9999/")
+                pending = store.pending_state(snapshot_id)
+                self.assertIsNotNone(pending)
+                self.assertFalse(pending["snapshot_sound_enabled"])
+                desktop_path.write_bytes(b"desktop")
+                mobile_path.write_bytes(b"mobile")
+
+            with patch.object(store, "_render_pair", side_effect=fake_render):
+                record = store.capture(state, True, "http://127.0.0.1:9999/", False)
+
+            self.assertEqual(record["callsign"], "BAW283")
+            self.assertEqual(record["registration"], "G-STBH")
+            self.assertTrue(record["radar"])
+            self.assertTrue(record["desktop"].endswith("_desktop.png"))
+            self.assertTrue(record["mobile"].endswith("_mobile.png"))
+            self.assertEqual(store.image(record["id"], "desktop"), b"desktop")
+            self.assertEqual(store.image(record["id"], "mobile"), b"mobile")
+            self.assertEqual(len(store.list()), 1)
+            self.assertIsNone(store.pending_state(record["id"]))
+            self.assertTrue(store.delete(record["id"]))
+            self.assertEqual(store.list(), [])
+            self.assertFalse((store.root / record["desktop"]).exists())
+            self.assertFalse((store.root / record["mobile"]).exists())
+
+    def test_snapshot_store_refuses_capture_without_current_aircraft(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "screenshots")
+            state = FrameState()
+            with self.assertRaisesRegex(ValueError, "No current aircraft"):
+                store.capture(state, False, "http://127.0.0.1:9999/")
+
+    def test_snapshot_requirements_and_readme_document_chromium_renderer(self):
+        requirements = Path(__file__).with_name("requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("playwright", requirements.lower())
+        readme = Path(__file__).with_name("README.md").read_text(encoding="utf-8")
+        self.assertIn("screenshots/index.json", readme)
+        self.assertIn("python3 -m playwright install --with-deps chromium", readme)
+        self.assertIn("390×844 mobile", readme)
+        gitignore = Path(__file__).with_name(".gitignore").read_text(encoding="utf-8")
+        self.assertIn("screenshots/", gitignore.splitlines())
+
+
+
+# Provider regression tests consolidated from test_overhead_failover.py and test_v92.py.
+import email.message
+import urllib.error
+import overhead
+import monitor
+
+class _FailoverResponse:
+    def __init__(self, data): self.data = data
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+    def read(self, *args): return json.dumps(self.data).encode()
+
+class _UIResponse:
+    def __init__(self, data): self.data = data
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+    def read(self, *args): return json.dumps(self.data).encode()
+
+class ProviderFailoverTests(unittest.TestCase):
+ def setUp(self):
+  overhead._provider_retry_until.clear(); overhead._provider_backoff.clear(); overhead._provider_request_counts.clear();overhead._provider_last_status.clear()
+ def test_normal(self):
+  urls=[]
+  def request(req,timeout=8): urls.append(req.full_url);return _FailoverResponse({'ac':[{'hex':'a'}]})
+  with patch.object(overhead.urllib.request,'urlopen',side_effect=request):
+   self.assertEqual(overhead.fetch_aircraft(overhead.Settings(latitude=51.5,longitude=-3.3,radius_nm=25)),[{'hex':'a'}])
+  self.assertEqual(len(urls),1);self.assertIn('/v2/point/51.5/-3.3/25',urls[0])
+ def test_429_fallback_and_cooldown(self):
+  urls=[]; headers=email.message.Message();headers['x-ratelimit-remaining']='0';headers['x-ratelimit-reset']='34300'
+  def request(req,timeout=8):
+   urls.append(req.full_url)
+   if 'adsb.lol' in req.full_url: raise urllib.error.HTTPError(req.full_url,429,'rate limited',headers,None)
+   return _FailoverResponse({'ac':[{'hex':'a'}]})
+  with patch.object(overhead.urllib.request,'urlopen',side_effect=request):
+   overhead.fetch_aircraft(overhead.Settings())
+   overhead.fetch_aircraft(overhead.Settings())
+  self.assertEqual(len(urls),3)
+  self.assertEqual(overhead._provider_request_counts['ADSB.lol'],1)
+  self.assertGreater(overhead.aircraft_provider_status()['ADSB.lol']['retry_in_seconds'],34000)
+ def test_both_limited(self):
+  def request(req,timeout=8): raise urllib.error.HTTPError(req.full_url,429,'x',{},None)
+  with patch.object(overhead.urllib.request,'urlopen',side_effect=request):
+   with self.assertRaises(overhead.AircraftFeedRateLimited): overhead.fetch_aircraft(overhead.Settings())
+   with self.assertRaises(overhead.AircraftFeedRateLimited): overhead.fetch_aircraft(overhead.Settings())
+  self.assertEqual(sum(overhead._provider_request_counts.values()),2)
+ def test_recovery(self):
+  overhead._provider_retry_until['ADSB.lol']=overhead.time.monotonic()-1
+  urls=[]
+  def request(req,timeout=8):urls.append(req.full_url);return _FailoverResponse({'ac':[]})
+  with patch.object(overhead.urllib.request,'urlopen',side_effect=request):overhead.fetch_aircraft(overhead.Settings())
+  self.assertIn('adsb.lol',urls[0])
+ def test_tracking_uses_fallback(self):
+  overhead._provider_retry_until['ADSB.lol']=overhead.time.monotonic()+999
+  with patch.object(overhead.urllib.request,'urlopen',return_value=_FailoverResponse({'ac':[{'hex':'406b82','flight':'BAW283','lat':51.5,'lon':-3.3,'seen_pos':0}]})) as call:
+   plane,callsign=monitor.fetch_tracked_aircraft(['BAW283'])
+   self.assertEqual(callsign,'BAW283');self.assertIn('opendata.adsb.fi',call.call_args[0][0].full_url)
+ def test_lease(self):
+  lease=monitor.ActiveMonitorLease();self.assertFalse(lease.active());lease.touch();self.assertTrue(lease.active());lease.last_seen-=15;self.assertFalse(lease.active())
+
+class ProviderUIRegressionTests(unittest.TestCase):
+ def setUp(self):
+  overhead._provider_retry_until.clear();overhead._provider_backoff.clear();overhead._provider_request_counts.clear();overhead._provider_last_status.clear()
+ def test_429_then_fallback_returns_live(self):
+  requests=[]
+  def send(req,timeout=8):
+   requests.append(req.full_url)
+   if 'api.adsb.lol' in req.full_url:
+    raise urllib.error.HTTPError(req.full_url,429,'limited',{'x-ratelimit-remaining':'0','x-ratelimit-reset':'34300'},None)
+   return _UIResponse({'ac':[{'hex':'abc123'}]})
+  with patch.object(overhead.urllib.request,'urlopen',side_effect=send):
+   result=overhead.fetch_aircraft(overhead.Settings(radius_nm=25))
+   result2=overhead.fetch_aircraft(overhead.Settings(radius_nm=25))
+  self.assertEqual(result,result2)
+  self.assertEqual(len(requests),3)
+  self.assertEqual(overhead.aircraft_provider_status()['ADSB.fi']['last_status'],'OK')
+  self.assertEqual(overhead.aircraft_provider_status()['ADSB.lol']['last_status'],'429')
+ def test_no_api_heartbeat_thread(self):
+  self.assertNotIn('threading.Thread(target=api_health_loop',(Path(__file__).resolve().parent / 'monitor.py').read_text())
+ def test_ui_distance_steps(self):
+  source=(Path(__file__).resolve().parent / 'monitor.py').read_text()
+  self.assertIn("radarRanges=Array.from({length:20},(_,i)=>(i+1)*5)",source)
+  self.assertIn('displayRadarRangeValue(radius,trackingActive)',source)
+  self.assertIn('rate_limited:\'Rate Limited\'',source)
 
 
 if __name__ == "__main__":

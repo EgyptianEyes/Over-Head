@@ -231,6 +231,7 @@ to colour as part of the notification.
 The top-right controls provide:
 
 - sound mute/unmute
+- paired desktop/mobile flight snapshots
 - browser full-screen mode
 - display settings
 - radar show/hide
@@ -240,6 +241,45 @@ When the radar is closed, this control cluster is raised to keep clear of the
 airline branding. Radar-open and Settings-open positioning is kept separate.
 
 Double-clicking the display also toggles browser full screen.
+
+## Flight snapshots
+
+The camera control preserves the current aircraft display as a matched pair of PNG
+screenshots. One press freezes the current Over-Head flight state and renders both:
+
+- a **1920×1080 desktop** screenshot
+- a **390×844 mobile** screenshot
+
+Both images come from the same frozen aircraft payload, route, identity, map state and
+radar preference, so the two versions cannot drift onto different live updates while
+they are being rendered.
+
+The screenshots are full Over-Head viewport captures. They deliberately retain the
+header, controls, complete flight/radar presentation and the full footer/credit line.
+If Radar was open when the camera was pressed, the desktop image contains the normal
+Flight + Radar composition and the mobile companion contains the mobile Radar view. If
+Radar was closed, both variants use their normal Flight presentation.
+
+Snapshot pairs are written beneath:
+
+```text
+screenshots/
+```
+
+with a persistent `screenshots/index.json` metadata index. Filenames include the
+capture time and available flight/registration/route identifiers, with `_desktop.png`
+and `_mobile.png` suffixes.
+
+Open **Settings → Snapshots** to browse the saved archive inside Over-Head. Each saved
+flight appears once with Desktop and Mobile previews. Either image can be opened at
+full size in the UI, and deleting the record removes both PNG files together.
+
+Snapshot rendering uses Chromium through Playwright so the saved files are genuine
+responsive renders of the same Over-Head HTML/CSS/Leaflet interface rather than a
+second drawing implementation. The normal setup uses Playwright's pinned Chromium
+build, installed as described below. The optional `OVERHEAD_CHROMIUM` environment
+variable can instead point to a specific administrator-selected Chromium-compatible
+executable.
 
 ## Altitude colours
 
@@ -261,6 +301,7 @@ Settings currently provide:
 - sound alerts
 - current location
 - full-screen mode
+- saved flight snapshots
 
 Closing ordinary Settings restores the radar state that was active before
 Settings was opened.
@@ -370,7 +411,12 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 python3 -m pip install -r requirements.txt
+python3 -m playwright install --with-deps chromium
 ```
+
+The second command installs the Chromium build and Linux runtime dependencies used to
+generate the paired flight screenshots. To deliberately use an existing compatible
+Chromium/Chrome installation instead, set `OVERHEAD_CHROMIUM` to its executable path.
 
 #### Linux desktop / directly connected display
 
@@ -440,6 +486,7 @@ Press `Ctrl+C` in the terminal to stop Over-Head.
 git clone https://github.com/egyptianeyes/Over-Head.git
 Set-Location Over-Head
 py -m pip install -r requirements.txt
+py -m playwright install chromium
 py monitor.py --open
 ```
 
@@ -485,8 +532,9 @@ after Over-Head is running:
 chromium --kiosk --noerrdialogs --disable-infobars http://127.0.0.1:8765/
 ```
 
-A headless server does not need Chromium installed unless it is also providing a
-local graphical display.
+A headless server does not need Chromium for the live display itself, but the paired
+flight-snapshot feature does require the Playwright Chromium installation above (or an
+administrator-selected browser supplied through `OVERHEAD_CHROMIUM`).
 
 ## Standalone RGB output
 
@@ -524,8 +572,8 @@ python3 -m unittest -v
 
 The current regression suite covers route-source selection and plausibility,
 persistent flight tracking, route-map layout and animation, branding, flags,
-location handling, radar behaviour, browser title state, footer credits,
-live/demo failure behaviour and the RGB output path.
+location handling, radar behaviour, browser title state, paired flight snapshots,
+footer credits, live/demo failure behaviour and the RGB output path.
 
 ## Connecting RGB hardware later
 

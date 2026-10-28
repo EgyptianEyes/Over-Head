@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Render nearby ADSB.lol traffic to a 128x64 RGB888 framebuffer."""
+"""Render nearby ADS-B traffic to a 128x64 RGB888 framebuffer."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import threading
+import datetime
+import email.utils
 import time
 import urllib.error
 import urllib.request
@@ -35,6 +38,117 @@ class Settings:
     output_rgb: str = "output/frame.rgb"
     output_png: str = "output/frame.png"
     demo_on_failure: bool = False
+
+
+class AircraftFeedRateLimited(OSError):
+    """Neither aircraft provider is currently eligible for a request."""
+
+    def __init__(self, retry_seconds: float):
+        self.retry_seconds = max(0.0, float(retry_seconds))
+        super().__init__(f"Aircraft providers unavailable; retry in {self.retry_seconds:.0f}s")
+
+
+AIRCRAFT_PROVIDERS = (
+    ("ADSB.lol", "https://api.adsb.lol"),
+    ("ADSB.fi", "https://opendata.adsb.fi"),
+)
+_aircraft_request_lock = threading.RLock()
+_provider_retry_until: dict[str, float] = {}
+_provider_backoff: dict[str, float] = {}
+_provider_request_counts: dict[str, int] = {}
+_provider_last_status: dict[str, str] = {}
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        try:
+            date = email.utils.parsedate_to_datetime(value)
+            return max(0.0, (date - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def _pause_provider(name: str, error: Exception) -> None:
+    headers = getattr(error, "headers", None)
+    retry = _retry_after_seconds(headers.get("Retry-After") if headers else None)
+    if retry is None and headers and headers.get("x-ratelimit-remaining") == "0":
+        retry = _retry_after_seconds(headers.get("x-ratelimit-reset"))
+    delay = max(30.0, retry if retry is not None else _provider_backoff.get(name, 30.0))
+    _provider_retry_until[name] = time.monotonic() + delay
+    _provider_backoff[name] = min(3600.0, max(60.0, delay * 2.0))
+    _provider_last_status[name] = "429" if getattr(error, "code", None) == 429 else type(error).__name__
+
+
+def aircraft_provider_status() -> dict[str, dict[str, object]]:
+    """Local-only diagnostics; never contacts an upstream API."""
+    with _aircraft_request_lock:
+        now = time.monotonic()
+        return {name: {"requests": _provider_request_counts.get(name, 0),
+                       "retry_in_seconds": round(max(0.0, _provider_retry_until.get(name, 0) - now)),
+                       "last_status": _provider_last_status.get(name, "not-tested")}
+                for name, _ in AIRCRAFT_PROVIDERS}
+
+
+def _provider_url(name: str, base: str, path: str) -> str:
+    """Translate ADSB.lol v2 paths to ADSB.fi's v3 API where necessary."""
+    if name != "ADSB.fi":
+        return base + path
+    parts = path.strip("/").split("/")
+    if len(parts) == 5 and parts[:2] == ["v2", "point"]:
+        return base + f"/api/v3/lat/{parts[2]}/lon/{parts[3]}/dist/{parts[4]}"
+    if len(parts) == 3 and parts[:2] == ["v2", "hex"]:
+        return base + f"/api/v3/hex/{parts[2]}"
+    if len(parts) == 3 and parts[:2] == ["v2", "callsign"]:
+        return base + f"/api/v3/callsign/{parts[2]}"
+    raise ValueError("Unsupported ADSB.fi aircraft path")
+
+
+def fetch_provider_aircraft(path: str) -> list[dict[str, Any]]:
+    """Try primary, then independent fallback; one request per eligible provider."""
+    with _aircraft_request_lock:
+        wait_times = []
+        last_error: Exception | None = None
+        for name, base in AIRCRAFT_PROVIDERS:
+            remaining = _provider_retry_until.get(name, 0.0) - time.monotonic()
+            if remaining > 0:
+                wait_times.append(remaining)
+                continue
+            request = urllib.request.Request(_provider_url(name, base, path), headers={"User-Agent": "Over-Head/0.2 (+personal wall display)"})
+            _provider_request_counts[name] = _provider_request_counts.get(name, 0) + 1
+            try:
+                with urllib.request.urlopen(request, timeout=8) as response:
+                    payload = json.load(response)
+                if not isinstance(payload, dict) or not isinstance(payload.get("ac"), list):
+                    raise ValueError(f"Unexpected {name} aircraft response")
+                _provider_retry_until.pop(name, None)
+                _provider_backoff.pop(name, None)
+                _provider_last_status[name] = "OK"
+                return payload["ac"]
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                if exc.code == 429:
+                    _pause_provider(name, exc)
+                elif exc.code >= 500:
+                    _pause_provider(name, exc)
+                else:
+                    _provider_last_status[name] = f"HTTP {exc.code}"
+            except (OSError, ValueError, TimeoutError, json.JSONDecodeError) as exc:
+                last_error = exc
+                _pause_provider(name, exc)
+        if wait_times or any(_provider_retry_until.get(n, 0) > time.monotonic() for n, _ in AIRCRAFT_PROVIDERS):
+            remaining = [max(0.0, _provider_retry_until.get(n, 0) - time.monotonic()) for n, _ in AIRCRAFT_PROVIDERS]
+            raise AircraftFeedRateLimited(max(1.0, min(remaining))) from last_error
+        raise OSError("All aircraft providers failed") from last_error
+
+
+def fetch_aircraft(settings: Settings) -> list[dict[str, Any]]:
+    """Request positions only within the configured monitoring area."""
+    query_radius = min(250.0, max(1.0, float(settings.radius_nm)))
+    return fetch_provider_aircraft(f"/v2/point/{settings.latitude}/{settings.longitude}/{query_radius:g}")
 
 
 DEMO = {
@@ -93,20 +207,6 @@ def load_settings(path: Path, allow_missing: bool = False) -> Settings:
     settings.latitude, settings.longitude = validate_location(settings.latitude, settings.longitude)
     return settings
 
-
-def fetch_aircraft(settings: Settings) -> list[dict[str, Any]]:
-    query_radius = min(250.0, max(1.0, float(settings.radius_nm)))
-    url = (
-        "https://api.adsb.lol/v2/point/"
-        f"{settings.latitude}/{settings.longitude}/{query_radius:g}"
-    )
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Over-Head/0.1 (+personal wall display)"},
-    )
-    with urllib.request.urlopen(request, timeout=8) as response:
-        payload = json.load(response)
-    return payload.get("ac", [])
 
 
 def haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
