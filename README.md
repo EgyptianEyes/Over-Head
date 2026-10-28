@@ -1,7 +1,8 @@
 # Over-Head
 
 A wall-mounted live aircraft display for a standard monitor. Over-Head retrieves
-live aircraft from the ADSB.lol network and normally selects the nearest aircraft
+live aircraft primarily from ADSB.lol, with ADSB.fi available as a fallback,
+and normally selects the nearest aircraft
 with a recent position. The browser display is native HTML, CSS and SVG at the
 screen's full resolution, while `overhead.py` continues to produce the original
 128×64 RGB888 and PNG frame outputs for hardware or integration use.
@@ -82,10 +83,14 @@ While tracking is active:
 Press **TRACK** again with the same flight to stop tracking and restore the
 previous manual radar range.
 
-Manual radar ranges are 5, 10, 15, 25, 40, 60 and 100 NM. Automatic tracking can
-use substantially larger ranges for distant flights. The ordinary ADSB.lol point
-query is capped at 250 NM so long-distance tracking does not turn the local
-traffic query into an unnecessarily large request.
+Manual radar distance controls increase or decrease the displayed range in
+increments of 5 nautical miles, miles or kilometres, according to the selected
+distance unit. Automatic tracking adjusts the radar range to follow aircraft
+beyond the configured monitoring area.
+
+Normal aircraft monitoring remains restricted to the configured location and
+radius. Long-distance tracking uses direct aircraft lookups rather than
+expanding the normal geographical query.
 
 ## Route resolution
 
@@ -148,7 +153,7 @@ cache/aircraft-identities.json
 ```
 
 If ADSBDB is unavailable or has no matching record, Over-Head continues with the
-live ADSB.lol fields and its built-in ICAO type-name table.
+live aircraft-provider fields and its built-in ICAO type-name table.
 
 ## Airport and flag data
 
@@ -241,6 +246,14 @@ When the radar is closed, this control cluster is raised to keep clear of the
 airline branding. Radar-open and Settings-open positioning is kept separate.
 
 Double-clicking the display also toggles browser full screen.
+
+## Automatic radar, commentary and photograph rotation
+
+When available, the browser rotates through radar, aircraft commentary and
+aircraft photographs. Each view remains visible for no more than 15 seconds
+before advancing to the next available view. Missing commentary or photographs
+are skipped rather than leaving an empty panel. Rotation does not require
+additional aircraft-position API requests.
 
 ## Flight snapshots
 
@@ -335,22 +348,21 @@ The live footer begins with:
 For Sam 🧡
 ```
 
-The heart is also the **core API heartbeat**. Every 30 seconds the Python server
-checks the four public/non-billable data services used by the live display:
-ADSB.lol, adsb.im, ADSBDB and OurAirports. When all four respond, the orange
-heart pulses once. If any check fails, the heart turns grey and remains grey
-until a later check confirms that all four are responding again; recovery turns
-it orange and produces the next pulse.
+The heart is the live API heartbeat, coloured McLaren Papaya Orange
+(`#FF8000`). It reflects the results of requests already made by Over-Head;
+there is no independent 30-second API-probing thread. Successful requests
+pulse the heart orange. A monitored request failure turns it grey, and a
+subsequent successful recovery restores orange and its pulse. API health
+indication does not generate extra requests or interrupt the monitor.
 
-FlightAware AeroAPI is deliberately not synthetically probed by the heartbeat.
-It is optional and commercial, so Over-Head does not generate potentially
-billable AeroAPI requests merely to animate the footer. Normal FlightAware use
-and route-resolution failures continue to be handled by the route resolver.
+FlightAware AeroAPI is not synthetically probed. It is optional and commercial,
+so Over-Head does not generate potentially billable AeroAPI requests just to
+animate the footer. Normal route-resolution handling remains independent.
 
-The footer keeps an intentionally expansive set of linked credits for the
-services and artwork visible in the display:
+The footer keeps linked credits for the services and artwork used in the display:
 
 - ADSB.lol
+- ADSB.fi
 - FlightAware, only when AeroAPI is configured
 - ADSBDB
 - OurAirports
@@ -359,9 +371,9 @@ services and artwork visible in the display:
 - Soaring Symbols
 - country-flag-icons
 - arunangshubanerjee / Pixabay
-- TheFlightWall
 
-The footer also reports the most recent display update time.
+The footer no longer displays an Inspired-by credit, and also reports the most
+recent display update time. On mobile, credits are arranged across three lines.
 
 ## Sound
 
@@ -507,7 +519,7 @@ You can also create or edit `config.json` manually:
   "latitude": 51.5074,
   "longitude": -0.1278,
   "radius_nm": 25,
-  "refresh_seconds": 10,
+  "refresh_seconds": 300,
   "output_rgb": "output/frame.rgb",
   "output_png": "output/frame.png",
   "demo_on_failure": false
@@ -517,6 +529,29 @@ You can also create or edit `config.json` manually:
 `demo_on_failure` is retained for configuration compatibility, but live operation
 does not silently substitute demo traffic. Demonstration aircraft are displayed
 only when Over-Head is explicitly started with `--demo`.
+
+### Aircraft polling and provider failover
+
+The default aircraft-position polling interval is **300 seconds (five minutes)**.
+This is approximately 288 scheduled position polls per day during uninterrupted
+monitoring, excluding direct TRACK lookups, other data requests and retries.
+Polling pauses when there is no active monitor window and resumes when a
+monitor becomes active.
+
+ADSB.lol is the primary live aircraft-position provider. When unavailable or
+rate-limited (HTTP 429), Over-Head can fall back to ADSB.fi. Provider rate-limit
+handling observes available retry/reset information and allows subsequent
+recovery to the primary provider. If live aircraft information cannot be
+retrieved, the application does not substitute demonstration aircraft.
+
+Provider diagnostics are available from the running monitor at
+`http://127.0.0.1:8765/provider-status`.
+
+Existing installations keep the `refresh_seconds` value in their local
+`config.json`: updating code does not overwrite it. To adopt the five-minute
+interval on an existing installation, set `"refresh_seconds": 300` in that
+file. The default also needs to be set in application code for new installations;
+editing this README alone does not change runtime behaviour.
 
 An optional FlightAware AeroAPI key can be supplied through the
 `FLIGHTAWARE_AEROAPI_KEY` environment variable or the `flightaware_api_key`
@@ -570,7 +605,7 @@ TRACK mode.
 python3 -m unittest -v
 ```
 
-The current regression suite covers route-source selection and plausibility,
+The regression suite covers route-source selection and plausibility,
 persistent flight tracking, route-map layout and animation, branding, flags,
 location handling, radar behaviour, browser title state, paired flight snapshots,
 footer credits, live/demo failure behaviour and the RGB output path.
@@ -588,12 +623,9 @@ Over-Head is an [Egyptian Eyes](https://egyptianeyes.com) project by
 
 ## Acknowledgements
 
-Over-Head was inspired by
-[TheFlightWall](https://github.com/AxisNimble/TheFlightWall_OSS), an open-source
-aircraft information display created by AxisNimble.
-
-Live ADS-B aircraft position/state and direct callsign tracking are provided by
-the [ADSB.lol](https://adsb.lol/) community network.
+Live ADS-B aircraft positions and direct callsign tracking are provided
+primarily by the [ADSB.lol](https://adsb.lol/) community network, with
+[ADSB.fi](https://opendata.adsb.fi/) used as an alternative source when needed.
 
 Free route fallback data is queried from [adsb.im](https://adsb.im/) and
 [ADSB.lol](https://adsb.lol/) and is independently checked against the current
@@ -628,8 +660,8 @@ project.
 is not covered by Over-Head's MIT License.
 
 Over-Head is an independent project and is not affiliated with or endorsed by
-TheFlightWall, ADSB.lol, adsb.im, FlightAware, ADSBDB, OurAirports, Soaring
-Symbols, country-flag-icons, Pixabay or any airline.
+ADSB.lol, ADSB.fi, adsb.im, FlightAware, ADSBDB, OurAirports, Soaring Symbols,
+country-flag-icons, Pixabay or any airline.
 
 ## License
 
