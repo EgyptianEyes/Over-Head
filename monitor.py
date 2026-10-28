@@ -2391,7 +2391,7 @@ PAGE = b"""<!doctype html>
     }
     const svgNS='http://www.w3.org/2000/svg';
     const radarRanges=Array.from({length:20},(_,i)=>(i+1)*5); let currentRadarRange=25;
-    let radarRangeRequest=Promise.resolve(),radarRangePending=null;
+    let radarRangeRequest=Promise.resolve(),radarRangePending=null,radarManualOverride=false;
     const radarRangeKey=()=> 'overhead-radar-range-'+distanceUnit;
     const radarRangeUser=()=>Math.round((currentRadarRange*distanceUnitSpec().factor)/5)*5;
     const nearestRadarRange=(value)=>radarRanges.reduce((a,b)=>Math.abs(b-value)<Math.abs(a-value)?b:a,radarRanges[0]);
@@ -2400,6 +2400,7 @@ PAGE = b"""<!doctype html>
       // Serialize updates: a slow earlier request must not overwrite a later click.
       const requested=radius;
       radarRangePending=requested;
+      radarManualOverride=true;
       radarRangeRequest=radarRangeRequest.catch(()=>{}).then(async()=>{
         const response=await fetch('/radar-range?radius='+encodeURIComponent(requested),{cache:'no-store'});
         if(!response.ok)throw new Error('Radar range update failed ('+response.status+')');
@@ -2934,6 +2935,7 @@ PAGE = b"""<!doctype html>
         const saved=Number(localStorage.getItem(radarRangeKey()));
         const requested=radarRanges.includes(saved)?saved:nearestRadarRange(currentRadarRange*distanceUnitSpec().factor);
         currentRadarRange=radarRangeNm(requested);
+        radarManualOverride=true;
         localStorage.setItem(radarRangeKey(),String(requested));
         requestRadarRange(currentRadarRange);
       }
@@ -3257,7 +3259,10 @@ PAGE = b"""<!doctype html>
         if((contacts||[]).length<=10&&c.flight&&!c.selected){ const label=document.createElementNS(svgNS,'text'); label.textContent=c.flight; label.setAttribute('x','2.8'); label.setAttribute('y','-1.5'); label.setAttribute('transform','rotate('+(0-(Number(c.track)||0))+' 2.8 -1.5)'); group.appendChild(label); }
         layer.appendChild(group);
       }
-      currentRadarRange=!trackingActive&&radarRangePending!==null?radarRangePending:(Number(radius)||25); byId('radar-count').textContent=(contacts||[]).length+' CONTACTS'; byId('radar-range').textContent=trackingActive||radarRangePending===null?displayRadarRangeValue(radius,trackingActive):displayRadarRangeValue(radarRangePending,false);
+      if(trackingActive){ currentRadarRange=Number(radius)||25; }
+      else if(!radarManualOverride){ currentRadarRange=Number(radius)||25; }
+      byId('radar-count').textContent=(contacts||[]).length+' CONTACTS';
+      byId('radar-range').textContent=displayRadarRangeValue(trackingActive?radius:currentRadarRange,trackingActive);
       updateRadarRangeControls();
     }
     const isMobileViewport=()=>window.matchMedia('(max-width:700px), (max-width:950px) and (max-height:500px)').matches;
@@ -3415,7 +3420,7 @@ PAGE = b"""<!doctype html>
       const current=nearestRadarRange(radarRangeUser());
       const index=radarRanges.indexOf(current);
       const next=radarRanges[Math.max(0,Math.min(radarRanges.length-1,index+direction))]; if(next===current)return;
-      currentRadarRange=radarRangeNm(next); localStorage.setItem(radarRangeKey(),String(next));
+      currentRadarRange=radarRangeNm(next); radarManualOverride=true; localStorage.setItem(radarRangeKey(),String(next));
       byId('radar-range').textContent=next+' '+distanceUnitSpec().label;
       updateRadarRangeControls();
       await requestRadarRange(currentRadarRange);
@@ -3515,7 +3520,7 @@ PAGE = b"""<!doctype html>
       else if(byId('location-backdrop').classList.contains('open'))closeLocationSelector();
       else if(byId('wall').classList.contains('settings-open'))setSettings(false);
     });
-    const savedRange=Number(localStorage.getItem(radarRangeKey())); if(radarRanges.includes(savedRange)){ currentRadarRange=radarRangeNm(savedRange); requestRadarRange(currentRadarRange); }
+    const savedRange=Number(localStorage.getItem(radarRangeKey())); if(radarRanges.includes(savedRange)){ currentRadarRange=radarRangeNm(savedRange); radarManualOverride=true; requestRadarRange(currentRadarRange); }
     let cursorIdleTimer=null;
     function resetCursorIdle(){
       document.documentElement.classList.remove('cursor-hidden');
@@ -5044,7 +5049,13 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                         return
                     settings.radius_nm = float(radius)
                     tracker.set_manual_radius(float(radius))
-                    with state.lock: state.payload["radar_radius_nm"] = radius
+                    with state.lock:
+                        state.payload["radar_radius_nm"] = radius
+                        # Reproject cached positions immediately. The upstream feed may
+                        # be scheduled for five minutes, but radar zoom is local state.
+                        selected_hex = str(state.payload.get("aircraft_id") or "")
+                        selected = {"hex": selected_hex} if selected_hex else None
+                        state.payload["radar_contacts"] = radar_contacts(state.last_live_aircraft, settings, selected)
                     refresh_event.set()
                     self.send(HTTPStatus.OK, "application/json", json.dumps({"radius_nm": radius}).encode(), cache=False)
             else: self.send(HTTPStatus.NOT_FOUND, "text/plain", b"Not found")

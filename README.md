@@ -85,7 +85,8 @@ previous manual radar range.
 
 Manual radar distance controls increase or decrease the displayed range in
 increments of 5 nautical miles, miles or kilometres, according to the selected
-distance unit. Each unit retains its own manual range in the browser, and range
+distance unit. The chosen radar range updates immediately using cached aircraft positions,
+without waiting for the next upstream aircraft polling interval. Each unit retains its own manual range in the browser, and range
 changes are applied in order so slower network responses cannot undo later clicks.
 Automatic tracking adjusts the radar range to follow aircraft
 beyond the configured monitoring area.
