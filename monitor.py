@@ -4636,6 +4636,9 @@ class SnapshotStore:
 
 
 def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, identities: AircraftIdentityStore, routes: FlightRouteStore | None = None, flags: FlagStore | None = None, tracker: FlightTrackingState | None = None, health: APIHealthMonitor | None = None, places: NearbyPlaceStore | None = None) -> None:
+    # Capture the location used for this sample. Never publish an old-location
+    # result after the user has saved a new location in the browser.
+    sampled_location = (settings.latitude, settings.longitude)
     tracking = tracker.snapshot() if tracker else {"active": False, "query": "", "candidates": (), "resolved_callsign": "", "last_plane": None, "revision": 0}
     tracking_revision = int(tracking.get("revision") or 0)
     local_position_received_at: float | None = None
@@ -4727,8 +4730,10 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
     if tracking.get("active") and not demo:
         position_observed_at = commentary_observation_time(plane, tracked_position_received_at) if tracked_position_received_at is not None else None
     else:
-        position_observed_at = commentary_observation_time(plane, local_position_received_at) if local_position_received_at is not None else None
+        position_observed_at = commentary_observation_time(plane, local_position_received_at) if plane is not None and local_position_received_at is not None else None
     nearby_place = places.get(plane.get("lat"), plane.get("lon")) if places and plane and not demo else {}
+    if (settings.latitude, settings.longitude) != sampled_location:
+        return  # Location changed while this response was being processed.
     state.update(
         image, mode, plane, distance, aircraft, settings,
         logos.get(code, identity.get("airline_name", "")), identity, route, origin_flag, destination_flag,
@@ -4756,13 +4761,19 @@ class ActiveMonitorLease:
 
 def refresh_loop(state: FrameState, settings, demo: bool, logos: LogoStore, identities: AircraftIdentityStore, routes: FlightRouteStore, flags: FlagStore, refresh_event: threading.Event, tracker: FlightTrackingState | None = None, health: APIHealthMonitor | None = None, places: NearbyPlaceStore | None = None, lease: ActiveMonitorLease | None = None) -> None:
     last_fetch = 0.0
+    last_location = (settings.latitude, settings.longitude)
     while True:
         if lease is not None and not lease.active():
             time.sleep(1.0)
             continue
-        if time.monotonic() - last_fetch < max(1.0, settings.refresh_seconds):
+        location = (settings.latitude, settings.longitude)
+        location_changed = location != last_location
+        # A home-location change needs a fresh geographic query immediately;
+        # ordinary radar zoom and UI refreshes must still honour the request budget.
+        if not location_changed and time.monotonic() - last_fetch < max(1.0, settings.refresh_seconds):
             time.sleep(1.0)
             continue
+        last_location = location
         last_fetch = time.monotonic()
         try:
             update_state(state, settings, demo, logos, identities, routes, flags, tracker, health, places)
@@ -5162,8 +5173,17 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                 self.send(HTTPStatus.BAD_REQUEST, "application/json", body, cache=False)
                 return
             with state.lock:
-                state.payload["home_latitude"] = latitude
-                state.payload["home_longitude"] = longitude
+                # Old aircraft belong to the previous location. Do not display
+                # them while the new location's first fetch is pending.
+                state.last_live_aircraft = []
+                state.has_live_success = False
+                state.live_fetch_failures = 0
+                state.payload = {
+                    "mode": "starting", "updated": "never", "total": 0,
+                    "home_latitude": latitude, "home_longitude": longitude,
+                    "radar_radius_nm": settings.radius_nm,
+                    "radar_contacts": [],
+                }
             refresh_event.set()
             body = json.dumps({"saved": True, "latitude": latitude, "longitude": longitude}).encode()
             self.send(HTTPStatus.OK, "application/json", body, cache=False)

@@ -28,6 +28,10 @@ The main display shows:
 When no aircraft is available, the display shows **Scanning the skies…** rather
 than inserting sample traffic.
 
+When a live response contains no eligible aircraft, commentary observation timing
+is skipped until an aircraft is selected. This prevents an `AttributeError` from
+interrupting live monitoring when no aircraft qualifies for display.
+
 The browser tab remains branded and follows the displayed route:
 
 ```text
@@ -334,8 +338,12 @@ fits inside the viewport without scrolling. You can:
 **USE MY LOCATION** gently pulses as `LOCATING...` while the browser location
 request is in progress.
 
-Saving the location preserves other `config.json` values, updates the running
-display immediately, and returns directly to Radar. Cancelling, closing,
+Saving the location preserves other `config.json` values and updates the running
+monitor without restarting the service. It clears aircraft from the previous
+location and schedules a fresh geographic query immediately when a display is
+active, even if the normal five-minute polling interval has not elapsed.
+The interface returns directly to Radar and shows the new location while
+the first result is obtained. Cancelling, closing,
 clicking the backdrop or pressing Escape also exits the location chooser back to
 Radar.
 
