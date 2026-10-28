@@ -2391,10 +2391,23 @@ PAGE = b"""<!doctype html>
     }
     const svgNS='http://www.w3.org/2000/svg';
     const radarRanges=Array.from({length:20},(_,i)=>(i+1)*5); let currentRadarRange=25;
+    let radarRangeRequest=Promise.resolve(),radarRangePending=null;
     const radarRangeKey=()=> 'overhead-radar-range-'+distanceUnit;
     const radarRangeUser=()=>Math.round((currentRadarRange*distanceUnitSpec().factor)/5)*5;
     const nearestRadarRange=(value)=>radarRanges.reduce((a,b)=>Math.abs(b-value)<Math.abs(a-value)?b:a,radarRanges[0]);
     const radarRangeNm=(value)=>value/distanceUnitSpec().factor;
+    function requestRadarRange(radius){
+      // Serialize updates: a slow earlier request must not overwrite a later click.
+      const requested=radius;
+      radarRangePending=requested;
+      radarRangeRequest=radarRangeRequest.catch(()=>{}).then(async()=>{
+        const response=await fetch('/radar-range?radius='+encodeURIComponent(requested),{cache:'no-store'});
+        if(!response.ok)throw new Error('Radar range update failed ('+response.status+')');
+      }).catch(error=>{console.warn(error);}).then(()=>{
+        if(radarRangePending===requested)radarRangePending=null;
+      });
+      return radarRangeRequest;
+    }
     function displayRadarRangeValue(nm,auto=false){return (auto?'AUTO ':'')+Math.round(Number(nm)*distanceUnitSpec().factor/5)*5+' '+distanceUnitSpec().label;}
     function updateRadarRangeControls(){
       const current=radarRangeUser(),idx=radarRanges.indexOf(nearestRadarRange(current));
@@ -2908,7 +2921,7 @@ PAGE = b"""<!doctype html>
       if(resetCommentary)renderCommentary(d); else tickCommentaryCountdown();
       const prefix=d.tracking_active?'AUTO ':'';
       const radarRange=byId('radar-range');
-      if(radarRange&&Number.isFinite(Number(d.radar_radius_nm)))radarRange.textContent=displayRadarRangeValue(d.radar_radius_nm,Boolean(d.tracking_active));
+      if(radarRange&&Number.isFinite(Number(d.radar_radius_nm)))radarRange.textContent=displayRadarRangeValue(!d.tracking_active&&radarRangePending!==null?radarRangePending:d.radar_radius_nm,Boolean(d.tracking_active));
     }
     function setSpeedUnit(value){
       if(!validSpeedUnits.has(value))return;
@@ -2921,7 +2934,8 @@ PAGE = b"""<!doctype html>
         const saved=Number(localStorage.getItem(radarRangeKey()));
         const requested=radarRanges.includes(saved)?saved:nearestRadarRange(currentRadarRange*distanceUnitSpec().factor);
         currentRadarRange=radarRangeNm(requested);
-        fetch('/radar-range?radius='+encodeURIComponent(currentRadarRange),{cache:'no-store'});
+        localStorage.setItem(radarRangeKey(),String(requested));
+        requestRadarRange(currentRadarRange);
       }
       renderUnitSensitiveValues(lastDisplayStatus,false);
       updateRadarRangeControls();
@@ -3243,7 +3257,7 @@ PAGE = b"""<!doctype html>
         if((contacts||[]).length<=10&&c.flight&&!c.selected){ const label=document.createElementNS(svgNS,'text'); label.textContent=c.flight; label.setAttribute('x','2.8'); label.setAttribute('y','-1.5'); label.setAttribute('transform','rotate('+(0-(Number(c.track)||0))+' 2.8 -1.5)'); group.appendChild(label); }
         layer.appendChild(group);
       }
-      currentRadarRange=Number(radius)||25; byId('radar-count').textContent=(contacts||[]).length+' CONTACTS'; byId('radar-range').textContent=displayRadarRangeValue(radius,trackingActive);
+      currentRadarRange=!trackingActive&&radarRangePending!==null?radarRangePending:(Number(radius)||25); byId('radar-count').textContent=(contacts||[]).length+' CONTACTS'; byId('radar-range').textContent=trackingActive||radarRangePending===null?displayRadarRangeValue(radius,trackingActive):displayRadarRangeValue(radarRangePending,false);
       updateRadarRangeControls();
     }
     const isMobileViewport=()=>window.matchMedia('(max-width:700px), (max-width:950px) and (max-height:500px)').matches;
@@ -3404,7 +3418,7 @@ PAGE = b"""<!doctype html>
       currentRadarRange=radarRangeNm(next); localStorage.setItem(radarRangeKey(),String(next));
       byId('radar-range').textContent=next+' '+distanceUnitSpec().label;
       updateRadarRangeControls();
-      await fetch('/radar-range?radius='+encodeURIComponent(currentRadarRange),{cache:'no-store'});
+      await requestRadarRange(currentRadarRange);
     }
     async function update(){
       try{
@@ -3501,7 +3515,7 @@ PAGE = b"""<!doctype html>
       else if(byId('location-backdrop').classList.contains('open'))closeLocationSelector();
       else if(byId('wall').classList.contains('settings-open'))setSettings(false);
     });
-    const savedRange=Number(localStorage.getItem(radarRangeKey())); if(radarRanges.includes(savedRange)){ currentRadarRange=radarRangeNm(savedRange); fetch('/radar-range?radius='+encodeURIComponent(currentRadarRange),{cache:'no-store'}); }
+    const savedRange=Number(localStorage.getItem(radarRangeKey())); if(radarRanges.includes(savedRange)){ currentRadarRange=radarRangeNm(savedRange); requestRadarRange(currentRadarRange); }
     let cursorIdleTimer=null;
     function resetCursorIdle(){
       document.documentElement.classList.remove('cursor-hidden');
