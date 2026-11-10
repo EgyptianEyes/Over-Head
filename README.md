@@ -23,10 +23,11 @@ The main display shows:
 - airline/registered-owner branding when a suitable full wordmark is available
 - a live route map with origin, aircraft position and destination
 - an optional wider-area radar
-- live, reconnecting and demo status
+- scanning, live, reconnecting, rate-limited, demo and error status
 
-When no aircraft is available, the display shows **Scanning the skies…** rather
-than inserting sample traffic.
+When a successful aircraft response contains no eligible selection, the status
+shows **Scanning** and the idle message rotates. Over-Head never inserts sample
+traffic during live operation.
 
 When a live response contains no eligible aircraft, commentary observation timing
 is skipped until an aircraft is selected. This prevents an `AttributeError` from
@@ -89,11 +90,12 @@ previous manual radar range.
 
 Manual radar distance controls increase or decrease the displayed range in
 increments of 5 nautical miles, miles or kilometres, according to the selected
-distance unit. The chosen radar range updates immediately using cached aircraft positions,
-without waiting for the next upstream aircraft polling interval. Each unit retains its own manual range in the browser, and range
-changes are applied in order so slower network responses cannot undo later clicks.
-Automatic tracking adjusts the radar range to follow aircraft
-beyond the configured monitoring area.
+distance unit. Each unit retains its own manual range in the browser. The chosen
+range updates immediately using cached aircraft positions, without waiting for
+the next upstream aircraft polling interval. Range changes are serialized so
+slower network responses cannot undo later clicks, and do not change the normal
+aircraft query radius. Automatic tracking adjusts the radar display scale and
+the tracking-area query independently.
 
 Normal aircraft monitoring remains restricted to the configured location and
 radius. Long-distance tracking uses direct aircraft lookups rather than
@@ -280,19 +282,23 @@ If Radar was open when the camera was pressed, the desktop image contains the no
 Flight + Radar composition and the mobile companion contains the mobile Radar view. If
 Radar was closed, both variants use their normal Flight presentation.
 
-Snapshot pairs are written beneath:
+Visitor snapshot pairs are written beneath a session-specific directory under:
 
 ```text
-screenshots/
+screenshots/visitors/
 ```
 
-with a persistent `screenshots/index.json` metadata index. Filenames include the
-capture time and available flight/registration/route identifiers, with `_desktop.png`
-and `_mobile.png` suffixes.
+Each visitor can save up to 20 pairs; the server allows at most 50 pairs across
+all sessions. Captures are serialized globally, limited to one every 30 seconds
+per visitor, and rejected rather than queued when another capture is running.
+Files and their index are deleted when that visitor's session expires after 30
+minutes without an active browser heartbeat. Filenames include the capture time
+and available flight/registration/route identifiers, with `_desktop.png` and
+`_mobile.png` suffixes.
 
-Open **Settings → Snapshots** to browse the saved archive inside Over-Head. Each saved
-flight appears once with Desktop and Mobile previews. Either image can be opened at
-full size in the UI, and deleting the record removes both PNG files together.
+Open the saved-snapshots control in the header to browse the archive inside Over-Head.
+Each saved flight appears once with Desktop and Mobile previews. Either image can be
+opened at full size in the UI, and deleting the record removes both PNG files together.
 
 Snapshot rendering uses Chromium through Playwright so the saved files are genuine
 responsive renders of the same Over-Head HTML/CSS/Leaflet interface rather than a
@@ -321,7 +327,6 @@ Settings currently provide:
 - sound alerts
 - current location
 - full-screen mode
-- saved flight snapshots
 
 Closing ordinary Settings restores the radar state that was active before
 Settings was opened.
@@ -338,14 +343,19 @@ fits inside the viewport without scrolling. You can:
 **USE MY LOCATION** gently pulses as `LOCATING...` while the browser location
 request is in progress.
 
-Saving the location preserves other `config.json` values and updates the running
-monitor without restarting the service. It clears aircraft from the previous
-location and schedules a fresh geographic query immediately when a display is
-active, even if the normal five-minute polling interval has not elapsed.
-The interface returns directly to Radar and shows the new location while
-the first result is obtained. Cancelling, closing,
-clicking the backdrop or pressing Escape also exits the location chooser back to
-Radar.
+Each browser receives an independent, opaque session. Its selected location,
+radar range, tracked aircraft and snapshot library are kept in server memory and
+are not written to the operator's `config.json`. A session expires after 30
+minutes without an active browser heartbeat; refreshing an active page preserves
+its session. Browser geolocation is sent to the server for that session and is
+discarded when the session expires.
+
+Location changes clear that visitor's previous aircraft and queue a fresh query.
+Queries share one server-wide acquisition scheduler, so a change can wait for the
+next available provider slot. The status shows when a request is queued. Other
+visitors' locations, tracked aircraft and radar ranges are unchanged. Cancelling,
+closing, clicking the backdrop or pressing Escape exits the location chooser
+back to Radar.
 
 On first normal startup, if `config.json` is missing, Over-Head opens a dedicated
 location setup page and does not start live tracking until an explicit location
@@ -455,9 +465,11 @@ Over-Head opens locally at:
 http://127.0.0.1:8765/
 ```
 
-On the first run, if `config.json` does not exist, the browser opens the location
-setup screen. Save the home location and Over-Head will continue into the normal
-live monitor.
+On the first run, if `config.json` does not exist, Over-Head opens a location
+setup screen for the operator default. Saving this persistent default is
+restricted to a loopback connection; use the local browser or an SSH tunnel.
+Ordinary public visitors choose a separate, temporary session location and
+cannot overwrite the operator configuration.
 
 #### Headless Linux server
 
@@ -649,6 +661,12 @@ You can also create or edit `config.json` manually:
 }
 ```
 
+`radius_nm` sets the normal aircraft query radius and the initial radar display
+range. Subsequent manual radar zoom changes only the display range; they do not
+change the provider query area. Explicit TRACK mode scales the radar and its
+bounded local query automatically while resolving the selected aircraft
+directly.
+
 `demo_on_failure` is retained for configuration compatibility, but live operation
 does not silently substitute demo traffic. Demonstration aircraft are displayed
 only when Over-Head is explicitly started with `--demo`.
@@ -656,25 +674,136 @@ only when Over-Head is explicitly started with `--demo`.
 ### Aircraft polling and provider failover
 
 The default aircraft-position polling interval is **300 seconds (five minutes)**.
-This is approximately 288 scheduled position polls per day during uninterrupted
-monitoring, excluding direct TRACK lookups, other data requests and retries.
-Polling pauses when there is no active monitor window and resumes when a
-monitor becomes active.
+Normal geographic scans use one shared provider-backed slot every 300 seconds,
+regardless of the number of visitors: at most 288 scans/day. Inactive sessions
+are excluded; distinct uncovered locations share a fair queue. The service caps
+concurrent in-memory sessions at 64 and reports queue position and estimated wait.
 
-ADSB.lol is the primary live aircraft-position provider. When unavailable or
-rate-limited (HTTP 429), Over-Head can fall back to ADSB.fi. Provider rate-limit
-handling observes available retry/reset information and allows subsequent
-recovery to the primary provider. If live aircraft information cannot be
-retrieved, the application does not substitute demonstration aircraft.
+With simultaneous visitors at distinct locations and no reusable geographic
+coverage, the deterministic scheduler model is:
+
+| Active visitors | Average first-observation wait | Last first-observation wait | Per-visitor steady cadence | Peak queued visitors |
+|---:|---:|---:|---:|---:|
+| 1 | immediate | immediate | 5 minutes | 0 |
+| 2 | 2 minutes 30 seconds | 5 minutes | 10 minutes | 1 |
+| 5 | 10 minutes | 20 minutes | 25 minutes | 4 |
+| 10 | 22 minutes 30 seconds | 45 minutes | 50 minutes | 9 |
+| 64 | 2 hours 37 minutes 30 seconds | 5 hours 15 minutes | 5 hours 20 minutes | 63 |
+
+Explicit tracking has independent **30-second per-target deadlines**. Its initial
+lookup is scheduled promptly without waiting for the global geographic slot.
+Deadlines and shared-cache expiry start at the request attempt, not its response,
+so response latency does not silently turn a 30-second interval into 60 seconds.
+One acquisition worker serializes requests; network latency, cooldowns and budgets
+can still delay updates. Tracking selection survives ordinary updates. Cancellation,
+an inactive browser lease (12 seconds), or session expiry stops future targeted
+requests unless another active visitor still tracks the aircraft. A request already
+in flight cannot be recalled, but a tracking revision check rejects its late result.
+
+Visitors share positive, missing and failed results for the same target interval.
+Callsign lookups require an exact match and an unambiguous ICAO identity; once
+resolved, subsequent requests are pinned to that hex. Shared callsign results are
+short-lived aliases to that observation, not permanent callsign-to-aircraft links.
+Distinct hex identities never share history merely because their callsigns match.
+
+All geographic and targeted position attempts, including failed attempts and
+fallbacks, consume rolling 60-second budgets: currently **30 per provider and 30
+aggregate**, defined by `PROVIDER_REQUESTS_PER_MINUTE` and
+`AGGREGATE_REQUESTS_PER_MINUTE` in `overhead.py`. Switching provider does not
+reset the aggregate budget. These are local safety ceilings, **not verified
+provider-approved allowances**. Operators must establish permitted usage before
+live operation and lower these ceilings if necessary; no external provider
+research or new providers were introduced by this change. Route, photo, identity
+and map services remain separate and are not covered by the position budget.
+
+Thirty-second updates cost at least two successful requests per minute per
+distinct target. The aggregate ceiling therefore supports fewer than 15 continuously
+tracked targets once geographic scans, failures and fallback overhead are included.
+Under overload, least-recently-served targets take priority rather than allowing
+early targets to monopolize each renewed budget. This is bounded best-effort
+tracking, not a 30-second guarantee under arbitrary load. Budgets and shared caches
+are process-local; multiple application instances require a shared limiter.
+
+Deterministic offline workload checks exercise actual mocked upstream requests:
+
+| Workload | Upstream attempts | Observation timing |
+|---|---:|---|
+| 12 visitors, 4 aircraft, 5 updates over 120 seconds, one primary HTTP 429 | 21 (20 successful lookups + one 429) | Every visitor receives genuine observations at 0/30/60/90/120 seconds |
+| 32 distinct aircraft, updates at 0/30/60 seconds | 30/0/30 per update | All targets served by 60 seconds; overloaded updates explicitly delayed |
+
+Zero simulated lookup latency uses instantaneous fixtures and is not an estimate
+of real provider latency. A separate eight-second response fixture verifies that
+the next permitted request remains due 30 seconds after the previous attempt.
+
+Fresh aircraft observations can be reused for at most 300 seconds when the
+queried geographic circle fully contains another visitor's requested circle.
+This supports identical locations and genuinely covered overlaps without a new
+provider cycle. A normal 25 NM query does not cover a different 25 NM circle
+unless their centers coincide, so this does not solve demand across distant
+cities. The application currently has no provider-approved budget for increasing
+the distinct-location acquisition rate; operator capacity must be kept low or
+the provider budget must be established before changing the interval.
+
+The browser refreshes local status every two seconds; those requests do not create
+aircraft-provider requests. Provider cooldowns and result sharing reduce actual
+traffic, but do not establish that the configured maximum is within upstream
+terms.
+
+ADSB.lol is the primary live aircraft-position provider. The existing ADSB.fi
+fallback maps the primary's `/v2/point`, `/v2/hex` and `/v2/callsign` paths to
+`/api/v3/lat/.../lon/.../dist/...`, `/api/v3/hex/...` and
+`/api/v3/callsign/...`. These mappings are tested with local fixtures, not newly
+verified against live APIs. Airplanes.live is not implemented. FlightAware,
+adsb.im and ADSBDB provide enrichment, not aircraft-position fallback.
+
+Unavailable, forbidden, rate-limited, malformed, missing-target, conflicting or
+stale responses can trigger eligible fallback. A satisfactory response stops
+additional provider requests. HTTP 403 starts at a five-minute cooldown; network,
+timeout, invalid-response and other HTTP failures start at 30 seconds, with
+exponential backoff capped at one hour. An explicit `Retry-After`, including an
+HTTP date, is never shortened by that cap. Provider cooldowns and budgets are
+shared across acquisition modes, and the primary is eligible again after recovery.
+The legacy `x-ratelimit-reset` interpretation remains unverified against provider
+documentation; a valid `Retry-After` takes precedence.
+
+Normalized records preserve identity, registration, callsign, coordinates, altitude,
+speed, heading and vertical rate along with source, receipt time, reported position
+age and observation timestamp. An available payload timestamp contributes to the
+actual age; HTTP 200 alone does not establish freshness. Geographic selections use
+a 20-second freshness threshold; targeted lookups accept observations up to 60
+seconds old, but the display labels anything over 20 seconds as last known.
+Missing one provider's record is not proof of disappearance. Older responses cannot
+overwrite a newer retained target observation. Stale-only responses, lookup misses,
+provider failures and delayed acquisition are distinguishable in local status.
+
+Altitude, speed, vertical-rate and distance history use only strictly newer actual
+observations, including those shared with other visitors. Source changes retain
+history for the same hex; identity changes reset it. Repeated browser status reads,
+replayed provider observations and cached updates do not fabricate history entries.
+Provider diagnostics read shared local request counters and cooldown state; no
+independent health-probe thread makes additional ADS-B requests. FlightAware AeroAPI
+is not synthetically probed. When acquisition fails, last-known positions age in
+place and expire; the last-success timestamp is not advanced. Live mode never
+substitutes demonstration aircraft.
 
 Provider diagnostics are available from the running monitor at
 `http://127.0.0.1:8765/provider-status`.
+They include active/last-successful provider, last observation and actual age,
+request counters, last response status, cooldowns, budget delays and switch reason.
+Session `/status` also includes the acquisition interval, observation source and
+timestamp, and tracking acquisition outcome.
+
+Validation: `python -m unittest discover` runs the deterministic regression and
+workload checks. `python acceptance_playwright.py` is the offline desktop/mobile
+acceptance gate; in the current container it cannot launch Chromium because
+`libatk-1.0.so.0` is absent. No dependencies were installed. Live API behavior,
+usage policies and browser acceptance remain outstanding verification requirements.
 
 Existing installations keep the `refresh_seconds` value in their local
-`config.json`: updating code does not overwrite it. To adopt the five-minute
-interval on an existing installation, set `"refresh_seconds": 300` in that
-file. The default also needs to be set in application code for new installations;
-editing this README alone does not change runtime behaviour.
+`config.json`: updating code does not overwrite it. A visitor's per-session
+refresh interval is still bounded by the shared 300-second minimum acquisition
+spacing. Lowering `refresh_seconds` does not raise aggregate public request
+volume. The default remains 300 seconds for new installations.
 
 An optional FlightAware AeroAPI key can be supplied through the
 `FLIGHTAWARE_AEROAPI_KEY` environment variable or the `flightaware_api_key`
@@ -732,6 +861,11 @@ The regression suite covers route-source selection and plausibility,
 persistent flight tracking, route-map layout and animation, branding, flags,
 location handling, radar behaviour, browser title state, paired flight snapshots,
 footer credits, live/demo failure behaviour and the RGB output path.
+
+Run the offline desktop/mobile browser acceptance checks with
+`python3 acceptance_playwright.py`. They use fixture aircraft data and a local
+Leaflet shim; they do not contact aircraft or map services. Playwright Chromium
+and its Linux system libraries must be installed for these checks to run.
 
 ## Connecting RGB hardware later
 

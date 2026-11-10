@@ -38,6 +38,11 @@ class Settings:
     output_rgb: str = "output/frame.rgb"
     output_png: str = "output/frame.png"
     demo_on_failure: bool = False
+    query_radius_nm: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.query_radius_nm is None:
+            self.query_radius_nm = float(self.radius_nm)
 
 
 class AircraftFeedRateLimited(OSError):
@@ -46,6 +51,18 @@ class AircraftFeedRateLimited(OSError):
     def __init__(self, retry_seconds: float):
         self.retry_seconds = max(0.0, float(retry_seconds))
         super().__init__(f"Aircraft providers unavailable; retry in {self.retry_seconds:.0f}s")
+
+
+class AircraftFeedUnavailable(OSError):
+    """Aircraft providers are restricted or unavailable for a non-quota reason."""
+
+    def __init__(self, retry_seconds: float):
+        self.retry_seconds = max(0.0, float(retry_seconds))
+        super().__init__(f"Aircraft providers unavailable; retry in {self.retry_seconds:.0f}s")
+
+
+class AircraftPositionStale(OSError):
+    pass
 
 
 AIRCRAFT_PROVIDERS = (
@@ -57,13 +74,55 @@ _provider_retry_until: dict[str, float] = {}
 _provider_backoff: dict[str, float] = {}
 _provider_request_counts: dict[str, int] = {}
 _provider_last_status: dict[str, str] = {}
+_provider_last_attempt_at: dict[str, float] = {}
+_provider_last_success_at: dict[str, float] = {}
+_last_successful_aircraft_provider = ""
+_last_provider_switch_reason = ""
+_provider_request_windows: dict[str, list[float]] = {}
+PROVIDER_REQUESTS_PER_MINUTE = 30
+AGGREGATE_REQUESTS_PER_MINUTE = 30
+_active_aircraft_provider = ""
+_last_aircraft_observation: float | None = None
+
+
+def normalise_aircraft(record: dict[str, Any], source: str, received_at: float, payload_time: Any = None) -> dict[str, Any]:
+    result = dict(record)
+    result["hex"] = str(record.get("hex") or "").strip().lower()
+    if "flight" in result:
+        result["flight"] = str(result["flight"] or "").strip().upper()
+    try:
+        age = float(record.get("seen_pos"))
+        generated_at = float(payload_time) if payload_time is not None else received_at
+        if generated_at > 100_000_000_000:
+            generated_at /= 1000.0
+        if not math.isfinite(age) or age < 0 or not math.isfinite(generated_at):
+            raise ValueError("Invalid position age")
+        validate_location(record.get("lat"), record.get("lon"))
+        observed_at = min(received_at, generated_at) - age
+        result.update(source=source, observed_at=observed_at, received_at=received_at,
+                      reported_position_age=age, seen_pos=max(0.0, received_at - observed_at))
+    except (TypeError, ValueError, OverflowError):
+        result.update(source=source, observed_at=None, received_at=received_at, seen_pos=999.0)
+    return result
+
+
+def _request_budget_wait(name: str, now: float) -> float:
+    windows = {key: [stamp for stamp in _provider_request_windows.get(key, []) if now - stamp < 60]
+               for key in (name, "_aggregate")}
+    waits = [0.0]
+    for key, limit in ((name, PROVIDER_REQUESTS_PER_MINUTE), ("_aggregate", AGGREGATE_REQUESTS_PER_MINUTE)):
+        window = windows[key]
+        if len(window) >= limit:
+            waits.append(max(0.0, 60 - (now - window[0])))
+    return max(waits)
 
 
 def _retry_after_seconds(value: str | None) -> float | None:
     if not value:
         return None
     try:
-        return max(0.0, float(value))
+        seconds = float(value)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
     except (TypeError, ValueError):
         try:
             date = email.utils.parsedate_to_datetime(value)
@@ -73,24 +132,42 @@ def _retry_after_seconds(value: str | None) -> float | None:
 
 
 def _pause_provider(name: str, error: Exception) -> None:
+    status = getattr(error, "code", None)
     headers = getattr(error, "headers", None)
     retry = _retry_after_seconds(headers.get("Retry-After") if headers else None)
     if retry is None and headers and headers.get("x-ratelimit-remaining") == "0":
         retry = _retry_after_seconds(headers.get("x-ratelimit-reset"))
-    delay = max(30.0, retry if retry is not None else _provider_backoff.get(name, 30.0))
+    minimum = 300.0 if status == 403 else 30.0
+    delay = max(minimum, retry if retry is not None else _provider_backoff.get(name, minimum))
     _provider_retry_until[name] = time.monotonic() + delay
-    _provider_backoff[name] = min(3600.0, max(60.0, delay * 2.0))
-    _provider_last_status[name] = "429" if getattr(error, "code", None) == 429 else type(error).__name__
+    _provider_backoff[name] = min(3600.0, max(minimum * 2.0, delay * 2.0))
+    _provider_last_status[name] = "429" if status == 429 else f"HTTP {status}" if status is not None else type(error).__name__
 
 
 def aircraft_provider_status() -> dict[str, dict[str, object]]:
     """Local-only diagnostics; never contacts an upstream API."""
-    with _aircraft_request_lock:
-        now = time.monotonic()
-        return {name: {"requests": _provider_request_counts.get(name, 0),
-                       "retry_in_seconds": round(max(0.0, _provider_retry_until.get(name, 0) - now)),
-                       "last_status": _provider_last_status.get(name, "not-tested")}
-                for name, _ in AIRCRAFT_PROVIDERS}
+    now = time.monotonic()
+    providers = {
+        name: {
+            "requests": _provider_request_counts.get(name, 0),
+            "retry_in_seconds": round(max(0.0, _provider_retry_until.get(name, 0) - now)),
+            "last_status": _provider_last_status.get(name, "not-tested"),
+            "last_attempt_at": _provider_last_attempt_at.get(name),
+            "last_success_at": _provider_last_success_at.get(name),
+            "last_successful_provider": name == _last_successful_aircraft_provider,
+            "budget_retry_in_seconds": round(_request_budget_wait(name, now), 2),
+        }
+        for name, _ in AIRCRAFT_PROVIDERS
+    }
+    providers["_meta"] = {
+        "last_successful_provider": _last_successful_aircraft_provider or None,
+        "last_provider_switch_reason": _last_provider_switch_reason or None,
+        "active_provider": _active_aircraft_provider or None,
+        "last_observation_at": _last_aircraft_observation,
+        "position_age_seconds": max(0.0, time.time() - _last_aircraft_observation) if _last_aircraft_observation is not None else None,
+        "aggregate_requests_per_minute": AGGREGATE_REQUESTS_PER_MINUTE,
+    }
+    return providers
 
 
 def _provider_url(name: str, base: str, path: str) -> str:
@@ -109,46 +186,104 @@ def _provider_url(name: str, base: str, path: str) -> str:
 
 def fetch_provider_aircraft(path: str) -> list[dict[str, Any]]:
     """Try primary, then independent fallback; one request per eligible provider."""
+    global _last_successful_aircraft_provider, _last_provider_switch_reason, _active_aircraft_provider, _last_aircraft_observation
     with _aircraft_request_lock:
         wait_times = []
         last_error: Exception | None = None
+        best_records: list[dict[str, Any]] = []
+        best_observation = float("-inf")
+        usable_response = False
+        target_kind, _, target = path.removeprefix("/v2/").partition("/")
+        targeted = target_kind in {"hex", "callsign"}
         for name, base in AIRCRAFT_PROVIDERS:
-            remaining = _provider_retry_until.get(name, 0.0) - time.monotonic()
+            now = time.monotonic()
+            remaining = max(_provider_retry_until.get(name, 0.0) - now, _request_budget_wait(name, now))
             if remaining > 0:
                 wait_times.append(remaining)
                 continue
             request = urllib.request.Request(_provider_url(name, base, path), headers={"User-Agent": "Over-Head/0.2 (+personal wall display)"})
+            _active_aircraft_provider = name
+            for key in (name, "_aggregate"):
+                _provider_request_windows[key] = [stamp for stamp in _provider_request_windows.get(key, []) if now - stamp < 60] + [now]
             _provider_request_counts[name] = _provider_request_counts.get(name, 0) + 1
+            _provider_last_attempt_at[name] = time.time()
             try:
                 with urllib.request.urlopen(request, timeout=8) as response:
                     payload = json.load(response)
                 if not isinstance(payload, dict) or not isinstance(payload.get("ac"), list):
                     raise ValueError(f"Unexpected {name} aircraft response")
+                if any(not isinstance(record, dict) for record in payload["ac"]):
+                    raise ValueError(f"Invalid {name} aircraft records")
+                received_at = time.time()
+                records = [normalise_aircraft(record, name, received_at, payload.get("now"))
+                           if "lat" in record or "lon" in record else dict(record) for record in payload["ac"]]
+                if targeted:
+                    field = "hex" if target_kind == "hex" else "flight"
+                    records = [record for record in records if str(record.get(field) or "").strip().upper() == target.upper()]
+                    if target_kind == "callsign" and len({record.get("hex") for record in records}) > 1:
+                        _provider_last_status[name] = "ambiguous identity"
+                        _last_provider_switch_reason = f"{name} returned conflicting aircraft identities"
+                        usable_response = True
+                        continue
+                fresh = [record for record in records if record.get("observed_at") is not None and record.get("seen_pos", 999) <= (60 if targeted else 20)]
+                usable_response = True
                 _provider_retry_until.pop(name, None)
                 _provider_backoff.pop(name, None)
                 _provider_last_status[name] = "OK"
-                return payload["ac"]
+                previous_provider = _last_successful_aircraft_provider
+                _provider_last_success_at[name] = time.time()
+                _last_successful_aircraft_provider = name
+                if previous_provider and previous_provider != name and not _last_provider_switch_reason:
+                    _last_provider_switch_reason = f"{previous_provider} unavailable; used {name}"
+                if fresh:
+                    _last_aircraft_observation = max(record["observed_at"] for record in fresh)
+                    return records
+                if not targeted and (not records or not any("lat" in record or "lon" in record for record in records)):
+                    return records
+                observation = max((record.get("observed_at") or float("-inf") for record in records), default=float("-inf"))
+                if observation > best_observation:
+                    best_records, best_observation = records, observation
+                _provider_last_status[name] = "stale" if records else "missing"
+                _last_provider_switch_reason = f"{name} returned {'stale positions' if records else 'no matching aircraft'}"
             except urllib.error.HTTPError as exc:
                 last_error = exc
-                if exc.code == 429:
+                _last_provider_switch_reason = f"{name} returned HTTP {exc.code}"
+                if exc.code in {403, 429}:
                     _pause_provider(name, exc)
                 elif exc.code >= 500:
                     _pause_provider(name, exc)
                 else:
-                    _provider_last_status[name] = f"HTTP {exc.code}"
+                    _pause_provider(name, exc)
+                exc.close()
             except (OSError, ValueError, TimeoutError, json.JSONDecodeError) as exc:
                 last_error = exc
+                _last_provider_switch_reason = f"{name} failed: {type(exc).__name__}"
                 _pause_provider(name, exc)
+        if usable_response:
+            return best_records
         if wait_times or any(_provider_retry_until.get(n, 0) > time.monotonic() for n, _ in AIRCRAFT_PROVIDERS):
-            remaining = [max(0.0, _provider_retry_until.get(n, 0) - time.monotonic()) for n, _ in AIRCRAFT_PROVIDERS]
-            raise AircraftFeedRateLimited(max(1.0, min(remaining))) from last_error
+            remaining = [max(0.0, _provider_retry_until.get(n, 0) - time.monotonic(), _request_budget_wait(n, time.monotonic())) for n, _ in AIRCRAFT_PROVIDERS]
+            statuses = [_provider_last_status.get(name, "") for name, _ in AIRCRAFT_PROVIDERS]
+            retry_seconds = max(1.0, min(remaining))
+            if all(_request_budget_wait(name, time.monotonic()) > 0 for name, _ in AIRCRAFT_PROVIDERS):
+                raise AircraftFeedRateLimited(retry_seconds) from last_error
+            if any(status == "HTTP 403" for status in statuses):
+                raise AircraftFeedUnavailable(retry_seconds) from last_error
+            if all(status == "429" for status in statuses):
+                raise AircraftFeedRateLimited(retry_seconds) from last_error
+            raise OSError("All aircraft providers are cooling down") from last_error
         raise OSError("All aircraft providers failed") from last_error
 
 
-def fetch_aircraft(settings: Settings) -> list[dict[str, Any]]:
+def fetch_aircraft(settings: Settings, radius_nm: float | None = None) -> list[dict[str, Any]]:
     """Request positions only within the configured monitoring area."""
-    query_radius = min(250.0, max(1.0, float(settings.radius_nm)))
-    return fetch_provider_aircraft(f"/v2/point/{settings.latitude}/{settings.longitude}/{query_radius:g}")
+    configured_radius = settings.query_radius_nm if radius_nm is None else radius_nm
+    query_radius = min(250.0, max(1.0, float(configured_radius)))
+    records = fetch_provider_aircraft(f"/v2/point/{settings.latitude}/{settings.longitude}/{query_radius:g}")
+    observed = [record for record in records if record.get("observed_at") is not None]
+    if observed and not any(record.get("seen_pos", 999) <= 20 for record in observed):
+        raise AircraftPositionStale("Only stale aircraft positions were returned")
+    return records
 
 
 DEMO = {
@@ -179,7 +314,7 @@ def validate_location(latitude: Any, longitude: Any) -> tuple[float, float]:
     try:
         latitude_value = float(latitude)
         longitude_value = float(longitude)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("Latitude and longitude must be numeric coordinates") from exc
     if not math.isfinite(latitude_value) or not -90 <= latitude_value <= 90:
         raise ValueError("Latitude must be between -90 and 90")
@@ -219,16 +354,24 @@ def haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def select_nearest(
-    aircraft: list[dict[str, Any]], settings: Settings
+    aircraft: list[dict[str, Any]], settings: Settings, max_position_age_seconds: float = 20.0
 ) -> tuple[dict[str, Any] | None, float | None]:
     candidates: list[tuple[float, dict[str, Any]]] = []
     for plane in aircraft:
+        if not isinstance(plane, dict):
+            continue
         lat, lon = plane.get("lat"), plane.get("lon")
-        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+        try:
+            latitude, longitude = validate_location(lat, lon)
+        except ValueError:
             continue
-        if float(plane.get("seen_pos", 999)) > 20:
+        try:
+            seen_position = float(plane.get("seen_pos", 999))
+        except (TypeError, ValueError):
             continue
-        distance = haversine_nm(settings.latitude, settings.longitude, float(lat), float(lon))
+        if not math.isfinite(seen_position) or seen_position < 0 or seen_position > max_position_age_seconds:
+            continue
+        distance = haversine_nm(settings.latitude, settings.longitude, latitude, longitude)
         candidates.append((distance, plane))
     if not candidates:
         return None, None
