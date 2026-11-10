@@ -2,6 +2,7 @@ config.json
 output/
 cache/
 screenshots/
+test-artifacts/
 __pycache__/
 *.py[cod]
 .venv/

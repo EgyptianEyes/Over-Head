@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import copy
+import concurrent.futures
 import hashlib
 import ipaddress
 import json
@@ -29,7 +30,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from xml.etree import ElementTree
 
-from overhead import AircraftFeedRateLimited, AircraftFeedUnavailable, AircraftPositionStale, DEMO, Settings, aircraft_provider_status, fetch_provider_aircraft, fetch_aircraft, haversine_nm, load_settings, render, save_frame, select_nearest, validate_location
+from overhead import AircraftFeedRateLimited, AircraftFeedUnavailable, AircraftPositionInvalid, AircraftPositionStale, DEMO, Settings, aircraft_provider_status, fetch_provider_aircraft, fetch_aircraft, haversine_nm, load_settings, render, save_frame, select_nearest, validate_location
 
 
 SOARING_INDEX_URL = (
@@ -56,6 +57,13 @@ COUNTRY_FLAG_URL = (
 )
 SQUARE_FLAG_COUNTRIES = frozenset({"CH", "VA"})
 USER_AGENT = "Over-Head/0.2 (+personal wall display)"
+SECURITY_RESPONSE_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "X-Frame-Options": "DENY",
+    "Permissions-Policy": "geolocation=(self), fullscreen=(self)",
+    "Content-Security-Policy": "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self' 'unsafe-inline' https://unpkg.com; style-src 'self' 'unsafe-inline' https://unpkg.com; img-src 'self' data: blob: https://tile.openstreetmap.org https://unpkg.com; font-src 'self' data: https://unpkg.com; connect-src 'self'; media-src 'self'",
+}
 MAX_LOGO_BYTES = 1_000_000
 MAX_AIRCRAFT_PHOTO_BYTES = 8_000_000
 AIRCRAFT_PHOTO_RETRY_SECONDS = 300.0
@@ -2008,7 +2016,8 @@ PAGE = b"""<!doctype html>
     .location-details { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; min-height:0; }
     .location-coordinate { padding:clamp(9px,1.2vh,12px) 14px; border:1px solid var(--line); border-radius:12px; background:rgba(20,236,255,.025); }
     .location-coordinate span { display:block; margin-bottom:4px; color:var(--muted); font-size:10px; font-weight:700; letter-spacing:.16em; }
-    .location-coordinate strong { color:var(--white); font:700 clamp(15px,1.2vw,20px)/1.15 "Segoe UI",sans-serif; }
+    .location-coordinate input { display:block; width:100%; min-width:0; padding:0; border:0; outline:none; background:transparent; color:var(--white); font:700 clamp(15px,1.2vw,20px)/1.15 "Segoe UI",sans-serif; font-variant-numeric:tabular-nums; }
+    .location-coordinate input:focus-visible { outline:1px solid var(--cyan); outline-offset:3px; }
     .location-status { min-height:1.35em; color:var(--muted); font-size:clamp(11px,.9vw,14px); }
     .location-status.error { color:var(--amber); }
     .location-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:10px; min-height:0; }
@@ -2120,6 +2129,12 @@ PAGE = b"""<!doctype html>
     .footer-attribution:hover { color:var(--muted); }
     #footer-status { flex:0 0 auto; white-space:nowrap; }
     @media (max-width:1150px) { .wall.radar-open .content,.wall.settings-open .content { grid-template-columns:minmax(0,1fr) minmax(280px,36vw); } .wall.radar-open .metrics,.wall.settings-open .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+        @media (min-width:701px) and (max-width:950px) {
+            .wall.radar-open .radar-foot { flex-wrap:wrap; gap:8px; }
+            .wall.radar-open .radar-track { flex:1 1 100%; }
+            .wall.radar-open .radar-zoom { width:100%; justify-content:flex-end; }
+            .wall.radar-open .radar-heading span { font-size:9px; letter-spacing:.06em; }
+        }
     @media (max-aspect-ratio:4/3) { .callsign { font-size:clamp(56px,15vw,130px); } }
     @media (min-width:701px) and (max-height:780px) {
       .information { padding-bottom:22px; }
@@ -2437,7 +2452,7 @@ PAGE = b"""<!doctype html>
       .location-details { gap:6px; }
       .location-coordinate { padding:6px 8px; }
       .location-coordinate span { font-size:7px; }
-      .location-coordinate strong { font-size:12px; }
+    .location-coordinate input { font-size:12px; }
       .location-status { min-height:1.2em; font-size:9px; }
       .location-actions { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:5px; }
       .location-actions .setting-action { min-width:0; padding:.55em .35em; font-size:8px; letter-spacing:.06em; }
@@ -2448,6 +2463,9 @@ PAGE = b"""<!doctype html>
       .sound-toggle,.commentary-toggle,.camera-toggle,.snapshots-toggle,.fullscreen-toggle,.settings-toggle { width:27px; height:27px; padding:5px; flex-basis:27px; }
       .radar-toggle { min-height:27px; padding:.48em .52em; font-size:8px; }
     }
+        @media (prefers-reduced-motion:reduce) {
+            *,*::before,*::after { scroll-behavior:auto !important; animation-duration:.01ms !important; animation-iteration-count:1 !important; transition-duration:.01ms !important; }
+        }
 
   </style>
 </head>
@@ -2504,7 +2522,7 @@ PAGE = b"""<!doctype html>
     <div class="location-dialog">
       <div class="location-dialog-head"><div><strong id="location-title">SELECT CURRENT LOCATION</strong><p>Use your device's high-accuracy browser location, or click and drag the marker to set the exact home centre used for aircraft tracking.</p></div><button class="location-close" id="location-close" type="button" aria-label="Close location selector">&times;</button></div>
       <div id="location-map" aria-label="Map for selecting the Over-Head home location"></div>
-      <div class="location-details"><div class="location-coordinate"><span>LATITUDE</span><strong id="location-latitude">--</strong></div><div class="location-coordinate"><span>LONGITUDE</span><strong id="location-longitude">--</strong></div></div>
+    <div class="location-details"><label class="location-coordinate"><span>LATITUDE</span><input id="location-latitude" type="number" min="-90" max="90" step="any" inputmode="decimal" aria-label="Home latitude" placeholder="-90 to 90"></label><label class="location-coordinate"><span>LONGITUDE</span><input id="location-longitude" type="number" min="-180" max="180" step="any" inputmode="decimal" aria-label="Home longitude" placeholder="-180 to 180"></label></div>
       <div class="location-status" id="location-status">Choose a point on the map or use your device location.</div>
       <div class="location-actions"><button class="setting-action" id="location-use-device" type="button">USE MY LOCATION</button><button class="setting-action" id="location-cancel" type="button">CANCEL</button><button class="setting-action location-primary" id="location-save" type="button">SAVE LOCATION</button></div>
     </div>
@@ -2512,6 +2530,21 @@ PAGE = b"""<!doctype html>
   <audio id="alert-tone" preload="auto" src="/beep-tone.mp3"></audio>
   <script>
     const byId=id=>document.getElementById(id);
+        let modalReturnFocus=null,viewerReturnFocus=null;
+        function focusModalControl(selector){ const control=byId(selector); if(control)control.focus(); }
+        function trapModalTab(event){
+            if(event.key!=='Tab')return;
+            const viewer=byId('snapshot-viewer');
+            const location=byId('location-backdrop');
+            const gallery=byId('snapshot-backdrop');
+            const dialog=viewer.classList.contains('open')?viewer:location.classList.contains('open')?location:gallery.classList.contains('open')?gallery:null;
+            if(!dialog)return;
+            const controls=[...dialog.querySelectorAll('button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')].filter(item=>item.getClientRects().length);
+            if(!controls.length){ event.preventDefault(); return; }
+            const first=controls[0],last=controls[controls.length-1];
+            if(event.shiftKey&&(document.activeElement===first||!dialog.contains(document.activeElement))){ event.preventDefault(); last.focus(); }
+            else if(!event.shiftKey&&(document.activeElement===last||!dialog.contains(document.activeElement))){ event.preventDefault(); first.focus(); }
+        }
     const snapshotParams=new URLSearchParams(location.search);
     const snapshotId=snapshotParams.get('snapshot')||'';
     const snapshotRadar=snapshotParams.get('radar')==='1';
@@ -2590,10 +2623,10 @@ PAGE = b"""<!doctype html>
     function formatDistanceNm(value,digits=1){ const converted=distanceFromNm(value); return converted==null?'--':converted.toFixed(digits)+' '+distanceUnitSpec().label; }
     function formatDistanceValue(value,digits=1){ const converted=distanceFromNm(value); return converted==null?'--':converted.toFixed(digits); }
     function smartDistanceNm(value,precise=false){ const converted=distanceFromNm(value); if(converted==null)return ''; const digits=precise||converted<1?2:converted<10?1:0; return converted.toFixed(digits)+' '+distanceUnitSpec().label; }
-    const routeMapElement=byId('route-map'); let routeMap=null,routeMapLayers=[];
+    const routeMapElement=byId('route-map'); let routeMap=null,routeMapLayers=[],routeMapRenderKey='';
     let routeFlowKey='',routeFlowStartedAt=Date.now();
     let currentHomeLatitude=null,currentHomeLongitude=null,currentLocationRevision=0;
-    let locationMap=null,locationMarker=null,locationAccuracyCircle=null;
+    let locationMap=null,locationMarker=null,locationAccuracyCircle=null,locationDialogRevision=0;
     if(typeof L!=='undefined'){
       routeMap=L.map('route-map',{zoomControl:false,dragging:false,scrollWheelZoom:false,doubleClickZoom:false,boxZoom:false,keyboard:false,touchZoom:false,worldCopyJump:false,attributionControl:false,zoomSnap:.25,zoomDelta:.25,minZoom:0,maxZoom:8});
       L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{minZoom:0,maxZoom:8,attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>'}).addTo(routeMap);
@@ -2618,7 +2651,7 @@ PAGE = b"""<!doctype html>
     }
     const finiteCoordinate=value=>typeof value==='number'&&Number.isFinite(value);
     function unwrapLongitude(longitude,centreLongitude){ let value=Number(longitude); while(value-centreLongitude>180)value-=360; while(value-centreLongitude<-180)value+=360; return value; }
-    function clearRouteMap(){ for(const layer of routeMapLayers)layer.remove(); routeMapLayers=[]; routeMapElement.classList.remove('visible'); }
+    function clearRouteMap(){ for(const layer of routeMapLayers)layer.remove(); routeMapLayers=[]; routeMapRenderKey=''; routeMapElement.classList.remove('visible'); }
     function centredRouteViewport(map,points){
       const size=map.getSize();
       const radarOpen=byId('wall').classList.contains('radar-open');
@@ -2642,6 +2675,9 @@ PAGE = b"""<!doctype html>
     function renderRouteMap(d){
       const values=[d.aircraft_latitude,d.aircraft_longitude,d.origin_latitude,d.origin_longitude,d.destination_latitude,d.destination_longitude];
       if(!routeMap||!values.every(finiteCoordinate)||!d.origin||!d.destination){ clearRouteMap(); routeFlowKey=''; return; }
+    const renderKey=JSON.stringify([...values,d.aircraft_id,d.origin,d.destination,d.track]);
+    if(renderKey===routeMapRenderKey)return;
+    routeMapRenderKey=renderKey;
       const nextFlowKey=String(d.aircraft_id||'')+'|'+String(d.origin||'')+'|'+String(d.destination||'');
       if(nextFlowKey!==routeFlowKey){ routeFlowKey=nextFlowKey; routeFlowStartedAt=Date.now(); }
       for(const layer of routeMapLayers)layer.remove(); routeMapLayers=[]; routeMapElement.classList.add('visible');
@@ -2670,6 +2706,7 @@ PAGE = b"""<!doctype html>
       });
     }
     const ROTATION_INTERVAL_MS=15000;
+    const prefersReducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     const rotationViews=['radar','commentary','photo'];
     let rotationView='radar',rotationStartedAt=Date.now();
     function availableRotationViews(){
@@ -2680,7 +2717,7 @@ PAGE = b"""<!doctype html>
       return views;
     }
     function advanceRotation(){
-      if(snapshotId||document.visibilityState!=='visible')return;
+            if(snapshotId||prefersReducedMotion||document.visibilityState!=='visible')return;
       const wall=byId('wall');
       if(!wall||!wall.classList.contains('radar-open')||wall.classList.contains('settings-open'))return;
       const views=availableRotationViews();
@@ -3116,8 +3153,8 @@ PAGE = b"""<!doctype html>
     function setLocationCandidate(latitude,longitude,accuracy=null,centre=true){
       const lat=Number(latitude),lon=Number(longitude);
       if(!Number.isFinite(lat)||!Number.isFinite(lon)||lat<-90||lat>90||lon<-180||lon>180)return;
-      byId('location-latitude').textContent=formatCoordinate(lat);
-      byId('location-longitude').textContent=formatCoordinate(lon);
+    byId('location-latitude').value=formatCoordinate(lat);
+    byId('location-longitude').value=formatCoordinate(lon);
       if(locationMap){
         const point=L.latLng(lat,lon);
         if(!locationMarker){
@@ -3149,7 +3186,10 @@ PAGE = b"""<!doctype html>
       locationMap.on('click',event=>{ setLocationCandidate(event.latlng.lat,event.latlng.lng,null,false); locationStatus('Location selected from the map. Save when ready.'); });
     }
     async function openLocationSelector(){
+            const revision=++locationDialogRevision;
+            modalReturnFocus=document.activeElement;
       byId('location-backdrop').classList.add('open');
+            focusModalControl('location-close');
       let lat=Number(currentHomeLatitude),lon=Number(currentHomeLongitude);
       if(!Number.isFinite(lat)||!Number.isFinite(lon)){
         try{
@@ -3164,21 +3204,28 @@ PAGE = b"""<!doctype html>
           }
         }catch(_){}
       }
+            if(revision!==locationDialogRevision||!byId('location-backdrop').classList.contains('open'))return;
       if(!Number.isFinite(lat)||!Number.isFinite(lon)){
         closeLocationSelector();
         return;
       }
       initialiseLocationMap(lat,lon);
       requestAnimationFrame(()=>{
+                if(revision!==locationDialogRevision||!byId('location-backdrop').classList.contains('open'))return;
         locationMap.invalidateSize(false);
         setLocationCandidate(lat,lon,null,true);
       });
       locationStatus('Choose a point on the map or use your device location.');
     }
     function closeLocationSelector(){
+            locationDialogRevision++;
       setLocationButtonBusy(false);
       byId('location-backdrop').classList.remove('open');
       setRadar(true);
+            const returnTarget=modalReturnFocus&&modalReturnFocus.isConnected&&modalReturnFocus.getClientRects().length
+                ?modalReturnFocus:byId('settings-toggle');
+            if(returnTarget)returnTarget.focus();
+    modalReturnFocus=null;
     }
     function setLocationButtonBusy(busy){
       const button=byId('location-use-device');
@@ -3187,6 +3234,15 @@ PAGE = b"""<!doctype html>
       button.textContent=busy?'LOCATING...':'USE MY LOCATION';
       button.setAttribute('aria-busy',String(busy));
     }
+        function applyManualLocation(){
+            const latitude=Number(byId('location-latitude').value),longitude=Number(byId('location-longitude').value);
+            if(!Number.isFinite(latitude)||!Number.isFinite(longitude)||latitude < -90||latitude > 90||longitude < -180||longitude > 180){
+                locationStatus('Enter a latitude from -90 to 90 and a longitude from -180 to 180.',true);
+                return;
+            }
+            setLocationCandidate(latitude,longitude,null,true);
+            locationStatus('Coordinates selected. Save when ready.');
+        }
     function useDeviceLocation(){
       if(!navigator.geolocation){
         setLocationButtonBusy(false);
@@ -3210,9 +3266,9 @@ PAGE = b"""<!doctype html>
       );
     }
     async function saveSelectedLocation(){
-      const latitude=Number(byId('location-latitude').textContent),longitude=Number(byId('location-longitude').textContent);
-      if(!Number.isFinite(latitude)||!Number.isFinite(longitude)){
-        locationStatus('Select a valid location first.',true);
+            const latitude=Number(byId('location-latitude').value),longitude=Number(byId('location-longitude').value);
+            if(!Number.isFinite(latitude)||!Number.isFinite(longitude)||latitude < -90||latitude > 90||longitude < -180||longitude > 180){
+                locationStatus('Enter a valid latitude and longitude before saving.',true);
         return;
       }
       const button=byId('location-save');
@@ -3321,14 +3377,18 @@ PAGE = b"""<!doctype html>
       return route+'  \\u00b7  '+(item.radar?'RADAR OPEN':'RADAR CLOSED');
     }
     function openSnapshotViewer(item,variant){
+            viewerReturnFocus=document.activeElement;
       const viewer=byId('snapshot-viewer'),image=byId('snapshot-viewer-image');
       byId('snapshot-viewer-title').textContent=snapshotLabel(item)+'  \\u00b7  '+variant.toUpperCase();
       image.src='/snapshot-image?id='+encodeURIComponent(item.id)+'&variant='+encodeURIComponent(variant)+'&t='+Date.now();
       viewer.classList.add('open');
+    focusModalControl('snapshot-viewer-close');
     }
     function closeSnapshotViewer(){
       byId('snapshot-viewer').classList.remove('open');
       byId('snapshot-viewer-image').removeAttribute('src');
+    if(viewerReturnFocus&&viewerReturnFocus.isConnected)viewerReturnFocus.focus();
+    viewerReturnFocus=null;
     }
     function renderSnapshotGallery(items){
       const grid=byId('snapshot-grid');
@@ -3361,16 +3421,17 @@ PAGE = b"""<!doctype html>
       }
     }
     async function loadSnapshotGallery(open=false){
+            if(open)modalReturnFocus=document.activeElement;
       try{
         const response=await fetch('/snapshots?t='+Date.now(),{cache:'no-store'});
         if(!response.ok)throw new Error('Could not load snapshots');
         const data=await response.json();
         const items=Array.isArray(data.snapshots)?data.snapshots:[];
         renderSnapshotGallery(items);
-        if(open){ setSettings(false); closeSnapshotViewer(); byId('snapshot-backdrop').classList.add('open'); byId('snapshots-toggle').classList.add('active'); byId('snapshots-toggle').setAttribute('aria-pressed','true'); }
+        if(open){ setSettings(false); closeSnapshotViewer(); byId('snapshot-backdrop').classList.add('open'); byId('snapshots-toggle').classList.add('active'); byId('snapshots-toggle').setAttribute('aria-pressed','true'); focusModalControl('snapshot-close'); }
       }catch(_){ if(open)showSnapshotToast('COULD NOT OPEN SNAPSHOTS',true); }
     }
-    function closeSnapshotGallery(){ closeSnapshotViewer(); byId('snapshot-backdrop').classList.remove('open'); byId('snapshots-toggle').classList.remove('active'); byId('snapshots-toggle').setAttribute('aria-pressed','false'); }
+    function closeSnapshotGallery(){ closeSnapshotViewer(); byId('snapshot-backdrop').classList.remove('open'); byId('snapshots-toggle').classList.remove('active'); byId('snapshots-toggle').setAttribute('aria-pressed','false'); if(modalReturnFocus&&modalReturnFocus.isConnected)modalReturnFocus.focus(); modalReturnFocus=null; }
     async function captureSnapshot(){
       if(snapshotId)return;
       const wall=byId('wall'),button=byId('camera-toggle');
@@ -3395,9 +3456,17 @@ PAGE = b"""<!doctype html>
         button.disabled=byId('wall').classList.contains('no-aircraft');
       }
     }
-    function drawRadar(contacts,radius,trackingActive){
-      const layer=byId('radar-contacts'); layer.replaceChildren();
-      for(const c of contacts||[]){
+        let radarRenderKey='';
+        function drawRadar(contacts,radius,trackingActive){
+            const items=contacts||[];
+            const visualKey=JSON.stringify([radius,Boolean(trackingActive),items.map(c=>[
+                c.aircraft_hex,c.callsign,c.x,c.y,c.track,c.flight,c.selected,c.emergency,
+            ])]);
+            const layer=byId('radar-contacts');
+            if(visualKey!==radarRenderKey){
+                radarRenderKey=visualKey;
+                layer.replaceChildren();
+            for(const c of items){
         const canTrack=!trackingActive&&Boolean(c.aircraft_hex&&c.callsign);
         const group=document.createElementNS(svgNS,'g'); group.setAttribute('class','contact'+(canTrack?' trackable':'')+(c.selected?' selected':'')+(c.emergency?' emergency':'')); group.setAttribute('transform','translate('+c.x+' '+c.y+') rotate('+(Number(c.track)||0)+')');
         if(canTrack){
@@ -3411,6 +3480,7 @@ PAGE = b"""<!doctype html>
         if((contacts||[]).length<=10&&c.flight&&!c.selected){ const label=document.createElementNS(svgNS,'text'); label.textContent=c.flight; label.setAttribute('x','2.8'); label.setAttribute('y','-1.5'); label.setAttribute('transform','rotate('+(0-(Number(c.track)||0))+' 2.8 -1.5)'); group.appendChild(label); }
         layer.appendChild(group);
       }
+            }
       if(trackingActive){ currentRadarRange=Number(radius)||25; }
       else if(!radarManualOverride){ currentRadarRange=Number(radius)||25; }
       byId('radar-count').textContent=(contacts||[]).length+' CONTACTS';
@@ -3639,6 +3709,7 @@ PAGE = b"""<!doctype html>
         else if(d.tracking_acquisition_outcome==='provider_unavailable')byId('footer-status').textContent='Aircraft updates temporarily unavailable';
         else if(d.tracking_acquisition_outcome==='stale')byId('footer-status').textContent='Only older aircraft positions are available';
         else if(d.acquisition_outcome==='stale')byId('footer-status').textContent='Only older aircraft positions are available';
+        else if(d.acquisition_outcome==='invalid_data')byId('footer-status').textContent='Aircraft position data could not be validated';
         else if(d.position_state==='reported')byId('footer-status').textContent='Position reported '+formatObservationAge(d.position_age_seconds)+' ago';
         else if(d.position_state==='last_known')byId('footer-status').textContent='Last known position '+formatObservationAge(d.position_age_seconds)+' ago';
         else if(d.aircraft_id)byId('footer-status').textContent='Aircraft position unavailable';
@@ -3659,7 +3730,8 @@ PAGE = b"""<!doctype html>
     setRadar(snapshotId?snapshotRadar:(isMobileViewport()?initialRadarPreference==='open':initialRadarPreference!=='closed'));
     byId('radar-toggle').addEventListener('click',()=>setRadar(!byId('wall').classList.contains('radar-open')||byId('wall').classList.contains('settings-open')));
     byId('settings-toggle').addEventListener('click',()=>setSettings(!byId('wall').classList.contains('settings-open')));
-    document.addEventListener('keydown',event=>{if(event.key.toLowerCase()==='r')setRadar(!byId('wall').classList.contains('radar-open')||byId('wall').classList.contains('settings-open'))});
+    document.addEventListener('keydown',event=>{if(event.key.toLowerCase()!=='r'||event.defaultPrevented||event.altKey||event.ctrlKey||event.metaKey||event.shiftKey)return;if(event.target.closest('input,textarea,select,[contenteditable="true"],[role="textbox"]'))return;setRadar(!byId('wall').classList.contains('radar-open')||byId('wall').classList.contains('settings-open'))});
+    document.addEventListener('keydown',trapModalTab);
     updateSoundButton();
     updateCommentaryButton();
     refreshUnitSettings();
@@ -3681,6 +3753,8 @@ PAGE = b"""<!doctype html>
     byId('radar-track-form').addEventListener('submit',submitFlightTracking);
     byId('zoom-in').addEventListener('click',()=>changeRadarRange(-1)); byId('zoom-out').addEventListener('click',()=>changeRadarRange(1));
     byId('settings-location').addEventListener('click',openLocationSelector);
+    byId('location-latitude').addEventListener('change',applyManualLocation);
+    byId('location-longitude').addEventListener('change',applyManualLocation);
     byId('location-use-device').addEventListener('click',useDeviceLocation);
     byId('location-save').addEventListener('click',saveSelectedLocation);
     byId('location-close').addEventListener('click',closeLocationSelector);
@@ -4398,6 +4472,7 @@ def shift_metric_history(
 class FrameState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
+        self.last_enrichment_future: concurrent.futures.Future[Any] | None = None
         self.location_lock = threading.Lock()
         self.location_revision = 0
         self.png = b""
@@ -4428,7 +4503,7 @@ class FrameState:
         self.commentary_samples: list[dict[str, Any]] = []
         self.payload: dict[str, Any] = {"mode": "starting", "updated": "never", "total": 0, "location_revision": 0}
 
-    def update(self, image, mode: str, plane: dict[str, Any] | None, distance: float | None, aircraft: list[dict[str, Any]], settings, logo: tuple[bytes, str, str] | None, identity: dict[str, str] | None = None, route: dict[str, Any] | None = None, origin_flag: bytes | None = None, destination_flag: bytes | None = None, flightaware_configured: bool = False, tracking: dict[str, Any] | None = None, api_health: dict[str, Any] | None = None, position_observed_at: float | None = None, nearby_place: dict[str, Any] | None = None, aircraft_photo: tuple[bytes, str, str] | None = None, aircraft_photo_debug: dict[str, Any] | None = None, expected_location_revision: int | None = None, reported_position_observed_at: float | None = None, new_position_observation: bool = False) -> None:
+    def update(self, image, mode: str, plane: dict[str, Any] | None, distance: float | None, aircraft: list[dict[str, Any]], settings, logo: tuple[bytes, str, str] | None, identity: dict[str, str] | None = None, route: dict[str, Any] | None = None, origin_flag: bytes | None = None, destination_flag: bytes | None = None, flightaware_configured: bool = False, tracking: dict[str, Any] | None = None, api_health: dict[str, Any] | None = None, position_observed_at: float | None = None, nearby_place: dict[str, Any] | None = None, aircraft_photo: tuple[bytes, str, str] | None = None, aircraft_photo_debug: dict[str, Any] | None = None, expected_location_revision: int | None = None, reported_position_observed_at: float | None = None, new_position_observation: bool = False, preserve_radar_radius: bool = False) -> None:
         data = BytesIO()
         image.save(data, format="PNG")
         plane = plane or {}
@@ -4460,7 +4535,7 @@ class FrameState:
             "tracking_resolved_callsign": str(tracking.get("resolved_callsign") or ""),
             "tracking_found": bool(tracking.get("found")),
             "tracking_acquisition_outcome": tracking.get("acquisition_outcome", "waiting"),
-            "acquisition_outcome": "stale" if mode == "stale" else tracking.get("acquisition_outcome", mode),
+            "acquisition_outcome": mode if mode in {"stale", "invalid_data"} else tracking.get("acquisition_outcome", mode),
             "acquisition_interval_seconds": TRACKING_ACQUISITION_INTERVAL_SECONDS if tracking.get("active") else settings.refresh_seconds,
             "observation_source": plane.get("source"),
             "observation_timestamp": plane.get("observed_at"),
@@ -4520,6 +4595,16 @@ class FrameState:
         with self.lock:
             if expected_location_revision is not None and expected_location_revision != self.location_revision:
                 return
+            if preserve_radar_radius and not tracking.get("active"):
+                try:
+                    current_radius = float(self.payload.get("radar_radius_nm"))
+                except (TypeError, ValueError):
+                    current_radius = float("nan")
+                if math.isfinite(current_radius) and 1 <= current_radius <= 250:
+                    display_settings = copy.copy(settings)
+                    display_settings.radius_nm = current_radius
+                    payload["radar_radius_nm"] = current_radius
+                    payload["radar_contacts"] = radar_contacts(aircraft, display_settings, plane)
             payload["location_revision"] = self.location_revision
             payload["acquisition_status"] = self.payload.get("acquisition_status", "ready")
             current_observation = reported_position_observed_at
@@ -4843,7 +4928,7 @@ class SnapshotStore:
                 record = {
                     "id": snapshot_id,
                     "captured_at": now.isoformat(timespec="seconds"),
-                    "captured_display": now.strftime("%d %b %Y Â· %H:%M:%S"),
+                    "captured_display": now.strftime("%d %b %Y · %H:%M:%S"),
                     "callsign": str(payload.get("callsign") or ""),
                     "commercial_flight": str(payload.get("commercial_flight") or ""),
                     "registration": str(payload.get("registration") or ""),
@@ -4937,6 +5022,11 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
                 aircraft = fetch_aircraft(sample_settings, radius_nm=tracking_query_radius)
             mode = "live"
             local_position_received_at = time.monotonic()
+        except AircraftPositionInvalid:
+            age = time.monotonic() - cached_aircraft_received_at if cached_aircraft_received_at is not None else float("inf")
+            aircraft = age_aircraft_positions(cached_aircraft, age)
+            selection_position_age_limit = retained_position_seconds(sample_settings.refresh_seconds)
+            mode = "invalid_data"
         except AircraftPositionStale:
             age = time.monotonic() - cached_aircraft_received_at if cached_aircraft_received_at is not None else float("inf")
             aircraft = age_aircraft_positions(cached_aircraft, age)
@@ -4989,6 +5079,7 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
     plane: dict[str, Any] | None
     distance: float | None
     tracking_found = False
+    tracked_position_received_at: float | None = None
     reported_position_observed_at: float | None = None
     new_position_observation = False
 
@@ -5108,23 +5199,6 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
     if tracker and int(tracker.snapshot().get("revision") or 0) != tracking_revision:
         return
 
-    identity = {} if demo else (identities.get(plane) or {})
-    aircraft_photo = (
-        identities.photo_asset(identity, plane)
-        if not demo and hasattr(identities, "photo_asset")
-        else None
-    )
-    aircraft_photo_debug = (
-        identities.photo_debug(identity, plane)
-        if not demo and hasattr(identities, "photo_debug")
-        else {}
-    )
-    route = {} if demo or routes is None else (routes.get(plane) or {})
-    origin_flag = flags.get(route.get("origin_country", "")) if flags else None
-    destination_flag = flags.get(route.get("destination_country", "")) if flags else None
-    if tracker and int(tracker.snapshot().get("revision") or 0) != tracking_revision:
-        return
-    code = identity.get("operator_code") or operator_code(plane)
     if tracking.get("active") and not demo:
         position_observed_at = tracked_position_observed_at if tracked_position_received_at is not None and position_age <= POSITION_FRESHNESS_SECONDS else None
         if tracked_position_observed_at is not None and plane is not None and plane.get("lat") is not None:
@@ -5136,8 +5210,6 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
             mode == "live" and local_position_received_at is not None
             and reported_position_observed_at is not None
         )
-    nearby_place = places.get(plane.get("lat"), plane.get("lon")) if places and plane and plane.get("lat") is not None and plane.get("lon") is not None and not demo else {}
-    logo = logos.get(code, identity.get("airline_name", ""))
     image = render(plane, distance, mode)
     with state.location_lock:
         with state.lock:
@@ -5151,14 +5223,74 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
             save_frame(image, sample_settings)
         state.update(
             image, mode, plane, distance, aircraft, sample_settings,
-            logo, identity, route, origin_flag, destination_flag,
-            bool(routes and routes.api_key), tracking, health.snapshot() if health else None, position_observed_at, nearby_place,
-            aircraft_photo=aircraft_photo,
-            aircraft_photo_debug=aircraft_photo_debug,
+            None, {}, {}, None, None,
+            bool(routes and routes.api_key), tracking, health.snapshot() if health else None, position_observed_at, {},
             expected_location_revision=location_revision,
             reported_position_observed_at=reported_position_observed_at,
             new_position_observation=new_position_observation,
+            preserve_radar_radius=not bool(tracking.get("active")),
         )
+    if demo or plane is None or not _enrichment_slots.acquire(blocking=False):
+        return
+
+    def enrich_and_publish() -> None:
+        try:
+            identity = identities.get(plane) or {}
+            aircraft_photo = identities.photo_asset(identity, plane) if hasattr(identities, "photo_asset") else None
+            aircraft_photo_debug = identities.photo_debug(identity, plane) if hasattr(identities, "photo_debug") else {}
+            route = (routes.get(plane) or {}) if routes is not None else {}
+            origin_flag = flags.get(route.get("origin_country", "")) if flags else None
+            destination_flag = flags.get(route.get("destination_country", "")) if flags else None
+            code = identity.get("operator_code") or operator_code(plane)
+            nearby_place = (
+                places.get(plane.get("lat"), plane.get("lon"))
+                if places and plane.get("lat") is not None and plane.get("lon") is not None else {}
+            )
+            logo = logos.get(code, identity.get("airline_name", ""))
+            with state.location_lock:
+                with state.lock:
+                    if state.location_revision != location_revision:
+                        return
+                    if str(state.payload.get("aircraft_id") or "") != aircraft_identity(plane):
+                        return
+                    latest_observation = state.position_observed_at_monotonic
+                    if (
+                        reported_position_observed_at is not None
+                        and latest_observation is not None
+                        and latest_observation > reported_position_observed_at + 0.001
+                    ):
+                        return
+                    if tracker and int(tracker.snapshot().get("revision") or 0) != tracking_revision:
+                        return
+                state.update(
+                    image, mode, plane, distance, aircraft, sample_settings,
+                    logo, identity, route, origin_flag, destination_flag,
+                    bool(routes and routes.api_key), tracking, health.snapshot() if health else None,
+                    position_observed_at, nearby_place,
+                    aircraft_photo=aircraft_photo,
+                    aircraft_photo_debug=aircraft_photo_debug,
+                    expected_location_revision=location_revision,
+                    reported_position_observed_at=reported_position_observed_at,
+                    new_position_observation=False,
+                    preserve_radar_radius=not bool(tracking.get("active")),
+                )
+        except Exception:
+            with state.lock:
+                if state.location_revision == location_revision and state.payload.get("aircraft_id") == aircraft_identity(plane):
+                    state.payload["enrichment_status"] = "unavailable"
+
+    try:
+        future = _enrichment_executor.submit(enrich_and_publish)
+    except RuntimeError:
+        _enrichment_slots.release()
+        return
+    with state.lock:
+        state.last_enrichment_future = future
+
+    def finish_enrichment(completed: concurrent.futures.Future[Any]) -> None:
+        _enrichment_slots.release()
+
+    future.add_done_callback(finish_enrichment)
 
 
 def restore_nearest_cached_aircraft(
@@ -5249,10 +5381,18 @@ class ActiveMonitorLease:
 
 
 VISITOR_SESSION_TTL_SECONDS = 30 * 60
+VISITOR_SNAPSHOT_RETENTION_SECONDS = VISITOR_SESSION_TTL_SECONDS
+SNAPSHOT_RECONCILE_INTERVAL_SECONDS = 60.0
 MAX_VISITOR_SESSIONS = 64
 GLOBAL_ACQUISITION_MIN_INTERVAL_SECONDS = 300.0
 TRACKING_ACQUISITION_INTERVAL_SECONDS = 30.0
 MAX_VISITOR_SNAPSHOTS = 50
+MAX_ENRICHMENT_WORKERS = 4
+MAX_QUEUED_ENRICHMENTS = 64
+_enrichment_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=MAX_ENRICHMENT_WORKERS, thread_name_prefix="aircraft-enrichment",
+)
+_enrichment_slots = threading.BoundedSemaphore(MAX_ENRICHMENT_WORKERS + MAX_QUEUED_ENRICHMENTS)
 
 
 class VisitorSession:
@@ -5278,6 +5418,7 @@ class VisitorSession:
         self.acquisition_kind = "normal"
         self.last_track_action_at = 0.0
         self.last_snapshot_at = 0.0
+        self.last_archive_touch_at = 0.0
         folder = hashlib.sha256(session_id.encode("ascii")).hexdigest()[:32]
         self.snapshots = SnapshotStore(snapshot_root / folder)
         self.state.payload = {
@@ -5319,6 +5460,28 @@ class VisitorSessionStore:
         self.next_acquisition_at = 0.0
         self.next_tracking_at = 0.0
         self.tracking_next_due: dict[tuple[str, ...], float] = {}
+        self.last_snapshot_reconcile_at = 0.0
+        self._reconcile_snapshot_root()
+
+    def _reconcile_snapshot_root(self, now: float | None = None) -> None:
+        self.snapshot_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.snapshot_root.is_symlink() or not self.snapshot_root.is_dir():
+            raise ValueError("Visitor snapshot root must be a real directory")
+        current_time = time.time() if now is None else float(now)
+        for entry in os.scandir(self.snapshot_root):
+            if not re.fullmatch(r"[0-9a-f]{32}", entry.name):
+                continue
+            path = Path(entry.path)
+            try:
+                if entry.is_symlink():
+                    path.unlink()
+                elif entry.is_dir(follow_symlinks=False):
+                    modified_at = entry.stat(follow_symlinks=False).st_mtime
+                    if current_time - modified_at >= VISITOR_SNAPSHOT_RETENTION_SECONDS:
+                        shutil.rmtree(path)
+            except FileNotFoundError:
+                continue
+        self.last_snapshot_reconcile_at = time.monotonic()
 
     @staticmethod
     def valid_session_id(value: str | None) -> bool:
@@ -5332,21 +5495,76 @@ class VisitorSessionStore:
         ]
         return [self.sessions.pop(session_id).snapshots.root for session_id in expired]
 
-    @staticmethod
-    def _remove_snapshot_folders(paths: list[Path]) -> None:
+    def _remove_snapshot_folders(self, paths: list[Path]) -> None:
         for path in paths:
-            shutil.rmtree(path, ignore_errors=True)
+            candidate = Path(path)
+            try:
+                if candidate.parent.resolve() != self.snapshot_root.resolve():
+                    continue
+                if not re.fullmatch(r"[0-9a-f]{32}", candidate.name) or candidate.is_symlink():
+                    continue
+                if candidate.is_dir():
+                    shutil.rmtree(candidate, ignore_errors=True)
+            except OSError:
+                continue
 
-    def get_or_create(self, session_id: str | None = None, touch_existing: bool = True) -> tuple[VisitorSession | None, bool]:
+    def retained_snapshot_count(self) -> int:
+        total = 0
+        try:
+            entries = os.scandir(self.snapshot_root)
+        except OSError:
+            return total
+        with entries:
+            for entry in entries:
+                if not re.fullmatch(r"[0-9a-f]{32}", entry.name) or entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                    continue
+                index_path = Path(entry.path) / "index.json"
+                if index_path.is_symlink():
+                    continue
+                try:
+                    records = json.loads(index_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if isinstance(records, list):
+                    for record in records:
+                        if not isinstance(record, dict) or not record.get("id"):
+                            continue
+                        filenames = [str(record.get(key) or "") for key in ("desktop", "mobile")]
+                        if any(not name or Path(name).name != name for name in filenames):
+                            continue
+                        paths = [Path(entry.path) / name for name in filenames]
+                        if all(path.is_file() and not path.is_symlink() for path in paths):
+                            total += 1
+        return total
+
+    def get_or_create(
+        self, session_id: str | None = None, touch_existing: bool = True, create: bool = True,
+    ) -> tuple[VisitorSession | None, bool]:
         now = time.monotonic()
         with self.lock:
+            if now - self.last_snapshot_reconcile_at >= SNAPSHOT_RECONCILE_INTERVAL_SECONDS:
+                self._reconcile_snapshot_root()
             expired_paths = self._expire_unlocked(now)
             session = self.sessions.get(session_id) if self.valid_session_id(session_id) else None
             created = False
+            if session is None and create and self.valid_session_id(session_id) and len(self.sessions) < self.max_sessions:
+                archive_name = hashlib.sha256(session_id.encode("ascii")).hexdigest()[:32]
+                archive = self.snapshot_root / archive_name
+                try:
+                    recent_archive = (
+                        archive.is_dir()
+                        and not archive.is_symlink()
+                        and time.time() - archive.stat(follow_symlinks=False).st_mtime < VISITOR_SNAPSHOT_RETENTION_SECONDS
+                    )
+                except OSError:
+                    recent_archive = False
+                if recent_archive:
+                    session = VisitorSession(session_id, self.defaults, self.snapshot_root)
+                    self.sessions[session_id] = session
             if session is not None:
                 if touch_existing:
                     session.last_access_at = now
-            elif len(self.sessions) < self.max_sessions:
+            elif create and len(self.sessions) < self.max_sessions:
                 new_id = secrets.token_urlsafe(32)
                 while new_id in self.sessions:
                     new_id = secrets.token_urlsafe(32)
@@ -5367,6 +5585,14 @@ class VisitorSessionStore:
             if active:
                 session.last_access_at = now
                 session.lease.touch()
+                if now - session.last_archive_touch_at >= SNAPSHOT_RECONCILE_INTERVAL_SECONDS:
+                    archive = session.snapshots.root
+                    if archive.is_dir() and not archive.is_symlink():
+                        try:
+                            os.utime(archive, None, follow_symlinks=False)
+                            session.last_archive_touch_at = now
+                        except OSError:
+                            pass
                 lease_revision = session.lease.revision()
                 if lease_revision > session.active_lease_revision:
                     session.active_lease_revision = lease_revision
@@ -5382,6 +5608,19 @@ class VisitorSessionStore:
             session.refresh_reasons.add(reason)
             if session.refresh_requested_at is None:
                 session.refresh_requested_at = time.monotonic()
+            self.wake.set()
+
+    def request_tracking_refresh(self, session: VisitorSession) -> None:
+        with self.lock:
+            if self.sessions.get(session.session_id) is not session or not session.tracker.snapshot()["active"]:
+                return
+            now = time.monotonic()
+            session.refresh_reasons.add("tracking")
+            if session.refresh_requested_at is None:
+                session.refresh_requested_at = now
+            key = self.tracking_share_key(session)
+            if key is not None:
+                self.tracking_next_due[key] = now
             self.wake.set()
 
     def cancel_refresh(self, session: VisitorSession, reason: str) -> None:
@@ -5899,6 +6138,9 @@ def apply_visitor_location_change(
 
 def configuration_required_handler(config_path: Path):
     class Handler(BaseHTTPRequestHandler):
+        server_version = "Over-Head"
+        sys_version = ""
+
         def do_GET(self) -> None:
             path = urlsplit(self.path).path
             if path in {"/", "/setup"}:
@@ -5949,6 +6191,8 @@ def configuration_required_handler(config_path: Path):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            for name, value in SECURITY_RESPONSE_HEADERS.items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
 
@@ -5999,14 +6243,17 @@ def overhead_logo_asset(base_dir: Path) -> tuple[bytes, str] | None:
 def handler_factory(state: FrameState, settings, refresh_event: threading.Event, tone_path: Path, config_path: Path, routes: FlightRouteStore, logos: LogoStore, tracker: FlightTrackingState, snapshots: SnapshotStore, demo: bool = False, lease: ActiveMonitorLease | None = None, sessions: VisitorSessionStore | None = None):
     asset_dir = Path(__file__).resolve().parent
     visitor_get_paths = {
-        "/", "/frame.png", "/status", "/snapshots", "/snapshot-state", "/snapshot-image",
+        "/frame.png", "/status", "/snapshots", "/snapshot-state", "/snapshot-image",
         "/route-debug", "/photo-debug", "/photo-test", "/operator-logo", "/aircraft-photo",
         "/origin-flag", "/destination-flag", "/radar-range",
     }
     visitor_mutation_paths = {"/snapshots", "/track", "/location"}
 
     class Handler(BaseHTTPRequestHandler):
-        def visitor_context(self, touch_activity: bool = True):
+        server_version = "Over-Head"
+        sys_version = ""
+
+        def visitor_context(self, touch_activity: bool = True, create: bool = False):
             if sessions is None:
                 return state, settings, tracker, snapshots, lease, None
             if hasattr(self, "_visitor_context"):
@@ -6018,9 +6265,13 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                 cookie = SimpleCookie()
             morsel = cookie.get("overhead_session")
             session_id = morsel.value if morsel else None
-            session, created = sessions.get_or_create(session_id, touch_existing=touch_activity)
+            session, created = sessions.get_or_create(
+                session_id, touch_existing=touch_activity, create=create,
+            )
             if session is None:
-                self.send(HTTPStatus.SERVICE_UNAVAILABLE, "application/json", b'{"error":"Visitor capacity reached"}', cache=False)
+                status = HTTPStatus.SERVICE_UNAVAILABLE if create else HTTPStatus.UNAUTHORIZED
+                message = b'{"error":"Visitor capacity reached"}' if create else b'{"error":"Active visitor session required"}'
+                self.send(status, "application/json", message, cache=False)
                 self._visitor_context = None
                 return None
             if created:
@@ -6071,7 +6322,10 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
             context = None
             if sessions is not None and path in visitor_get_paths:
                 active_status = parse_qs(request_url.query).get("active", ["0"])[0] == "1"
-                context = self.visitor_context(touch_activity=path != "/status" or active_status)
+                context = self.visitor_context(
+                    touch_activity=path != "/status" or active_status,
+                    create=path == "/status" and active_status,
+                )
                 if context is None:
                     return
                 state, settings, tracker, snapshots, lease, session = context
@@ -6196,7 +6450,7 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                             "updated",
                         )
                     }
-                body = json.dumps({"current": current, "resolver": routes.debug_snapshot()}, indent=2).encode()
+                body = json.dumps({"current": current}, indent=2).encode()
                 self.send(HTTPStatus.OK, "application/json", body, cache=False)
             elif path == "/photo-debug":
                 with state.lock:
@@ -6325,7 +6579,7 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                 if not self.same_origin_request():
                     self.send(HTTPStatus.FORBIDDEN, "application/json", b'{"error":"Cross-origin request rejected"}', cache=False)
                     return
-                context = self.visitor_context()
+                context = self.visitor_context(create=False)
                 if context is None:
                     return
                 state, settings, tracker, snapshots, lease, session = context
@@ -6342,8 +6596,7 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                         return
                 try:
                     if sessions is not None and session is not None:
-                        with sessions.lock:
-                            total_snapshots = sum(len(visitor.snapshots.list()) for visitor in sessions.sessions.values())
+                        total_snapshots = sessions.retained_snapshot_count()
                         if total_snapshots >= MAX_VISITOR_SNAPSHOTS:
                             self.send(HTTPStatus.TOO_MANY_REQUESTS, "application/json", b'{"error":"The shared snapshot limit has been reached"}', cache=False)
                             return
@@ -6481,6 +6734,8 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                 self.send(HTTPStatus.BAD_REQUEST, "application/json", body, cache=False)
                 return
             self.request_refresh(session, "location")
+            if session is not None:
+                sessions.request_tracking_refresh(session)
             body = json.dumps({"saved": True, "latitude": latitude, "longitude": longitude, "location_revision": location_revision}).encode()
             self.send(HTTPStatus.OK, "application/json", body, cache=False)
 
@@ -6517,6 +6772,7 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
 
         def send(self, status, content_type, body, cache=True, headers=None) -> None:
             self.send_response(status); self.send_header("Content-Type", content_type); self.send_header("Content-Length", str(len(body))); self.send_header("Cache-Control", "public, max-age=30" if cache else "no-store")
+            for name, value in SECURITY_RESPONSE_HEADERS.items(): self.send_header(name, value)
             visitor_cookie = getattr(self, "_new_visitor_cookie", None)
             if visitor_cookie:
                 cookie = f"overhead_session={visitor_cookie}; Path=/; Max-Age={int(sessions.session_ttl_seconds)}; HttpOnly; SameSite=Lax"

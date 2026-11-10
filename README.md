@@ -292,7 +292,14 @@ Each visitor can save up to 20 pairs; the server allows at most 50 pairs across
 all sessions. Captures are serialized globally, limited to one every 30 seconds
 per visitor, and rejected rather than queued when another capture is running.
 Files and their index are deleted when that visitor's session expires after 30
-minutes without an active browser heartbeat. Filenames include the capture time
+minutes without an active browser heartbeat. After a process restart, UUID-named
+orphan archives are reconciled at startup and once per minute; only directories
+whose modification time is at least 30 minutes old are removed. Recent archives
+remain on disk during that retention window and count toward the global snapshot
+limit. A returning browser with the same valid opaque cookie can reattach its
+recent snapshot archive after restart; its location and tracking state reset to
+operator defaults. Cleanup never follows UUID-directory symlinks or removes
+entries outside the snapshot root. Filenames include the capture time
 and available flight/registration/route identifiers, with `_desktop.png` and
 `_mobile.png` suffixes.
 
@@ -519,9 +526,10 @@ Press `Ctrl+C` in the terminal to stop Over-Head.
 
 For a public browser display, use a domain such as `demodomain.name` and place
 Caddy in front of Over-Head. **Replace `demodomain.name` with your own domain**
-throughout these instructions. These commands assume the Linux installation
-above is in `/root/Over-Head` and the commands are run as `root`. Adjust the
-paths and service user if you installed the application elsewhere.
+throughout these instructions. The service example uses a root-owned code
+checkout at `/opt/over-head` and runs the application as the unprivileged
+`overhead` account. Commands that install Caddy or configure systemd require
+administrative privileges; the application process itself should not run as root.
 
 Before starting, create an **A record** pointing `demodomain.name` to your
 server's public IPv4 address (and an AAAA record only if IPv6 is configured and
@@ -541,6 +549,12 @@ Create `/etc/caddy/Caddyfile`:
 ```bash
 cat > /etc/caddy/Caddyfile <<'EOF'
 demodomain.name {
+  header {
+    Strict-Transport-Security "max-age=31536000"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "strict-origin-when-cross-origin"
+    X-Frame-Options "DENY"
+  }
     reverse_proxy 127.0.0.1:8765
 }
 EOF
@@ -563,6 +577,25 @@ If an old instance is still running, identify and stop that specific process
 before proceeding. Running the manual instance and the service together will
 cause a port-binding error and repeated service restarts.
 
+The service should not run as root. The example below assumes a root-owned code
+checkout at `/opt/over-head`, with only its cache and snapshot directories
+writable by a dedicated `overhead` account. The process also keeps its operator
+configuration under `/var/lib/over-head`. Adapt these paths before applying them;
+this documentation does not change ownership or migrate a live installation.
+Install or update the code at `/opt/over-head` using the normal release procedure;
+do not copy runtime caches or snapshots as source files. Recreate the virtual
+environment at that path and install the already-approved project requirements.
+
+```bash
+useradd --system --home /var/lib/over-head --create-home --shell /usr/sbin/nologin overhead
+install -d -o overhead -g overhead /var/lib/over-head /opt/over-head/cache /opt/over-head/screenshots
+install -o overhead -g overhead -m 0600 /path/to/approved/config.json /var/lib/over-head/config.json
+```
+
+For an existing installation, copy the operator's configuration to the state
+directory deliberately and preserve any required API-key permissions. Do not
+make the source checkout or all of `/opt/over-head` writable by the service.
+
 Create `/etc/systemd/system/over-head.service`:
 
 ```bash
@@ -574,12 +607,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/root/Over-Head
-ExecStart=/root/Over-Head/.venv/bin/python /root/Over-Head/monitor.py --host 127.0.0.1
+User=overhead
+Group=overhead
+WorkingDirectory=/opt/over-head
+StateDirectory=over-head
+ExecStart=/opt/over-head/.venv/bin/python /opt/over-head/monitor.py --host 127.0.0.1 --config /var/lib/over-head/config.json
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/over-head /opt/over-head/cache /opt/over-head/screenshots
 
 [Install]
 WantedBy=multi-user.target
@@ -590,7 +631,11 @@ systemctl enable --now over-head
 ```
 
 The application listens **only on localhost**; Caddy serves it to browsers via
-`https://demodomain.name/` with automatic HTTPS certificate management.
+`https://demodomain.name/` with automatic HTTPS certificate management. The
+application supplies a CSP compatible with its inline UI and pinned Leaflet
+assets, plus content-type, referrer, framing and permissions headers. HSTS is
+added only by Caddy on the HTTPS site. The CSP uses `unsafe-inline` because the
+current application embeds its UI; a nonce/hash migration remains future work.
 
 Verify the services and website:
 
@@ -678,6 +723,27 @@ Normal geographic scans use one shared provider-backed slot every 300 seconds,
 regardless of the number of visitors: at most 288 scans/day. Inactive sessions
 are excluded; distinct uncovered locations share a fair queue. The service caps
 concurrent in-memory sessions at 64 and reports queue position and estimated wait.
+
+An idealized deterministic crossing model illustrates the discovery tradeoff:
+for a straight 450-knot track through a 25 NM circle, with path offset uniform
+across the circle and poll phase uniform across each interval, expected detection
+is about 89.5% at 300 seconds, 98.4% at 120 seconds, 99.5% at 60 seconds and
+99.8% at 30 seconds. This is geometry, not observed provider performance; it
+assumes a continuous track through the query area and ignores feed coverage,
+position age, aircraft traffic patterns and outages.
+
+| Geographic interval | Area scans/day | Worst-case position-provider attempts/day | Modeled crossing detection |
+|---:|---:|---:|---:|
+| 300 seconds (current) | 288 | 576 | 89.5% |
+| 120 seconds | 720 | 1,440 | 98.4% |
+| 60 seconds | 1,440 | 2,880 | 99.5% |
+| 30 seconds | 2,880 | 5,760 | 99.8% |
+
+The current 300-second default remains unchanged. Shorter intervals can improve
+discovery but multiply process-wide provider volume, and current provider
+permissions have not been independently established. Revisit the interval only
+after obtaining explicit usage guidance; browser status polling is not an aircraft
+observation.
 
 With simultaneous visitors at distinct locations and no reusable geographic
 coverage, the deterministic scheduler model is:

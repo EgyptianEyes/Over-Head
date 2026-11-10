@@ -14,11 +14,38 @@ class Tests(unittest.TestCase):
  def setUp(self):
   overhead._provider_retry_until.clear(); overhead._provider_backoff.clear(); overhead._provider_request_counts.clear();overhead._provider_last_status.clear()
   overhead._provider_request_windows.clear()
+  overhead._provider_empty_counts.clear()
+  overhead._provider_empty_counts.clear()
  def test_invalid_response_cools_provider(self):
   with patch.object(overhead.urllib.request,'urlopen',side_effect=[Resp({'ac':'invalid'}),Resp({'ac':[]})]) as request:
    self.assertEqual(overhead.fetch_aircraft(overhead.Settings()),[])
    self.assertGreater(overhead._provider_retry_until['ADSB.lol'],overhead.time.monotonic())
    self.assertEqual(request.call_count,2)
+ def test_partially_valid_response_drops_invalid_positions(self):
+  response=Resp({'ac':[
+   {'hex':'406b82','lat':51,'lon':0,'seen_pos':0},
+   {'hex':'ffffff','lat':float('nan'),'lon':0,'seen_pos':0},
+   {'hex':'abcdef','lat':51,'lon':0,'seen_pos':float('inf')},
+  ]})
+  with patch.object(overhead.urllib.request,'urlopen',return_value=response) as request:
+   records=overhead.fetch_aircraft(overhead.Settings())
+  self.assertEqual([record['hex'] for record in records],['406b82'])
+  self.assertEqual(request.call_count,1)
+ def test_primary_empty_only_verifies_secondary_every_third_response(self):
+  with patch.object(overhead.urllib.request,'urlopen',return_value=Resp({'ac':[]})) as request:
+   self.assertEqual(overhead.fetch_aircraft(overhead.Settings()),[])
+   self.assertEqual(overhead.fetch_aircraft(overhead.Settings()),[])
+   self.assertEqual(request.call_count,2)
+   self.assertEqual(overhead.fetch_aircraft(overhead.Settings()),[])
+   self.assertEqual(request.call_count,4)
+ def test_empty_primary_periodically_accepts_secondary_aircraft(self):
+  responses=[Resp({'ac':[]}),Resp({'ac':[]}),Resp({'ac':[]}),
+             Resp({'ac':[{'hex':'406b82','lat':51,'lon':0,'seen_pos':0}]})]
+  with patch.object(overhead.urllib.request,'urlopen',side_effect=responses) as request:
+   for _ in range(2):self.assertEqual(overhead.fetch_aircraft(overhead.Settings()),[])
+   aircraft=overhead.fetch_aircraft(overhead.Settings())
+  self.assertEqual(request.call_count,4)
+  self.assertEqual(aircraft[0]['hex'],'406b82')
  def test_conflicting_callsign_falls_back(self):
   first=[{'hex':code,'flight':'BAW283','lat':51,'lon':0,'seen_pos':0} for code in ('406b82','ffffff')]
   with patch.object(overhead.urllib.request,'urlopen',side_effect=[Resp({'ac':first}),Resp({'ac':[first[0]]})]) as request:
@@ -61,16 +88,16 @@ class Tests(unittest.TestCase):
    self.assertEqual(store.next_acquisition_at,0)
  def test_normal(self):
   urls=[]
-  def request(req,timeout=8): urls.append(req.full_url);return Resp({'ac':[{'hex':'a'}]})
+  def request(req,timeout=8): urls.append(req.full_url);return Resp({'ac':[{'hex':'a','lat':51,'lon':0,'seen_pos':0}]})
   with patch.object(overhead.urllib.request,'urlopen',side_effect=request):
-   self.assertEqual(overhead.fetch_aircraft(overhead.Settings(latitude=51.5,longitude=-3.3,radius_nm=25)),[{'hex':'a'}])
+     self.assertEqual(overhead.fetch_aircraft(overhead.Settings(latitude=51.5,longitude=-3.3,radius_nm=25))[0]['hex'],'a')
   self.assertEqual(len(urls),1);self.assertIn('/v2/point/51.5/-3.3/25',urls[0])
  def test_429_fallback_and_cooldown(self):
   urls=[]; headers=email.message.Message();headers['x-ratelimit-remaining']='0';headers['x-ratelimit-reset']='34300'
   def request(req,timeout=8):
    urls.append(req.full_url)
    if 'adsb.lol' in req.full_url: raise urllib.error.HTTPError(req.full_url,429,'rate limited',headers,None)
-   return Resp({'ac':[{'hex':'a'}]})
+   return Resp({'ac':[{'hex':'a','lat':51,'lon':0,'seen_pos':0}]})
   with patch.object(overhead.urllib.request,'urlopen',side_effect=request):
    overhead.fetch_aircraft(overhead.Settings())
    overhead.fetch_aircraft(overhead.Settings())
@@ -196,6 +223,32 @@ class AcquisitionWorkloadTests(unittest.TestCase):
           self.assertEqual(fetch.call_count, 1)
           expected = 'provider_unavailable' if failure else 'not_observed'
           self.assertTrue(all(session.state.payload['tracking_acquisition_outcome'] == expected for session in store.sessions.values()))
+
+  def test_ten_visitors_tracking_one_aircraft_share_one_upstream_lookup(self):
+    with tempfile.TemporaryDirectory() as temporary, patch.object(monitor.time, 'monotonic', return_value=1000):
+      store = monitor.VisitorSessionStore(overhead.Settings(), Path(temporary))
+      visitors = []
+      for _ in range(10):
+        session, _ = store.get_or_create()
+        session.tracker.start('406B82', ('hex:406B82',))
+        session.last_fetch_at = 1000
+        store.touch(session, active=True)
+        session.refresh_reasons.clear()
+        visitors.append(session)
+      plane = {'hex': '406b82', 'flight': 'BAW5', 'lat': 51, 'lon': 0, 'seen_pos': 0, 'alt_baro': 30000}
+      with patch.object(monitor, 'fetch_tracked_aircraft', return_value=(plane, 'BAW5')) as fetch:
+        for _ in visitors:
+          selected, _ = store.claim_due()
+          self.assertIsNotNone(selected)
+          cached = selected.cached_tracking_result
+          selected.cached_tracking_result = None
+          monitor.update_state(selected.state, selected.settings, False, self.EmptyStore(), self.EmptyStore(),
+                               tracker=selected.tracker, tracking_only=True, persist_frame=False,
+                               cached_tracking_result=cached, perform_tracking_lookup=cached is None)
+          if cached is None:
+            store.remember_tracking_result(selected)
+      self.assertEqual(fetch.call_count, 1)
+      self.assertEqual(sum(bool(session.state.payload['tracking_found']) for session in visitors), 10)
 
   def test_inactive_and_expired_sessions_do_not_acquire(self):
     with tempfile.TemporaryDirectory() as temporary, patch.object(monitor.time, 'monotonic', return_value=1000):
@@ -338,6 +391,142 @@ class AcquisitionWorkloadTests(unittest.TestCase):
     self.assertEqual(state.payload['acquisition_outcome'], 'stale')
     self.assertIsNone(state.last_acquisition_succeeded_at)
     self.assertEqual(state.metric_observations, [])
+
+  def test_slow_route_enrichment_does_not_block_another_tracking_acquisition(self):
+    route_started = threading.Event()
+    release_route = threading.Event()
+    calls = []
+
+    class SlowRoutes:
+      api_key = ""
+
+      def get(self, plane):
+        route_started.set()
+        release_route.wait(2)
+        return {}
+
+    def lookup(candidates):
+      hex_code = candidates[0].split(":", 1)[-1]
+      calls.append(hex_code)
+      return ({"hex": hex_code.lower(), "flight": "TST" + hex_code[-2:],
+           "lat": 51, "lon": 0, "seen_pos": 0}, "TST" + hex_code[-2:])
+
+    first_state, second_state = monitor.FrameState(), monitor.FrameState()
+    first_tracker, second_tracker = monitor.FlightTrackingState(), monitor.FlightTrackingState()
+    first_tracker.start("hex:000001", ("hex:000001",))
+    second_tracker.start("hex:000002", ("hex:000002",))
+    with patch.object(monitor, "fetch_tracked_aircraft", side_effect=lookup):
+      try:
+        monitor.update_state(first_state, overhead.Settings(), False, self.EmptyStore(), self.EmptyStore(),
+                   routes=SlowRoutes(), tracker=first_tracker, tracking_only=True, persist_frame=False)
+        self.assertTrue(route_started.wait(1))
+        monitor.update_state(second_state, overhead.Settings(), False, self.EmptyStore(), self.EmptyStore(),
+                   routes=SlowRoutes(), tracker=second_tracker, tracking_only=True, persist_frame=False)
+        self.assertEqual(calls, ["000001", "000002"])
+        self.assertEqual(second_state.payload["aircraft_id"], "000002")
+      finally:
+        release_route.set()
+
+  def test_slow_enrichment_cannot_overwrite_a_newer_same_aircraft_position(self):
+    route_started = threading.Event()
+    release_first = threading.Event()
+    second_route_done = threading.Event()
+
+    class OrderedRoutes:
+      api_key = ""
+      count = 0
+
+      def get(self, plane):
+        self.count += 1
+        if self.count == 1:
+          route_started.set()
+          release_first.wait(2)
+        else:
+          second_route_done.set()
+        return {}
+
+    records = [
+      {"hex": "406b82", "flight": "BAW5", "lat": 51, "lon": 0, "seen_pos": 0, "alt_baro": 10000},
+      {"hex": "406b82", "flight": "BAW5", "lat": 52, "lon": 0, "seen_pos": 0, "alt_baro": 20000},
+    ]
+    state = monitor.FrameState()
+    tracker = monitor.FlightTrackingState()
+    tracker.start("406B82", ("hex:406B82",))
+    routes = OrderedRoutes()
+    with patch.object(monitor, "fetch_tracked_aircraft", side_effect=[(records[0], "BAW5"), (records[1], "BAW5")]):
+      monitor.update_state(state, overhead.Settings(), False, self.EmptyStore(), self.EmptyStore(),
+                           routes=routes, tracker=tracker, tracking_only=True, persist_frame=False)
+      self.assertTrue(route_started.wait(1))
+      with state.lock:
+        first_future = state.last_enrichment_future
+      monitor.update_state(state, overhead.Settings(), False, self.EmptyStore(), self.EmptyStore(),
+                           routes=routes, tracker=tracker, tracking_only=True, persist_frame=False)
+      self.assertTrue(second_route_done.wait(1))
+      with state.lock:
+        second_future = state.last_enrichment_future
+      self.assertIsNot(first_future, second_future)
+      second_future.result(timeout=2)
+      self.assertEqual(state.payload["aircraft_latitude"], 52)
+      release_first.set()
+      first_future.result(timeout=2)
+      self.assertEqual(state.payload["aircraft_latitude"], 52)
+      self.assertEqual(state.payload["altitude"], 20000)
+    release_first.set()
+
+  def test_sixty_four_position_updates_never_exceed_four_enrichment_workers(self):
+    release_routes = threading.Event()
+    workers_started = threading.Event()
+    counter_lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+    completed_routes = 0
+
+    class BlockingRoutes:
+      api_key = ""
+
+      def get(self, plane):
+        nonlocal active, maximum_active, completed_routes
+        with counter_lock:
+          active += 1
+          maximum_active = max(maximum_active, active)
+          if active == monitor.MAX_ENRICHMENT_WORKERS:
+            workers_started.set()
+        release_routes.wait(2)
+        with counter_lock:
+          active -= 1
+          completed_routes += 1
+        return {}
+
+    states = []
+    trackers = []
+
+    def lookup(candidates):
+      identifier = candidates[0].split(":", 1)[-1]
+      return ({"hex": identifier.lower(), "flight": "TST" + identifier[-2:],
+               "lat": 51, "lon": 0, "seen_pos": 0, "alt_baro": 10000}, "TST" + identifier[-2:])
+
+    with patch.object(monitor, "fetch_tracked_aircraft", side_effect=lookup):
+      for index in range(64):
+        identifier = f"{index + 1:06X}"
+        state = monitor.FrameState()
+        tracker = monitor.FlightTrackingState()
+        tracker.start(identifier, ("hex:" + identifier,))
+        monitor.update_state(state, overhead.Settings(), False, self.EmptyStore(), self.EmptyStore(),
+                             routes=BlockingRoutes(), tracker=tracker, tracking_only=True, persist_frame=False)
+        states.append(state)
+        trackers.append(tracker)
+      try:
+        self.assertTrue(workers_started.wait(1), "Bounded enrichment workers did not start")
+        self.assertEqual(maximum_active, monitor.MAX_ENRICHMENT_WORKERS)
+        self.assertTrue(all(state.payload["aircraft_id"] == tracker.snapshot()["last_plane"]["hex"].upper()
+                            for state, tracker in zip(states, trackers)))
+      finally:
+        release_routes.set()
+      futures = [state.last_enrichment_future for state in states if state.last_enrichment_future is not None]
+      for future in futures:
+        future.result(timeout=3)
+    self.assertEqual(completed_routes, 64)
+    self.assertEqual(maximum_active, 4)
 
   def test_status_does_not_wait_for_an_inflight_provider(self):
     request_started = threading.Event()

@@ -1,5 +1,6 @@
 import json
 import http.client
+import os
 import threading
 import tempfile
 import time
@@ -1268,18 +1269,54 @@ class OverHeadTests(unittest.TestCase):
                 output_png=str(Path(temporary) / "frame.png"),
             )
             state = FrameState()
-            with patch("monitor.fetch_aircraft", return_value=[aircraft]):
+            enrichment_published = threading.Event()
+            original_update = state.update
+
+            def observe_update(*args, **kwargs):
+                original_update(*args, **kwargs)
+                route_data = args[8] if len(args) > 8 else kwargs.get("route")
+                if route_data and route_data.get("route") == "LHR to HND":
+                    enrichment_published.set()
+
+            with patch("monitor.fetch_aircraft", return_value=[aircraft]), patch.object(
+                state, "update", side_effect=observe_update,
+            ):
                 update_state(
                     state, settings, False, EmptyStore(), EmptyStore(), routes=store,
                     persist_frame=False,
                 )
+            self.assertTrue(enrichment_published.wait(5), "Route enrichment did not publish")
             self.assertEqual(state.payload["route"], "LHR to HND")
             self.assertEqual(state.payload["origin"], "LHR")
             self.assertEqual(state.payload["destination"], "HND")
 
     def test_failed_free_route_lookup_retries_after_thirty_seconds(self):
-        source = Path(__file__).with_name("monitor.py").read_text(encoding="utf-8")
-        self.assertIn("ROUTE_FAILURE_RETRY_SECONDS = 30", source)
+        class Routes(FlightRouteStore):
+            calls = 0
+
+            def _adsbim_routeset(self, callsign, plane):
+                self.calls += 1
+                return {}
+
+            def _adsblol_routeset(self, callsign, plane):
+                self.calls += 1
+                return {}
+
+            def _adsblol(self, callsign, plane):
+                self.calls += 1
+                return {}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Routes(Path(temporary) / "routes.json")
+            plane = {"hex": "406b82", "flight": "BAW5", "r": "G-YMMO", "lat": 51, "lon": 0}
+            key = store._cache_key(plane)
+            store._failures[key] = 1000
+            with patch("monitor.time.time", return_value=1029):
+                self.assertEqual(store.get(plane), {})
+            self.assertEqual(store.calls, 0)
+            with patch("monitor.time.time", return_value=1031):
+                self.assertEqual(store.get(plane), {})
+            self.assertEqual(store.calls, 3)
 
     def test_radar_replaces_home_centre_with_flight_tracking_controls(self):
         self.assertNotIn(b"HOME CENTRE", PAGE)
@@ -1690,6 +1727,24 @@ class OverHeadTests(unittest.TestCase):
         self.assertNotIn("FLIGHTAWARE_AEROAPI_URL", health_class)
         self.assertIn("time.sleep(API_HEALTH_INTERVAL_SECONDS)", source)
 
+    def test_keyboard_shortcut_ignores_editable_targets_and_reduced_motion_is_supported(self):
+        source = Path(__file__).with_name("monitor.py").read_text(encoding="utf-8")
+        self.assertIn("event.target.closest('input,textarea,select,[contenteditable=\"true\"],[role=\"textbox\"]')", source)
+        self.assertIn("event.defaultPrevented||event.altKey||event.ctrlKey||event.metaKey||event.shiftKey", source)
+        self.assertIn("@media (prefers-reduced-motion:reduce)", source)
+        self.assertIn("animation-iteration-count:1 !important", source)
+        self.assertIn("prefersReducedMotion||document.visibilityState", source)
+        self.assertIn("function trapModalTab(event)", source)
+        self.assertIn("dialog.contains(document.activeElement)", source)
+        self.assertIn("modalReturnFocus.focus()", source)
+        self.assertIn("viewerReturnFocus.focus()", source)
+
+    def test_unchanged_route_and_radar_data_skip_layer_reconstruction(self):
+        source = Path(__file__).with_name("monitor.py").read_text(encoding="utf-8")
+        self.assertIn("if(renderKey===routeMapRenderKey)return", source)
+        self.assertIn("if(visualKey!==radarRenderKey)", source)
+        self.assertIn("layer.replaceChildren()", source)
+
     def test_status_payload_exposes_api_health_to_browser(self):
         source = Path(__file__).with_name("monitor.py").read_text(encoding="utf-8")
         self.assertIn('"api_health_ok": bool(api_health.get("ok"))', source)
@@ -1862,6 +1917,8 @@ class OverHeadTests(unittest.TestCase):
                 )
 
             self.assertEqual(record["callsign"], "BAW283")
+            self.assertIn(" · ", record["captured_display"])
+            self.assertNotIn("Â·", record["captured_display"])
             self.assertEqual(record["registration"], "G-STBH")
             self.assertTrue(record["radar"])
             self.assertTrue(record["desktop"].endswith("_desktop.png"))
@@ -1914,26 +1971,27 @@ class _UIResponse:
 
 class ProviderFailoverTests(unittest.TestCase):
  def setUp(self):
-    overhead._provider_request_windows.clear()
-    overhead._provider_retry_until.clear(); overhead._provider_backoff.clear(); overhead._provider_request_counts.clear();overhead._provider_last_status.clear();overhead._provider_last_attempt_at.clear();overhead._provider_last_success_at.clear();overhead._last_successful_aircraft_provider='';overhead._last_provider_switch_reason=''
+     overhead._provider_request_windows.clear()
+     overhead._provider_empty_counts.clear()
+     overhead._provider_retry_until.clear(); overhead._provider_backoff.clear(); overhead._provider_request_counts.clear();overhead._provider_last_status.clear();overhead._provider_last_attempt_at.clear();overhead._provider_last_success_at.clear();overhead._last_successful_aircraft_provider='';overhead._last_provider_switch_reason=''
  def test_normal(self):
   urls=[]
-  def request(req,timeout=8): urls.append(req.full_url);return _FailoverResponse({'ac':[{'hex':'a'}]})
+  def request(req,timeout=8): urls.append(req.full_url);return _FailoverResponse({'ac':[{'hex':'a','lat':51,'lon':0,'seen_pos':0}]})
   with patch.object(overhead.urllib.request,'urlopen',side_effect=request):
-   self.assertEqual(overhead.fetch_aircraft(overhead.Settings(latitude=51.5,longitude=-3.3,radius_nm=25)),[{'hex':'a'}])
+    self.assertEqual(overhead.fetch_aircraft(overhead.Settings(latitude=51.5,longitude=-3.3,radius_nm=25))[0]['hex'],'a')
   self.assertEqual(len(urls),1);self.assertIn('/v2/point/51.5/-3.3/25',urls[0])
  def test_429_fallback_and_cooldown(self):
-  urls=[]; headers=email.message.Message();headers['x-ratelimit-remaining']='0';headers['x-ratelimit-reset']='34300'
-  def request(req,timeout=8):
-   urls.append(req.full_url)
-   if 'adsb.lol' in req.full_url: raise urllib.error.HTTPError(req.full_url,429,'rate limited',headers,None)
-   return _FailoverResponse({'ac':[{'hex':'a'}]})
-  with patch.object(overhead.urllib.request,'urlopen',side_effect=request):
-   overhead.fetch_aircraft(overhead.Settings())
-   overhead.fetch_aircraft(overhead.Settings())
-  self.assertEqual(len(urls),3)
-  self.assertEqual(overhead._provider_request_counts['ADSB.lol'],1)
-  self.assertGreater(overhead.aircraft_provider_status()['ADSB.lol']['retry_in_seconds'],34000)
+    urls=[]; headers=email.message.Message();headers['x-ratelimit-remaining']='0';headers['x-ratelimit-reset']='34300'
+    def request(req,timeout=8):
+     urls.append(req.full_url)
+     if 'adsb.lol' in req.full_url: raise urllib.error.HTTPError(req.full_url,429,'rate limited',headers,None)
+     return _FailoverResponse({'ac':[{'hex':'a','lat':51,'lon':0,'seen_pos':0}]})
+    with patch.object(overhead.urllib.request,'urlopen',side_effect=request):
+     overhead.fetch_aircraft(overhead.Settings())
+     overhead.fetch_aircraft(overhead.Settings())
+    self.assertEqual(len(urls),3)
+    self.assertEqual(overhead._provider_request_counts['ADSB.lol'],1)
+    self.assertGreater(overhead.aircraft_provider_status()['ADSB.lol']['retry_in_seconds'],34000)
  def test_retry_after_seconds_are_honoured(self):
   headers=email.message.Message();headers['Retry-After']='90'
   error=urllib.error.HTTPError('https://api.adsb.lol/',429,'limited',headers,None)
@@ -1945,10 +2003,10 @@ class ProviderFailoverTests(unittest.TestCase):
   def request(req,timeout=8):
     urls.append(req.full_url)
     if 'adsb.lol' in req.full_url: raise urllib.error.HTTPError(req.full_url,403,'forbidden',{},None)
-    return _FailoverResponse({'ac':[{'hex':'a'}]})
+    return _FailoverResponse({'ac':[{'hex':'a','lat':51,'lon':0,'seen_pos':0}]})
   with patch.object(overhead.urllib.request,'urlopen',side_effect=request):
-    self.assertEqual(overhead.fetch_aircraft(overhead.Settings()),[{'hex':'a'}])
-    self.assertEqual(overhead.fetch_aircraft(overhead.Settings()),[{'hex':'a'}])
+    self.assertEqual(overhead.fetch_aircraft(overhead.Settings())[0]['hex'],'a')
+    self.assertEqual(overhead.fetch_aircraft(overhead.Settings())[0]['hex'],'a')
   self.assertEqual(len([url for url in urls if 'adsb.lol' in url]),1)
   self.assertEqual(overhead.aircraft_provider_status()['ADSB.lol']['last_status'],'HTTP 403')
   self.assertGreaterEqual(overhead.aircraft_provider_status()['ADSB.lol']['retry_in_seconds'],299)
@@ -1975,7 +2033,7 @@ class ProviderFailoverTests(unittest.TestCase):
     return _FailoverResponse({'ac':[]})
   with patch.object(overhead.time,'monotonic',return_value=1301), patch.object(overhead.urllib.request,'urlopen',side_effect=recovered):
     overhead.fetch_aircraft(overhead.Settings())
-  self.assertIn('adsb.lol',urls[-1])
+    self.assertIn('adsb.lol',urls[-1])
  def test_403_retry_after_is_not_shortened_by_local_backoff_cap(self):
     headers = email.message.Message()
     headers['Retry-After'] = '999999'
@@ -2006,21 +2064,19 @@ class ProviderFailoverTests(unittest.TestCase):
 class ProviderUIRegressionTests(unittest.TestCase):
  def setUp(self):
     overhead._provider_request_windows.clear()
+    overhead._provider_empty_counts.clear()
     overhead._provider_retry_until.clear();overhead._provider_backoff.clear();overhead._provider_request_counts.clear();overhead._provider_last_status.clear();overhead._provider_last_attempt_at.clear();overhead._provider_last_success_at.clear();overhead._last_successful_aircraft_provider='';overhead._last_provider_switch_reason=''
  def test_429_then_fallback_returns_live(self):
-  requests=[]
-  def send(req,timeout=8):
-   requests.append(req.full_url)
-   if 'api.adsb.lol' in req.full_url:
-    raise urllib.error.HTTPError(req.full_url,429,'limited',{'x-ratelimit-remaining':'0','x-ratelimit-reset':'34300'},None)
-   return _UIResponse({'ac':[{'hex':'abc123'}]})
-  with patch.object(overhead.urllib.request,'urlopen',side_effect=send):
-   result=overhead.fetch_aircraft(overhead.Settings(radius_nm=25))
-   result2=overhead.fetch_aircraft(overhead.Settings(radius_nm=25))
-  self.assertEqual(result,result2)
-  self.assertEqual(len(requests),3)
-  self.assertEqual(overhead.aircraft_provider_status()['ADSB.fi']['last_status'],'OK')
-  self.assertEqual(overhead.aircraft_provider_status()['ADSB.lol']['last_status'],'429')
+    error=urllib.error.HTTPError('https://api.adsb.lol/',429,'limited',{'x-ratelimit-remaining':'0','x-ratelimit-reset':'34300'},None)
+    response=_UIResponse({'ac':[{'hex':'abc123','lat':51,'lon':0,'seen_pos':0}]})
+    with patch.object(overhead.urllib.request,'urlopen',side_effect=[error,response,response]) as provider:
+     result=overhead.fetch_aircraft(overhead.Settings(radius_nm=25))
+     result2=overhead.fetch_aircraft(overhead.Settings(radius_nm=25))
+    self.assertEqual(result[0]['hex'],result2[0]['hex'])
+    self.assertEqual((result[0]['lat'],result[0]['lon']),(result2[0]['lat'],result2[0]['lon']))
+    self.assertEqual(provider.call_count,3)
+    self.assertEqual(overhead.aircraft_provider_status()['ADSB.fi']['last_status'],'OK')
+    self.assertEqual(overhead.aircraft_provider_status()['ADSB.lol']['last_status'],'429')
  def test_no_api_heartbeat_thread(self):
   self.assertNotIn('threading.Thread(target=api_health_loop',(Path(__file__).resolve().parent / 'monitor.py').read_text())
  def test_ui_distance_steps(self):
@@ -2096,10 +2152,147 @@ class VisitorSessionTests(unittest.TestCase):
         return result
 
     def new_visitor(self):
-        status, cookie_header, _ = self.request("GET", "/")
+        existing_sessions = len(self.sessions.sessions)
+        status, _, _ = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(self.sessions.sessions), existing_sessions)
+        status, cookie_header, _ = self.request("GET", "/status?active=1")
         self.assertEqual(status, 200)
         self.assertIn("HttpOnly", cookie_header)
         return cookie_header.split(";", 1)[0]
+
+    def test_cookie_less_homepage_requests_do_not_allocate_monitoring_sessions(self):
+        for _ in range(70):
+            status, cookie, _ = self.request("GET", "/")
+            self.assertEqual(status, 200)
+            self.assertIsNone(cookie)
+        self.assertEqual(self.sessions.sessions, {})
+
+    def test_browser_security_headers_and_server_version_are_present(self):
+        connection = http.client.HTTPConnection(self.host, self.port)
+        connection.request("GET", "/")
+        response = connection.getresponse()
+        headers = {name.casefold(): value for name, value in response.getheaders()}
+        response.read()
+        connection.close()
+        self.assertEqual(headers["x-content-type-options"], "nosniff")
+        self.assertEqual(headers["referrer-policy"], "strict-origin-when-cross-origin")
+        self.assertEqual(headers["x-frame-options"], "DENY")
+        self.assertIn("https://unpkg.com", headers["content-security-policy"])
+        self.assertIn("https://tile.openstreetmap.org", headers["content-security-policy"])
+        self.assertNotIn("Python", headers.get("server", ""))
+
+    def test_snapshot_restart_reconciliation_stays_inside_archive_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "visitors"
+            root.mkdir()
+            orphan = root / ("a" * 32)
+            orphan.mkdir()
+            (orphan / "old.png").write_bytes(b"orphan")
+            expired_at = time.time() - monitor.VISITOR_SNAPSHOT_RETENTION_SECONDS - 1
+            os.utime(orphan, (expired_at, expired_at))
+            recent = root / ("c" * 32)
+            recent.mkdir()
+            (recent / "recent.png").write_bytes(b"recent")
+            unrelated = root / "notes"
+            unrelated.mkdir()
+            (unrelated / "keep.txt").write_text("keep", encoding="utf-8")
+            outside = Path(temporary) / "outside"
+            outside.mkdir()
+            (outside / "keep.txt").write_text("keep", encoding="utf-8")
+            (root / ("b" * 32)).symlink_to(outside, target_is_directory=True)
+
+            monitor.VisitorSessionStore(self.settings, root)
+
+            self.assertFalse(orphan.exists())
+            self.assertTrue((recent / "recent.png").exists())
+            self.assertFalse((root / ("b" * 32)).exists())
+            self.assertTrue((outside / "keep.txt").exists())
+            self.assertTrue((unrelated / "keep.txt").exists())
+
+    def test_restart_archives_still_count_toward_global_snapshot_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "visitors"
+            session_dir = root / ("d" * 32)
+            session_dir.mkdir(parents=True)
+            records = [
+                {"id": f"snapshot-{index}", "desktop": f"{index}-desktop.png", "mobile": f"{index}-mobile.png"}
+                for index in range(monitor.MAX_VISITOR_SNAPSHOTS)
+            ]
+            for record in records:
+                (session_dir / record["desktop"]).write_bytes(b"desktop")
+                (session_dir / record["mobile"]).write_bytes(b"mobile")
+            (session_dir / "index.json").write_text(json.dumps(records), encoding="utf-8")
+            sessions = monitor.VisitorSessionStore(self.settings, root)
+            self.assertEqual(sessions.retained_snapshot_count(), monitor.MAX_VISITOR_SNAPSHOTS)
+
+    def test_active_heartbeat_refreshes_archive_retention_without_following_symlinks(self):
+        visitor = self.new_visitor()
+        session = self.sessions.sessions[visitor.split("=", 1)[1]]
+        expired_at = time.time() - monitor.VISITOR_SNAPSHOT_RETENTION_SECONDS - 1
+        os.utime(session.snapshots.root, (expired_at, expired_at))
+        session.last_archive_touch_at = 0
+        self.sessions.touch(session, active=True)
+        self.assertGreater(session.snapshots.root.stat(follow_symlinks=False).st_mtime, expired_at)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "visitors"
+            store = monitor.VisitorSessionStore(self.settings, root)
+            visitor_session, _ = store.get_or_create()
+            archive = visitor_session.snapshots.root
+            real_archive = archive.with_name("real-archive")
+            archive.rename(real_archive)
+            outside = Path(temporary) / "outside"
+            outside.mkdir()
+            old_time = time.time() - monitor.VISITOR_SNAPSHOT_RETENTION_SECONDS - 1
+            os.utime(outside, (old_time, old_time))
+            archive.symlink_to(outside, target_is_directory=True)
+            visitor_session.last_archive_touch_at = 0
+            store.touch(visitor_session, active=True)
+            self.assertEqual(outside.stat(follow_symlinks=False).st_mtime, old_time)
+
+    def test_anonymous_and_forged_diagnostic_requests_do_not_allocate_sessions(self):
+        for cookie in (None, "overhead_session=forged-session-id"):
+            status, _, body = self.request("GET", "/route-debug", cookie)
+            self.assertEqual(status, 401)
+            self.assertEqual(json.loads(body), {"error": "Active visitor session required"})
+        self.assertEqual(self.sessions.sessions, {})
+
+    def test_public_route_diagnostics_are_visitor_scoped(self):
+        visitor_a = self.new_visitor()
+        visitor_b = self.new_visitor()
+        self.request("POST", "/track", visitor_a, {"flight": "BAW5"})
+        self.request("POST", "/track", visitor_b, {"flight": "JAL43"})
+        for visitor, own, other in ((visitor_a, "BAW5", "JAL43"), (visitor_b, "JAL43", "BAW5")):
+            status, _, body = self.request("GET", "/route-debug", visitor)
+            self.assertEqual(status, 200)
+            diagnostics = json.loads(body)
+            self.assertEqual(diagnostics["current"]["callsign"], "")
+            self.assertNotIn("resolver", diagnostics)
+            self.assertNotIn(own, body.decode())
+            self.assertNotIn(other, body.decode())
+
+    def test_concurrent_active_admission_respects_limit_after_anonymous_load(self):
+        self.sessions.max_sessions = 64
+        for _ in range(200):
+            self.assertEqual(self.request("GET", "/")[0], 200)
+        statuses = []
+        lock = threading.Lock()
+
+        def activate():
+            status, _, _ = self.request("GET", "/status?active=1")
+            with lock:
+                statuses.append(status)
+
+        workers = [threading.Thread(target=activate) for _ in range(65)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=3)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(statuses.count(200), 64)
+        self.assertEqual(statuses.count(503), 1)
+        self.assertEqual(len(self.sessions.sessions), 64)
 
     def get_status(self, cookie):
         status, _, body = self.request("GET", "/status?active=1", cookie)
@@ -2505,6 +2698,17 @@ class VisitorSessionTests(unittest.TestCase):
         self.sessions.touch(session, active=True)
         self.assertEqual(session.refresh_requested_at, requested_at)
 
+    def test_location_change_marks_active_tracking_due_immediately(self):
+        session, _ = self.sessions.get_or_create()
+        session.tracker.start("406B82", ("hex:406B82",))
+        self.sessions.touch(session, active=True)
+        key = self.sessions.tracking_share_key(session)
+        self.sessions.tracking_next_due[key] = time.monotonic() + 30
+        self.sessions.request_tracking_refresh(session)
+        selected, _ = self.sessions.claim_due(now=time.monotonic() + 0.001)
+        self.assertIs(selected, session)
+        self.assertEqual(session.acquisition_kind, "tracking")
+
     def test_stopping_tracking_cancels_only_its_queued_refresh_reason(self):
         session, _ = self.sessions.get_or_create()
         self.sessions.request_refresh(session, "tracking")
@@ -2714,25 +2918,32 @@ class VisitorSessionTests(unittest.TestCase):
         self.assertEqual(status, 200)
 
         status, new_cookie, body = self.request("GET", "/status", "overhead_session=invalid")
-        self.assertEqual(status, 200)
-        self.assertNotEqual(new_cookie.split(";", 1)[0], visitor_a)
-        self.assertFalse(json.loads(body).get("tracking_active", False))
+        self.assertEqual(status, 401)
+        self.assertIsNone(new_cookie)
+        self.assertIn(b"Active visitor session required", body)
+        self.assertEqual(self.request("GET", "/snapshots", "overhead_session=invalid")[0], 401)
+        self.assertTrue(session_a.tracker.snapshot()["active"])
 
-        status, _, _ = self.request("GET", "/snapshot-state?id=private-snapshot", new_cookie.split(";", 1)[0])
-        self.assertEqual(status, 404)
-
-    def test_backend_restart_cookie_creates_a_fresh_unrelated_session(self):
+    def test_backend_restart_reattaches_snapshots_but_resets_runtime_state(self):
         prior_session, _ = self.sessions.get_or_create()
         prior_session.settings.latitude = 35.0
         prior_session.tracker.start("BA703", ("BAW703",))
+        prior_session.snapshots.root.mkdir(parents=True, exist_ok=True)
+        (prior_session.snapshots.root / "recent-desktop.png").write_bytes(b"desktop")
+        (prior_session.snapshots.root / "recent-mobile.png").write_bytes(b"mobile")
+        prior_session.snapshots._write_index_unlocked([
+            {"id": "recent-snapshot", "desktop": "recent-desktop.png", "mobile": "recent-mobile.png"},
+        ])
         restarted = monitor.VisitorSessionStore(
-            self.settings, Path(self.temp.name) / "restarted-snapshots",
+            self.settings, self.sessions.snapshot_root,
         )
         new_session, created = restarted.get_or_create(prior_session.session_id)
-        self.assertTrue(created)
-        self.assertNotEqual(new_session.session_id, prior_session.session_id)
+        self.assertFalse(created)
+        self.assertEqual(new_session.session_id, prior_session.session_id)
         self.assertEqual(new_session.settings.latitude, self.settings.latitude)
         self.assertFalse(new_session.tracker.snapshot()["active"])
+        self.assertEqual([item["id"] for item in new_session.snapshots.list()], ["recent-snapshot"])
+        self.assertEqual(new_session.snapshots.image("recent-snapshot", "desktop"), b"desktop")
 
     def test_another_session_cannot_read_private_pending_snapshot_state(self):
         visitor_a = self.new_visitor()
@@ -2763,10 +2974,14 @@ class VisitorSessionTests(unittest.TestCase):
         visitor_a = self.new_visitor()
         visitor_b = self.new_visitor()
         session_a = self.sessions.sessions[visitor_a.split("=", 1)[1]]
-        session_a.snapshots._write_index_unlocked([
+        records = [
             {"id": f"fixture-{index}", "desktop": f"{index}-desktop.png", "mobile": f"{index}-mobile.png"}
             for index in range(monitor.MAX_VISITOR_SNAPSHOTS)
-        ])
+        ]
+        for record in records:
+            (session_a.snapshots.root / record["desktop"]).write_bytes(b"desktop")
+            (session_a.snapshots.root / record["mobile"]).write_bytes(b"mobile")
+        session_a.snapshots._write_index_unlocked(records)
         status, _, _ = self.request("POST", "/snapshots", visitor_b, {"radar": True})
         self.assertEqual(status, 429)
 

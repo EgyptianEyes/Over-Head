@@ -65,6 +65,10 @@ class AircraftPositionStale(OSError):
     pass
 
 
+class AircraftPositionInvalid(OSError):
+    pass
+
+
 AIRCRAFT_PROVIDERS = (
     ("ADSB.lol", "https://api.adsb.lol"),
     ("ADSB.fi", "https://opendata.adsb.fi"),
@@ -81,8 +85,10 @@ _last_provider_switch_reason = ""
 _provider_request_windows: dict[str, list[float]] = {}
 PROVIDER_REQUESTS_PER_MINUTE = 30
 AGGREGATE_REQUESTS_PER_MINUTE = 30
+EMPTY_PRIMARY_VERIFY_EVERY = 3
 _active_aircraft_provider = ""
 _last_aircraft_observation: float | None = None
+_provider_empty_counts: dict[str, int] = {}
 
 
 def normalise_aircraft(record: dict[str, Any], source: str, received_at: float, payload_time: Any = None) -> dict[str, Any]:
@@ -193,6 +199,9 @@ def fetch_provider_aircraft(path: str) -> list[dict[str, Any]]:
         best_records: list[dict[str, Any]] = []
         best_observation = float("-inf")
         usable_response = False
+        valid_empty_response = False
+        invalid_response = False
+        stale_response = False
         target_kind, _, target = path.removeprefix("/v2/").partition("/")
         targeted = target_kind in {"hex", "callsign"}
         for name, base in AIRCRAFT_PROVIDERS:
@@ -220,12 +229,44 @@ def fetch_provider_aircraft(path: str) -> list[dict[str, Any]]:
                 if targeted:
                     field = "hex" if target_kind == "hex" else "flight"
                     records = [record for record in records if str(record.get(field) or "").strip().upper() == target.upper()]
+                invalid_positions = [record for record in records if record.get("observed_at") is None]
+                fresh = [record for record in records if record.get("observed_at") is not None
+                         and record.get("seen_pos", 999) <= (60 if targeted else 20)]
+                stale = [record for record in records if record.get("observed_at") is not None
+                         and record.get("seen_pos", 999) > (60 if targeted else 20)]
+                if records and not fresh and (invalid_positions or stale):
+                    invalid_response = bool(invalid_positions)
+                    stale_response = bool(stale) and not invalid_positions
+                    _provider_last_status[name] = "invalid positions" if invalid_response else "stale positions"
+                    _last_provider_switch_reason = f"{name} returned {'invalid' if invalid_response else 'stale'} positions"
+                    if invalid_response:
+                        _pause_provider(name, ValueError(f"Invalid {name} aircraft positions"))
+                    continue
+                if targeted:
                     if target_kind == "callsign" and len({record.get("hex") for record in records}) > 1:
                         _provider_last_status[name] = "ambiguous identity"
                         _last_provider_switch_reason = f"{name} returned conflicting aircraft identities"
                         usable_response = True
                         continue
-                fresh = [record for record in records if record.get("observed_at") is not None and record.get("seen_pos", 999) <= (60 if targeted else 20)]
+                if targeted and records and not fresh:
+                    invalid_response = True
+                    _provider_last_status[name] = "invalid or stale target position"
+                    continue
+                if not targeted and not records:
+                    _provider_empty_counts[name] = _provider_empty_counts.get(name, 0) + 1
+                    if name == AIRCRAFT_PROVIDERS[0][0] and _provider_empty_counts[name] % EMPTY_PRIMARY_VERIFY_EVERY != 0:
+                        _provider_last_status[name] = "empty"
+                        _provider_last_success_at[name] = time.time()
+                        _last_successful_aircraft_provider = name
+                        return []
+                    if name == AIRCRAFT_PROVIDERS[0][0]:
+                        _provider_last_status[name] = "empty; verifying fallback"
+                        valid_empty_response = True
+                        usable_response = True
+                        continue
+                    valid_empty_response = True
+                elif records:
+                    _provider_empty_counts[name] = 0
                 usable_response = True
                 _provider_retry_until.pop(name, None)
                 _provider_backoff.pop(name, None)
@@ -237,8 +278,8 @@ def fetch_provider_aircraft(path: str) -> list[dict[str, Any]]:
                     _last_provider_switch_reason = f"{previous_provider} unavailable; used {name}"
                 if fresh:
                     _last_aircraft_observation = max(record["observed_at"] for record in fresh)
-                    return records
-                if not targeted and (not records or not any("lat" in record or "lon" in record for record in records)):
+                    return fresh
+                if valid_empty_response:
                     return records
                 observation = max((record.get("observed_at") or float("-inf") for record in records), default=float("-inf"))
                 if observation > best_observation:
@@ -261,6 +302,16 @@ def fetch_provider_aircraft(path: str) -> list[dict[str, Any]]:
                 _pause_provider(name, exc)
         if usable_response:
             return best_records
+        if valid_empty_response:
+            return []
+        if invalid_response:
+            raise AircraftPositionInvalid("Aircraft providers returned invalid positions") from last_error
+        if stale_response:
+            raise AircraftPositionStale("Aircraft providers returned only stale positions") from last_error
+        if invalid_response:
+            raise AircraftPositionInvalid("Providers returned no valid aircraft positions") from last_error
+        if stale_response:
+            raise AircraftPositionStale("Providers returned only stale aircraft positions") from last_error
         if wait_times or any(_provider_retry_until.get(n, 0) > time.monotonic() for n, _ in AIRCRAFT_PROVIDERS):
             remaining = [max(0.0, _provider_retry_until.get(n, 0) - time.monotonic(), _request_budget_wait(n, time.monotonic())) for n, _ in AIRCRAFT_PROVIDERS]
             statuses = [_provider_last_status.get(name, "") for name, _ in AIRCRAFT_PROVIDERS]
