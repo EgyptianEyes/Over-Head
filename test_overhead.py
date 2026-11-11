@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from monitor import APIHealthMonitor, ActiveMonitorLease, AircraftIdentityStore, AirportStore, CONFIG_REQUIRED_PAGE, FlagStore, FlightRouteStore, FlightTrackingState, FrameState, LogoStore, PAGE, RADAR_RANGES, TRACK_RADAR_RANGES, SnapshotStore, apply_live_location_change, aircraft_identity, aircraft_name, automatic_tracking_radius, commentary_observation_time, flight_details, merge_tracked_aircraft, normalise_flight_query, operator_code, overhead_logo_asset, radar_contacts, safe_svg, save_location_config, tracking_distance_nm, update_live_location_config, update_state, flightaware_api_key
-from overhead import DEMO, HEIGHT, WIDTH, Settings, fetch_aircraft, load_settings, produce_frame, select_nearest
+from overhead import AircraftFeedRateLimited, AircraftFeedUnavailable, AircraftPositionStale, DEMO, HEIGHT, WIDTH, Settings, fetch_aircraft, load_settings, produce_frame, select_nearest
 
 
 class OverHeadTests(unittest.TestCase):
@@ -146,30 +146,101 @@ class OverHeadTests(unittest.TestCase):
 
         observe(1000.0, "abc123", 10000, 200, 8.0)
         self.assertEqual(state.payload["metric_history_observations"], [])
-        observe(1300.0, "abc123", 12000, 210, 7.0)
-        observe(1600.0, "abc123", 14000, 220, 6.0)
+        observe(1030.0, "abc123", 12000, 210, 7.0)
+        observe(1060.0, "abc123", 14000, 220, 6.0)
         observations = state.payload["metric_history_observations"]
         self.assertEqual(len(observations), 2)
-        self.assertAlmostEqual(observations[0]["age_seconds"], 300.0, delta=0.2)
-        self.assertAlmostEqual(observations[1]["age_seconds"], 600.0, delta=0.2)
+        self.assertAlmostEqual(observations[0]["age_seconds"], 30.0, delta=0.2)
+        self.assertAlmostEqual(observations[1]["age_seconds"], 60.0, delta=0.2)
         self.assertEqual(observations[0]["altitude"], 12000)
         self.assertEqual(observations[1]["altitude"], 10000)
-        self.assertTrue(all(sample is None for sample in state.payload["metric_history"].values()))
+        self.assertEqual(state.payload["metric_history"]["30"]["altitude"], 12000)
+        self.assertEqual(state.payload["metric_history"]["60"]["altitude"], 10000)
+        self.assertIsNone(state.payload["metric_history"]["90"])
 
         observation_count = len(state.metric_observations)
         state.update(
             monitor.render({"hex": "abc123", "lat": 51.6, "lon": -0.1}, 6, "live"),
             "live", {"hex": "abc123", "lat": 51.6, "lon": -0.1}, 6,
             [{"hex": "abc123", "lat": 51.6, "lon": -0.1}], settings, None,
-            reported_position_observed_at=1599.9,
+            reported_position_observed_at=1059.9,
             new_position_observation=False,
         )
         self.assertEqual(len(state.metric_observations), observation_count)
 
-        observe(1900.0, "def456", 18000, 300, 12.0)
+        observe(1090.0, "def456", 18000, 300, 12.0)
         self.assertEqual(state.metric_observation_aircraft_id, "DEF456")
         self.assertEqual(len(state.metric_observations), 1)
         self.assertEqual(state.payload["metric_history_observations"], [])
+
+    def test_automatic_target_lookup_populates_history_from_provider_observations(self):
+        class EmptyStore:
+            def get(self, *_args):
+                return {}
+
+        settings = Settings(latitude=51.5, longitude=-0.1, radius_nm=25)
+        state = FrameState()
+
+        def plane(altitude, speed):
+            return {
+                "hex": "abc123", "flight": "TST123", "lat": 51.6, "lon": -0.1,
+                "seen_pos": 0.1, "alt_baro": altitude, "gs": speed,
+                "baro_rate": 500, "track": 180,
+            }
+
+        with patch("monitor.fetch_aircraft", return_value=[plane(10000, 200)]), patch.object(
+            monitor.time, "monotonic", return_value=1000.0,
+        ):
+            update_state(state, settings, False, EmptyStore(), EmptyStore(), persist_frame=False)
+
+        selected_id = state.payload["aircraft_id"]
+        with patch("monitor.fetch_tracked_aircraft", return_value=(plane(12000, 210), "TST123")) as lookup, patch.object(
+            monitor.time, "monotonic", return_value=1030.0,
+        ):
+            update_state(
+                state, settings, False, EmptyStore(), EmptyStore(), persist_frame=False,
+                tracking_only=True, automatic_tracking=(selected_id, ("hex:ABC123",)),
+                perform_automatic_tracking=True,
+            )
+
+        lookup.assert_called_once_with(("hex:ABC123",))
+        self.assertEqual(len(state.metric_observations), 2)
+        self.assertEqual(state.payload["metric_history"]["30"]["altitude"], 10000)
+        self.assertEqual(state.payload["altitude"], 12000)
+
+    def test_automatic_target_lookup_retains_provider_failure_outcome(self):
+        class EmptyStore:
+            def get(self, *_args):
+                return {}
+
+        aircraft = {
+            "hex": "abc123", "flight": "TST123", "lat": 51.6, "lon": -0.1,
+            "seen_pos": 0.1, "alt_baro": 10000, "gs": 200,
+        }
+        failures = (
+            (AircraftPositionStale(), "stale"),
+            (AircraftFeedRateLimited(30), "rate_limited"),
+            (AircraftFeedUnavailable(30), "provider_unavailable"),
+            (TimeoutError(), "provider_unavailable"),
+        )
+        for error, outcome in failures:
+            with self.subTest(outcome=outcome):
+                state = FrameState()
+                with patch("monitor.fetch_aircraft", return_value=[aircraft]):
+                    update_state(
+                        state, Settings(latitude=51.5, longitude=-0.1), False,
+                        EmptyStore(), EmptyStore(), persist_frame=False,
+                    )
+                selected_id = state.payload["aircraft_id"]
+                with patch("monitor.fetch_tracked_aircraft", side_effect=error):
+                    update_state(
+                        state, Settings(latitude=51.5, longitude=-0.1), False,
+                        EmptyStore(), EmptyStore(), persist_frame=False, tracking_only=True,
+                        automatic_tracking=(selected_id, ("hex:ABC123",)),
+                        perform_automatic_tracking=True,
+                    )
+                self.assertEqual(state.last_automatic_tracking_result["outcome"], outcome)
+                self.assertEqual(state.payload["callsign"], "TST123")
 
     def test_flightaware_maps_atc_callsign_to_current_commercial_flight(self):
         class StubAirports:
@@ -894,7 +965,12 @@ class OverHeadTests(unittest.TestCase):
     def test_location_button_busy_state_clears_on_success_failure_and_close(self):
         self.assertIn(b"position=>{\n          setLocationButtonBusy(false);", PAGE)
         self.assertIn(b"error=>{\n          setLocationButtonBusy(false);", PAGE)
-        self.assertIn(b"function closeLocationSelector(){\n      setLocationButtonBusy(false);\n      byId('location-backdrop').classList.remove('open');\n      setRadar(true);", PAGE)
+        close_handler = PAGE.split(b"function closeLocationSelector(){", 1)[1].split(
+            b"function setLocationButtonBusy", 1
+        )[0]
+        self.assertIn(b"setLocationButtonBusy(false);", close_handler)
+        self.assertIn(b"byId('location-backdrop').classList.remove('open');", close_handler)
+        self.assertIn(b"setRadar(true);", close_handler)
 
     def test_wrong_crl_to_opo_route_is_rejected_for_aircraft_over_wales(self):
         route = {
@@ -965,7 +1041,7 @@ class OverHeadTests(unittest.TestCase):
 
     def test_route_resolver_uses_adsblol_not_adsbdb_for_fallback(self):
         source = Path(__file__).with_name("monitor.py").read_text(encoding="utf-8")
-        self.assertIn('ADSBIM_ROUTESET_URL = "https://adsb.im/api/0/routeset"', source)
+        self.assertNotIn("ADSBIM_ROUTESET_URL", source)
         self.assertIn("ADSLOL_ROUTESET_URL", source)
         self.assertIn("https://api.adsb.lol/api/0/routeset", source)
         self.assertIn("ADSLOL_ROUTE_URL", source)
@@ -1003,10 +1079,12 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn(b"const destination=String(d.destination||'N/A').trim().toUpperCase()||'N/A'", PAGE)
 
     def test_every_location_selector_exit_returns_to_radar(self):
-        self.assertIn(
-            b"function closeLocationSelector(){\n      setLocationButtonBusy(false);\n      byId('location-backdrop').classList.remove('open');\n      setRadar(true);",
-            PAGE,
-        )
+        close_handler = PAGE.split(b"function closeLocationSelector(){", 1)[1].split(
+            b"function setLocationButtonBusy", 1
+        )[0]
+        self.assertIn(b"setLocationButtonBusy(false);", close_handler)
+        self.assertIn(b"byId('location-backdrop').classList.remove('open');", close_handler)
+        self.assertIn(b"setRadar(true);", close_handler)
         self.assertIn(b"byId('location-close').addEventListener('click',closeLocationSelector)", PAGE)
         self.assertIn(b"byId('location-cancel').addEventListener('click',closeLocationSelector)", PAGE)
         self.assertIn(b"if(event.target===byId('location-backdrop'))closeLocationSelector()", PAGE)
@@ -1170,7 +1248,7 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn('"callsign": callsign', source)
         self.assertIn('"lat": latitude', source)
         self.assertIn('"lng": longitude', source)
-        self.assertIn('("adsb.im routeset", self._adsbim_routeset)', source)
+        self.assertNotIn('("adsb.im routeset", self._adsbim_routeset)', source)
         self.assertIn('("ADSB.lol routeset", self._adsblol_routeset)', source)
 
     def test_adsblol_provider_flag_is_diagnostic_not_authority(self):
@@ -1186,24 +1264,22 @@ class OverHeadTests(unittest.TestCase):
         )
         self.assertIn(b".wall.radar-open .header-tools { transform:translateY(calc(-15% - 7px)); }", PAGE)
 
-    def test_adsbim_is_first_free_route_provider(self):
+    def test_adsblol_is_first_free_route_provider(self):
         source = Path(__file__).with_name("monitor.py").read_text(encoding="utf-8")
-        self.assertIn('ADSBIM_ROUTESET_URL = "https://adsb.im/api/0/routeset"', source)
-        adsbim = source.index('("adsb.im routeset", self._adsbim_routeset)')
+        self.assertNotIn("ADSBIM_ROUTESET_URL", source)
         adsblol = source.index('("ADSB.lol routeset", self._adsblol_routeset)')
         legacy = source.index('("ADSB.lol route", self._adsblol)')
-        self.assertLess(adsbim, adsblol)
         self.assertLess(adsblol, legacy)
 
-    def test_adsbim_routeset_uses_same_live_position_payload(self):
+    def test_adsblol_routeset_uses_same_live_position_payload(self):
         source = Path(__file__).with_name("monitor.py").read_text(encoding="utf-8")
         self.assertIn("def _routeset(self, url: str, callsign:", source)
-        self.assertIn("return self._routeset(ADSBIM_ROUTESET_URL, callsign, plane)", source)
+        self.assertIn("return self._routeset(ADSLOL_ROUTESET_URL, callsign, plane)", source)
         self.assertIn('"callsign": callsign', source)
         self.assertIn('"lat": latitude', source)
         self.assertIn('"lng": longitude', source)
 
-    def test_baw703_adsbim_payload_normalises_to_bjv_lhr(self):
+    def test_baw703_routeset_payload_normalises_to_bjv_lhr(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = FlightRouteStore(Path(tmp) / "routes.json")
             raw = {
@@ -1217,9 +1293,9 @@ class OverHeadTests(unittest.TestCase):
                 "number": "703",
                 "plausible": True,
             }
-            route = store._normalise_routeset(raw, "adsb.im routeset")
+            route = store._normalise_routeset(raw, "ADSB.lol routeset")
             self.assertEqual(route["route"], "BJV to LHR")
-            self.assertEqual(route["route_source"], "adsb.im routeset + live validation")
+            self.assertEqual(route["route_source"], "ADSB.lol routeset + live validation")
             accepted, detail = store._plausibility(
                 route,
                 {"lat": 51.35, "lon": -1.15, "alt_baro": 5600},
@@ -1247,9 +1323,9 @@ class OverHeadTests(unittest.TestCase):
                 "_airports": [{"iata": "LHR"}, {"iata": "HND"}],
                 "airline_code": "BAW", "number": "5", "callsign": "BAW5",
             }
-            with patch.object(store, "_adsbim_routeset", return_value=response) as lookup, patch.object(
-                store, "_adsblol_routeset", side_effect=AssertionError("fallback should not run")
-            ), patch.object(store, "_adsblol", side_effect=AssertionError("fallback should not run")):
+            with patch.object(store, "_adsblol_routeset", return_value=response) as lookup, patch.object(
+                store, "_adsblol", side_effect=AssertionError("fallback should not run")
+            ):
                 route = store.get(aircraft)
                 self.assertEqual(route["route"], "LHR to HND")
                 self.assertEqual(route["commercial_flight"], "BAW5")
@@ -1269,23 +1345,17 @@ class OverHeadTests(unittest.TestCase):
                 output_png=str(Path(temporary) / "frame.png"),
             )
             state = FrameState()
-            enrichment_published = threading.Event()
-            original_update = state.update
-
-            def observe_update(*args, **kwargs):
-                original_update(*args, **kwargs)
-                route_data = args[8] if len(args) > 8 else kwargs.get("route")
-                if route_data and route_data.get("route") == "LHR to HND":
-                    enrichment_published.set()
-
-            with patch("monitor.fetch_aircraft", return_value=[aircraft]), patch.object(
-                state, "update", side_effect=observe_update,
-            ):
+            monitor._enrichment_executor.submit(lambda: None).result(timeout=10)
+            self.assertTrue(monitor._enrichment_slots.acquire(timeout=10))
+            monitor._enrichment_slots.release()
+            with patch("monitor.fetch_aircraft", return_value=[aircraft]):
                 update_state(
                     state, settings, False, EmptyStore(), EmptyStore(), routes=store,
                     persist_frame=False,
                 )
-            self.assertTrue(enrichment_published.wait(5), "Route enrichment did not publish")
+                future = state.last_enrichment_future
+                self.assertIsNotNone(future, "Route enrichment was not scheduled")
+                future.result(timeout=5)
             self.assertEqual(state.payload["route"], "LHR to HND")
             self.assertEqual(state.payload["origin"], "LHR")
             self.assertEqual(state.payload["destination"], "HND")
@@ -1293,10 +1363,6 @@ class OverHeadTests(unittest.TestCase):
     def test_failed_free_route_lookup_retries_after_thirty_seconds(self):
         class Routes(FlightRouteStore):
             calls = 0
-
-            def _adsbim_routeset(self, callsign, plane):
-                self.calls += 1
-                return {}
 
             def _adsblol_routeset(self, callsign, plane):
                 self.calls += 1
@@ -1316,7 +1382,7 @@ class OverHeadTests(unittest.TestCase):
             self.assertEqual(store.calls, 0)
             with patch("monitor.time.time", return_value=1031):
                 self.assertEqual(store.get(plane), {})
-            self.assertEqual(store.calls, 3)
+            self.assertEqual(store.calls, 2)
 
     def test_radar_replaces_home_centre_with_flight_tracking_controls(self):
         self.assertNotIn(b"HOME CENTRE", PAGE)
@@ -1697,28 +1763,26 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn(b"function syncApiHeartbeat(d)", PAGE)
         self.assertIn(b"heart.classList.toggle('api-unhealthy',!healthy)", PAGE)
 
-    def test_api_health_monitor_checks_four_public_services(self):
+    def test_api_health_monitor_checks_active_public_services(self):
         monitor = APIHealthMonitor(Settings(latitude=51.5, longitude=-3.3))
         with patch.object(monitor, "_probe_adsblol", return_value=True), \
-             patch.object(monitor, "_probe_adsbim", return_value=True), \
              patch.object(monitor, "_probe_adsbdb", return_value=True), \
              patch.object(monitor, "_probe_ourairports", return_value=True):
             snapshot = monitor.check()
         self.assertTrue(snapshot["ok"])
         self.assertEqual(
             snapshot["services"],
-            {"ADSB.lol": True, "adsb.im": True, "ADSBDB": True, "OurAirports": True},
+            {"ADSB.lol": True, "ADSBDB": True, "OurAirports": True},
         )
 
     def test_api_health_goes_unhealthy_if_any_core_service_fails(self):
         monitor = APIHealthMonitor(Settings(latitude=51.5, longitude=-3.3))
-        with patch.object(monitor, "_probe_adsblol", return_value=True), \
-             patch.object(monitor, "_probe_adsbim", return_value=False), \
+        with patch.object(monitor, "_probe_adsblol", return_value=False), \
              patch.object(monitor, "_probe_adsbdb", return_value=True), \
              patch.object(monitor, "_probe_ourairports", return_value=True):
             snapshot = monitor.check()
         self.assertFalse(snapshot["ok"])
-        self.assertFalse(snapshot["services"]["adsb.im"])
+        self.assertFalse(snapshot["services"]["ADSB.lol"])
 
     def test_api_health_interval_is_thirty_seconds_and_flightaware_is_not_synthetically_probed(self):
         source = Path(__file__).with_name("monitor.py").read_text(encoding="utf-8")
@@ -2540,6 +2604,58 @@ class VisitorSessionTests(unittest.TestCase):
         self.assertIsNot(replacement, second)
         self.assertNotIn(second.session_id, self.sessions.sessions)
         self.assertFalse(old_snapshot_root.exists())
+
+    def test_normal_and_automatic_acquisition_deadlines_are_60_and_30_seconds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = monitor.VisitorSessionStore(
+                Settings(refresh_seconds=300), Path(temporary), global_min_interval_seconds=0,
+            )
+            session, _ = store.get_or_create()
+            store.touch(session, active=True)
+            now = time.monotonic() + 0.01
+            selected, _ = store.claim_due(now=now)
+            self.assertIs(selected, session)
+            self.assertEqual(selected.acquisition_kind, "normal")
+            self.assertEqual(store.next_acquisition_at, now + 60.0)
+
+            plane = {"hex": "abc123", "flight": "TST123", "lat": 51.6, "lon": -0.1, "seen_pos": 0.1}
+            with session.state.lock:
+                session.state.last_live_aircraft = [plane]
+                session.state.payload["aircraft_id"] = "ABC123"
+            session.last_fetch_at = now
+            self.assertIsNone(store.claim_due(now=now + 0.02)[0])
+            self.assertIsNone(store.claim_due(now=now + 29.99)[0])
+            selected, _ = store.claim_due(now=now + 30.02)
+            self.assertIs(selected, session)
+            self.assertEqual(selected.acquisition_kind, "automatic_tracking")
+            self.assertEqual(store.next_acquisition_at, now + 60.0)
+
+    def test_automatic_tracking_result_is_shared_by_aircraft_identity(self):
+        source, _ = self.sessions.get_or_create()
+        visitor, _ = self.sessions.get_or_create()
+        now = time.monotonic() + 0.01
+        plane = {"hex": "abc123", "flight": "TST123", "lat": 51.6, "lon": -0.1, "seen_pos": 0.1}
+        for session in (source, visitor):
+            self.sessions.touch(session, active=True)
+            with session.state.lock:
+                session.state.last_live_aircraft = [plane]
+                session.state.payload["aircraft_id"] = "ABC123"
+            session.last_fetch_at = now
+            session.refresh_reasons.clear()
+            session.refresh_requested_at = None
+            session.auto_tracking_key = ("hex:ABC123",)
+        source.state.last_automatic_tracking_result = {
+            "aircraft_id": "ABC123", "plane": plane, "observed_at": now - 0.1,
+            "received_at": now, "attempted_at": now, "outcome": "live",
+        }
+        source.last_auto_tracking_at = now
+        visitor.last_auto_tracking_at = now - monitor.TRACKING_ACQUISITION_INTERVAL_SECONDS
+        self.sessions.remember_automatic_tracking_result(source)
+
+        selected, _ = self.sessions.claim_due(now=now + 0.01)
+        self.assertIs(selected, visitor)
+        self.assertEqual(selected.acquisition_kind, "automatic_tracking_cache")
+        self.assertEqual(selected.cached_auto_tracking_result["aircraft_id"], "ABC123")
 
     def test_simulated_fair_queue_latency_for_1_2_5_10_and_64_unique_locations(self):
         expected_last_first_observation = {1: 0, 2: 300, 5: 1200, 10: 2700, 64: 18900}

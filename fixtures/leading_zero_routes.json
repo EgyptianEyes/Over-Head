@@ -1,0 +1,36 @@
+{
+  "aircraft": {
+    "flight": "AMX008",
+    "r": "XA-AMQ",
+    "hex": "0d0001",
+    "lat": 51.517220,
+    "lon": -7.161865,
+    "alt_baro": 35000
+  },
+  "unknown": {
+    "callsign": "AMX008",
+    "airport_codes": "unknown",
+    "_airports": []
+  },
+  "normalised": {
+    "callsign": "AMX8",
+    "airline_code": "AMX",
+    "number": "8",
+    "airport_codes": "EGLL-MMMX",
+    "_airport_codes_iata": "LHR-MEX",
+    "plausible": true,
+    "_airports": [
+      {"iata": "LHR", "icao": "EGLL", "lat": 51.4700, "lon": -0.4543},
+      {"iata": "MEX", "icao": "MMMX", "lat": 19.4363, "lon": -99.0721}
+    ]
+  },
+  "implausible": {
+    "callsign": "AMX8",
+    "airport_codes": "KLAX-KSFO",
+    "plausible": true,
+    "_airports": [
+      {"iata": "LAX", "icao": "KLAX", "lat": 33.9416, "lon": -118.4085},
+      {"iata": "SFO", "icao": "KSFO", "lat": 37.6213, "lon": -122.3790}
+    ]
+  }
+}

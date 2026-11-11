@@ -108,9 +108,21 @@ Route data is deliberately separated from aircraft identity data.
 When a route is required, Over-Head tries these sources in order:
 
 1. **FlightAware AeroAPI**, when an API key is configured
-2. **adsb.im routeset**, using the live callsign and aircraft position
-3. **ADSB.lol routeset**, using the live callsign and aircraft position
-4. **ADSB.lol route lookup** as the final free fallback
+2. **ADSB.lol routeset**, using the live callsign and aircraft position
+3. **ADSB.lol route lookup** as the final free fallback
+
+adsb.im requires prior access approval and is not queried automatically, including
+by the service heartbeat. An empty ADSB.lol routeset response (including HTTP 201)
+is treated as no route data, not as a JSON error; individual lookups continue.
+
+The original callsign is tried first. If no trustworthy route is found, callsigns
+consisting only of an alphabetic prefix and a numeric flight number with redundant
+leading zeros are retried without those zeros (for example, `AMX008` -> `AMX8`).
+Suffix-bearing identifiers are left unchanged. The alternative must pass the same
+live-position validation and is cached under the original callsign + registration;
+the aircraft's displayed/transmitted callsign is never changed. Concurrent lookups
+for the same identity share the existing serialized cache. ADSB.lol HTTP 403/429
+and explicit Retry-After responses pause both route endpoints before further requests.
 
 ADSBDB is **not** used as route authority.
 
@@ -143,6 +155,40 @@ Invoke-RestMethod "http://127.0.0.1:8765/route-debug" |
 
 See `FLIGHTAWARE_SETUP.txt` for optional AeroAPI configuration and provider
 details.
+
+### Persistent route-failure history
+
+Only a visitor's displayed, automatically selected or explicitly tracked aircraft
+is recorded after route enrichment completes. Radar-only contacts and transient
+loading placeholders are not recorded. No additional provider requests are made.
+Missing origin, destination or both are recorded with UTC timestamps, aircraft
+identifiers, available airports and bounded provider-attempt diagnostics. No visitor
+locations, session identifiers, airport coordinates or API credentials are stored.
+
+Records are grouped by original callsign and aircraft ICAO hex (registration when
+hex is unavailable), plus the UTC observation date used as the operating date.
+Repeated observations update that record; cache hits and cooldowns do not increase
+actual failed-lookup counts. Successful recovery retains prior failures and records
+the route/provider. Leading-zero statistics cover actual attempts for logged flights,
+not all flights detected by radar.
+
+The optional `route_failure_logging` object in `config.json` configures `path`
+(default `cache/route-failures.sqlite3`), `retention_days` (30), `max_records`
+(10000) and `history_limit` (50 snapshots per flight). All limits must be positive.
+Old records and excess history are pruned; cumulative attempt counters are retained
+until the flight record expires. SQLite storage is private to the server and is not
+exposed by a browser endpoint. Storage errors are reported at most once per minute
+without interrupting monitoring. Run only one monitor process per history file.
+
+Offline report and optional CSV export:
+
+```bash
+python route_failures.py --config config.json
+python route_failures.py --config config.json --csv route-failures.csv
+```
+
+The report lists unresolved/recovered flights, missing-airport counts and leading-zero
+fallback success rates. CSV includes the retained provider-attempt history.
 
 ## Aircraft identity
 
@@ -258,11 +304,11 @@ Double-clicking the display also toggles browser full screen.
 
 ## Automatic radar, commentary and photograph rotation
 
-When available, the browser rotates through radar, aircraft commentary and
-aircraft photographs. Each view remains visible for no more than 15 seconds
-before advancing to the next available view. Missing commentary or photographs
-are skipped rather than leaving an empty panel. Rotation does not require
-additional aircraft-position API requests.
+When available, radar and aircraft commentary keep their existing presentation
+rotation. The route map and the selected aircraft's photograph share the same
+map panel and alternate every 10 seconds. A missing or invalid photograph leaves
+the route map visible. Image loading and presentation rotation do not request
+additional aircraft-position observations.
 
 ## Flight snapshots
 
@@ -665,8 +711,9 @@ journalctl -u caddy -n 60 --no-pager
 Open `https://demodomain.name/` in an active browser tab to begin monitoring.
 When no active display is connected, the status may remain `starting`, with API
 request counts at zero; that alone does not indicate a provider failure. The
-existing `config.json` is preserved across Git updates, so verify that
-`"refresh_seconds"` is set to `300` on older installations.
+existing `config.json` is preserved across Git updates. Geographic discovery is
+now fixed at 60 seconds and selected-aircraft updates at 30 seconds; older
+`refresh_seconds` values no longer slow these monitor schedules.
 
 For later application updates, run `git pull --ff-only` from `/root/Over-Head`,
 update dependencies inside `.venv` if needed, and restart the service with
@@ -699,7 +746,7 @@ You can also create or edit `config.json` manually:
   "latitude": 51.5074,
   "longitude": -0.1278,
   "radius_nm": 25,
-  "refresh_seconds": 300,
+  "refresh_seconds": 60,
   "output_rgb": "output/frame.rgb",
   "output_png": "output/frame.png",
   "demo_on_failure": false
@@ -718,11 +765,14 @@ only when Over-Head is explicitly started with `--demo`.
 
 ### Aircraft polling and provider failover
 
-The default aircraft-position polling interval is **300 seconds (five minutes)**.
-Normal geographic scans use one shared provider-backed slot every 300 seconds,
-regardless of the number of visitors: at most 288 scans/day. Inactive sessions
-are excluded; distinct uncovered locations share a fair queue. The service caps
-concurrent in-memory sessions at 64 and reports queue position and estimated wait.
+Normal geographic discovery uses one shared provider-backed slot every **60
+seconds**, regardless of the number of visitors: at most 1,440 scans/day before
+cooldowns and coverage sharing. Automatically selected and explicitly tracked
+aircraft use 30-second identity-targeted observations. The first automatic
+targeted update uses the genuine geographic discovery observation; subsequent
+lookups are shared by identity. Inactive sessions are excluded, and distinct
+uncovered locations share a fair queue. The service caps concurrent in-memory
+sessions at 64 and reports queue position and estimated wait.
 
 An idealized deterministic crossing model illustrates the discovery tradeoff:
 for a straight 450-knot track through a 25 NM circle, with path offset uniform
@@ -734,30 +784,30 @@ position age, aircraft traffic patterns and outages.
 
 | Geographic interval | Area scans/day | Worst-case position-provider attempts/day | Modeled crossing detection |
 |---:|---:|---:|---:|
-| 300 seconds (current) | 288 | 576 | 89.5% |
+| 60 seconds (current) | 1,440 | 2,880 | 99.5% |
 | 120 seconds | 720 | 1,440 | 98.4% |
-| 60 seconds | 1,440 | 2,880 | 99.5% |
 | 30 seconds | 2,880 | 5,760 | 99.8% |
 
-The current 300-second default remains unchanged. Shorter intervals can improve
-discovery but multiply process-wide provider volume, and current provider
-permissions have not been independently established. Revisit the interval only
-after obtaining explicit usage guidance; browser status polling is not an aircraft
-observation.
+This deterministic crossing model is geometry, not observed provider performance;
+it assumes continuous coverage and ignores feed coverage, position age and outages.
+The 60-second schedule is implemented, but provider-approved allowances for
+these geographic and targeted request rates have not been independently verified.
+Browser status polling is not an aircraft observation.
 
 With simultaneous visitors at distinct locations and no reusable geographic
 coverage, the deterministic scheduler model is:
 
 | Active visitors | Average first-observation wait | Last first-observation wait | Per-visitor steady cadence | Peak queued visitors |
 |---:|---:|---:|---:|---:|
-| 1 | immediate | immediate | 5 minutes | 0 |
-| 2 | 2 minutes 30 seconds | 5 minutes | 10 minutes | 1 |
-| 5 | 10 minutes | 20 minutes | 25 minutes | 4 |
-| 10 | 22 minutes 30 seconds | 45 minutes | 50 minutes | 9 |
-| 64 | 2 hours 37 minutes 30 seconds | 5 hours 15 minutes | 5 hours 20 minutes | 63 |
+| 1 | immediate | immediate | 1 minute | 0 |
+| 2 | 30 seconds | 1 minute | 2 minutes | 1 |
+| 5 | 2 minutes | 4 minutes | 5 minutes | 4 |
+| 10 | 4 minutes 30 seconds | 9 minutes | 10 minutes | 9 |
+| 64 | 31 minutes 30 seconds | 63 minutes | 64 minutes | 63 |
 
-Explicit tracking has independent **30-second per-target deadlines**. Its initial
-lookup is scheduled promptly without waiting for the global geographic slot.
+Explicit tracking and automatic selected-aircraft updates have independent
+**30-second per-target deadlines**. Explicit TRACK lookup is scheduled promptly
+without waiting for the global geographic slot.
 Deadlines and shared-cache expiry start at the request attempt, not its response,
 so response latency does not silently turn a 30-second interval into 60 seconds.
 One acquisition worker serializes requests; network latency, cooldowns and budgets
@@ -801,7 +851,7 @@ Zero simulated lookup latency uses instantaneous fixtures and is not an estimate
 of real provider latency. A separate eight-second response fixture verifies that
 the next permitted request remains due 30 seconds after the previous attempt.
 
-Fresh aircraft observations can be reused for at most 300 seconds when the
+Fresh aircraft observations can be reused for at most 60 seconds when the
 queried geographic circle fully contains another visitor's requested circle.
 This supports identical locations and genuinely covered overlaps without a new
 provider cycle. A normal 25 NM query does not cover a different 25 NM circle
@@ -820,7 +870,7 @@ fallback maps the primary's `/v2/point`, `/v2/hex` and `/v2/callsign` paths to
 `/api/v3/lat/.../lon/.../dist/...`, `/api/v3/hex/...` and
 `/api/v3/callsign/...`. These mappings are tested with local fixtures, not newly
 verified against live APIs. Airplanes.live is not implemented. FlightAware,
-adsb.im and ADSBDB provide enrichment, not aircraft-position fallback.
+ADSBDB provides enrichment, not aircraft-position fallback.
 
 Unavailable, forbidden, rate-limited, malformed, missing-target, conflicting or
 stale responses can trigger eligible fallback. A satisfactory response stops
@@ -866,10 +916,12 @@ acceptance gate; in the current container it cannot launch Chromium because
 usage policies and browser acceptance remain outstanding verification requirements.
 
 Existing installations keep the `refresh_seconds` value in their local
-`config.json`: updating code does not overwrite it. A visitor's per-session
-refresh interval is still bounded by the shared 300-second minimum acquisition
-spacing. Lowering `refresh_seconds` does not raise aggregate public request
-volume. The default remains 300 seconds for new installations.
+`config.json`: updating code does not overwrite it. The value is retained for
+configuration compatibility, while monitor acquisition uses the fixed 60-second
+geographic and 30-second selected-target schedules. ADSB.lol/ADSB.fi endpoint
+availability and provider permission for automatic 30-second hex lookups remain
+unverified; cooldowns, Retry-After handling and local request ceilings remain
+active and may delay these targets.
 
 An optional FlightAware AeroAPI key can be supplied through the
 `FLIGHTAWARE_AEROAPI_KEY` environment variable or the `flightaware_api_key`
@@ -950,8 +1002,8 @@ Live ADS-B aircraft positions and direct callsign tracking are provided
 primarily by the [ADSB.lol](https://adsb.lol/) community network, with
 [ADSB.fi](https://opendata.adsb.fi/) used as an alternative source when needed.
 
-Free route fallback data is queried from [adsb.im](https://adsb.im/) and
-[ADSB.lol](https://adsb.lol/) and is independently checked against the current
+Free route fallback data is queried from [ADSB.lol](https://adsb.lol/)
+and is independently checked against the current
 aircraft position before display.
 
 Optional commercial-flight resolution is provided by

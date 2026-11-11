@@ -21,6 +21,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 WIDTH = 128
 HEIGHT = 64
+NORMAL_ACQUISITION_INTERVAL_SECONDS = 60.0
 BG = (2, 4, 9)
 CYAN = (20, 236, 255)
 WHITE = (232, 246, 255)
@@ -34,7 +35,7 @@ class Settings:
     latitude: float = 51.5074
     longitude: float = -0.1278
     radius_nm: float = 25.0
-    refresh_seconds: float = 300.0
+    refresh_seconds: float = NORMAL_ACQUISITION_INTERVAL_SECONDS
     output_rgb: str = "output/frame.rgb"
     output_png: str = "output/frame.png"
     demo_on_failure: bool = False
@@ -545,7 +546,7 @@ def main() -> int:
         print(f"Rendered {status} frame to {settings.output_rgb} and {settings.output_png}")
         if not args.watch:
             return 0
-        time.sleep(max(1.0, settings.refresh_seconds))
+        time.sleep(NORMAL_ACQUISITION_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":

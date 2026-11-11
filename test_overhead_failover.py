@@ -154,7 +154,9 @@ class AcquisitionWorkloadTests(unittest.TestCase):
     with tempfile.TemporaryDirectory() as temporary, patch.object(monitor.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(
       overhead.time, 'time', side_effect=lambda: clock[0] + 1_700_000_000
     ), patch.object(overhead.urllib.request, 'urlopen', side_effect=upstream):
-      store = monitor.VisitorSessionStore(overhead.Settings(), Path(temporary))
+      store = monitor.VisitorSessionStore(
+        overhead.Settings(), Path(temporary), global_min_interval_seconds=300,
+      )
       visitors = []
       for index in range(12):
         session, _ = store.get_or_create()

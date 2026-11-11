@@ -10,9 +10,10 @@ and uses the free live-position-aware route fallbacks.
 Route resolution order
 ----------------------
 1. FlightAware AeroAPI, when configured
-2. adsb.im routeset using callsign + live latitude/longitude
-3. ADSB.lol routeset using callsign + live latitude/longitude
-4. ADSB.lol route GET using callsign + live latitude/longitude
+2. ADSB.lol routeset using callsign + live latitude/longitude
+3. ADSB.lol route GET using callsign + live latitude/longitude
+
+adsb.im requires prior access approval and is not automatically queried or probed.
 
 ADSBDB is never used as route authority. It is used only for aircraft identity
 and registered-owner metadata.
@@ -41,7 +42,7 @@ What happens without a FlightAware key?
 ---------------------------------------
 Over-Head continues normally.
 
-It tries adsb.im first, then ADSB.lol's routeset endpoint, then the ADSB.lol
+It tries ADSB.lol's routeset endpoint, then the ADSB.lol
 route GET endpoint. Each free-provider result is independently validated against
 the aircraft's current ADS-B position before it is displayed.
 
@@ -73,6 +74,16 @@ aircraft's current position before reuse.
 
 A failed route lookup is retried after 30 seconds.
 
+After the original callsign fails, alphabetic-prefix/numeric-only identifiers with
+redundant leading zeros are retried without those zeros (AMX008 -> AMX8).
+Suffix-bearing identifiers are unchanged. Successful alternatives are independently
+validated and cached under the original callsign + registration without changing
+the displayed or transmitted callsign.
+
+An empty routeset response, including HTTP 201, supplies no route data and does
+not block individual route lookups. ADSB.lol HTTP 403/429 and explicit Retry-After
+responses pause both route endpoints; normal failed-lookup retry delays still apply.
+
 If FlightAware returns HTTP 401, 402 or 403, AeroAPI lookups are temporarily
 disabled for one hour so an invalid, unauthorised or unsuitable key is not
 hammered repeatedly. The free route fallbacks remain available.
@@ -81,8 +92,7 @@ Data roles
 ----------
 - ADSB.lol: live ADS-B position/state and direct callsign lookup for TRACK mode
 - FlightAware AeroAPI: optional primary commercial-flight identity and route
-- adsb.im routeset: first free route fallback
-- ADSB.lol routeset: second free route fallback
+- ADSB.lol routeset: first free route fallback
 - ADSB.lol route GET: final free route fallback
 - OurAirports: airport coordinates and country metadata used by FlightAware routes
 - ADSBDB: aircraft identity/registered-owner metadata only, never route authority
@@ -109,11 +119,11 @@ Current route decision:
     Invoke-RestMethod "http://127.0.0.1:8765/route-debug" |
         ConvertTo-Json -Depth 8
 
-The response includes the current callsign, registration, route, route source,
+The response includes the original and alternative callsigns, registration, route, route source,
 aircraft position, configured FlightAware state, provider attempts, raw route
 summaries, geographic-validation values and the final resolver decision.
 
-Example raw adsb.im routeset request:
+Example raw ADSB.lol routeset request:
 
     $body = @{
         planes = @(
@@ -124,15 +134,6 @@ Example raw adsb.im routeset request:
             }
         )
     } | ConvertTo-Json -Depth 4
-
-    Invoke-RestMethod `
-        -Method Post `
-        -Uri "https://adsb.im/api/0/routeset" `
-        -ContentType "application/json" `
-        -Body $body |
-        ConvertTo-Json -Depth 8
-
-Example raw ADSB.lol routeset request:
 
     Invoke-RestMethod `
         -Method Post `

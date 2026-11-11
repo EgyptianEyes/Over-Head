@@ -2,8 +2,14 @@
   "latitude": 51.5074,
   "longitude": -0.1278,
   "radius_nm": 25,
-  "refresh_seconds": 300,
+  "refresh_seconds": 60,
   "output_rgb": "output/frame.rgb",
   "output_png": "output/frame.png",
-  "demo_on_failure": false
+  "demo_on_failure": false,
+  "route_failure_logging": {
+    "path": "cache/route-failures.sqlite3",
+    "retention_days": 30,
+    "max_records": 10000,
+    "history_limit": 50
+  }
 }

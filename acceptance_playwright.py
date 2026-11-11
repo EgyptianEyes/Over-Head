@@ -28,9 +28,12 @@ LEAFLET_SHIM = r"""
 (() => {
     const maps = [];
   class Map {
-        constructor() { this.zoom = 12; this.layers = new Set(); this.handlers = {}; }
+                constructor(element) { this.element = element; this.zoom = 12; this.layers = new Set(); this.handlers = {}; }
     setView(_point, zoom) { if (Number.isFinite(zoom)) this.zoom = zoom; return this; }
     getZoom() { return this.zoom; }
+        getSize() { const box = this.element.getBoundingClientRect(); return {x: box.width, y: box.height}; }
+        project(point) { return {x: point.lng * 256, y: point.lat * 256}; }
+        unproject(point) { return {lat: point.y / 256, lng: point.x / 256}; }
     invalidateSize() { return this; }
     on(name, handler) { (this.handlers[name] ||= []).push(handler); return this; }
     fire(name, event) { for (const handler of this.handlers[name] || []) handler(event); return this; }
@@ -39,18 +42,23 @@ LEAFLET_SHIM = r"""
     hasLayer(layer) { return this.layers.has(layer); }
   }
   class Layer {
-    constructor(point) { this.point = point; this.map = null; }
+        constructor(point) { this.point = point; this.map = null; this.element = document.createElementNS('http://www.w3.org/2000/svg', 'path'); }
     addTo(map) { this.map = map; map.addLayer(this); return this; }
     on() { return this; }
     remove() { if (this.map) this.map.removeLayer(this); return this; }
     setLatLng(point) { this.point = point; return this; }
     getLatLng() { return {lat: this.point[0], lng: this.point[1]}; }
+        bindTooltip() { return this; }
+        getElement() { return this.element; }
   }
   window.L = {
-    map: () => { const map = new Map(); maps.push(map); return map; },
+        map: id => { const map = new Map(document.getElementById(id)); maps.push(map); return map; },
     tileLayer: () => new Layer([0, 0]),
     marker: point => new Layer(point),
     circle: point => new Layer(point),
+        circleMarker: point => new Layer(point),
+        polyline: points => new Layer(points[0]),
+        divIcon: options => options,
     latLng: (lat, lng) => ({lat, lng}),
     point: (x, y) => ({x, y})
   };
@@ -214,7 +222,7 @@ class BrowserAcceptanceTests(unittest.TestCase):
 
     def new_page(
         self, width: int, height: int, geolocation: dict[str, float] | None = None,
-        reduced_motion: str | None = None,
+        reduced_motion: str | None = None, install_clock: bool = False,
     ) -> Page:
         options: dict[str, Any] = {"viewport": {"width": width, "height": height}}
         if reduced_motion:
@@ -235,22 +243,33 @@ class BrowserAcceptanceTests(unittest.TestCase):
             context.grant_permissions(["geolocation"], origin=self.base_url)
         context.route("**/*", self._offline_route)
         page = context.new_page()
+        if install_clock:
+            page.clock.install()
         page.on("pageerror", lambda error: self.page_errors.append(str(error)))
         page.on("console", lambda message: self.console_errors.append(message.text) if message.type == "error" else None)
         page.on("requestfailed", lambda request: self.failed_requests.append(f"{request.url}: {request.failure}"))
-        page.goto(self.base_url + "/", wait_until="domcontentloaded")
+        page.bring_to_front()
         try:
-            self.wait_for_text(page, "#mode", lambda text: text.lower() in {"live", "error"}, timeout=10)
-        except AssertionError as exc:
-            self.fail(f"Initial display did not settle: {exc}; page errors={self.page_errors}; console errors={self.console_errors}; failed requests={self.failed_requests}")
-        if (page.locator("#mode").text_content() or "").lower() == "error":
-            cookies = page.context.cookies(self.base_url)
-            session_id = next((cookie["value"] for cookie in cookies if cookie["name"] == "overhead_session"), None)
-            session = self.sessions.sessions.get(session_id)
-            server_error = session.state.payload.get("error") if session else "session was not created"
-            self.fail(f"Initial display entered Error: {server_error}; page errors={self.page_errors}; console errors={self.console_errors}; failed requests={self.failed_requests}")
-        self.bind_page_session(page)
-        return page
+            for session in self.sessions.sessions.values():
+                session.last_fetch_at = time.monotonic()
+            interval_patch = patch.object(monitor, "NORMAL_ACQUISITION_INTERVAL_SECONDS", 0.05)
+            interval_patch.start()
+            page.goto(self.base_url + "/", wait_until="domcontentloaded")
+            try:
+                self.wait_for_text(page, "#mode", lambda text: text.lower() in {"live", "error"}, timeout=10)
+            except AssertionError as exc:
+                self.fail(f"Initial display did not settle: {exc}; page errors={self.page_errors}; console errors={self.console_errors}; failed requests={self.failed_requests}")
+            if (page.locator("#mode").text_content() or "").lower() == "error":
+                cookies = page.context.cookies(self.base_url)
+                session_id = next((cookie["value"] for cookie in cookies if cookie["name"] == "overhead_session"), None)
+                session = self.sessions.sessions.get(session_id)
+                server_error = session.state.payload.get("error") if session else "session was not created"
+                self.fail(f"Initial display entered Error: {server_error}; page errors={self.page_errors}; console errors={self.console_errors}; failed requests={self.failed_requests}")
+            self.bind_page_session(page)
+            return page
+        finally:
+            if "interval_patch" in locals():
+                interval_patch.stop()
 
     def wait_for_text(self, page: Page, selector: str, predicate, timeout: float = 5) -> str:
         locator = page.locator(selector)
@@ -391,6 +410,16 @@ class BrowserAcceptanceTests(unittest.TestCase):
                 screenshot_dir = self.ARTIFACT_ROOT / label
                 screenshot_dir.mkdir(parents=True, exist_ok=True)
                 page.screenshot(path=str(screenshot_dir / "initial.png"), full_page=False)
+                self.assertEqual(page.locator("header").evaluate("element => getComputedStyle(element).zIndex"), "1000")
+                self.assertEqual(page.locator("#brand-logo").evaluate("element => getComputedStyle(element).transform"), "matrix(1, 0, 0, 1, 0, 10)")
+                for selector in ("#sound-toggle", "#radar-toggle", "#camera-toggle", "#snapshots-toggle", "#fullscreen-toggle", "#settings-toggle"):
+                    button = page.locator(selector)
+                    if button.is_visible():
+                        self.assertTrue(button.evaluate("element => { const box=element.getBoundingClientRect(); const hit=document.elementFromPoint(box.x+box.width/2,box.y+box.height/2); return hit===element||element.contains(hit); }"), selector)
+                page.locator("#settings-toggle").click()
+                self.wait_for_class(page, "#wall", "settings-open")
+                page.locator("#settings-toggle").click()
+                self.wait_for_class(page, "#wall", "settings-open", present=False)
                 if not page.locator("#wall").evaluate("element => element.classList.contains('radar-open')"):
                     page.locator("#radar-toggle").click()
                     self.wait_for_class(page, "#wall", "radar-open")
@@ -411,6 +440,89 @@ class BrowserAcceptanceTests(unittest.TestCase):
                 self.assertEqual(page.locator("#mode").text_content(), "Live")
                 page.screenshot(path=str(screenshot_dir / "populated.png"), full_page=False)
                 self.assertEqual(self.page_errors, [])
+
+    def test_map_photo_rotation_identity_reset_missing_photo_and_responsive_area(self) -> None:
+        svg_photo = b'<svg xmlns="http://www.w3.org/2000/svg" width="400" height="200" viewBox="0 0 400 200"><rect width="400" height="200" fill="#14ecff"/><path d="M0 180L180 20 400 160" fill="none" stroke="#02050a" stroke-width="12"/></svg>'
+
+        def publish_photo(revision: str, available: bool = True) -> None:
+            with self.state.lock:
+                self.state.aircraft_photo = svg_photo if available else b""
+                self.state.aircraft_photo_type = "image/svg+xml"
+                self.state.payload["aircraft_photo_available"] = available
+                self.state.payload["aircraft_photo_revision"] = revision if available else ""
+                self.state.payload.update({
+                    "route": "LHR to JFK", "origin": "LHR", "destination": "JFK",
+                    "aircraft_latitude": 51.6, "aircraft_longitude": -0.1, "track": 90,
+                    "origin_latitude": 51.47, "origin_longitude": -0.45,
+                    "destination_latitude": 40.64, "destination_longitude": -73.78,
+                })
+
+        def wait_until(page: Page, predicate, timeout: float = 3.0) -> None:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if predicate():
+                    return
+                time.sleep(0.025)
+            self.fail("Timed out waiting for the local photo fixture state")
+
+        for label, width, height in (("desktop", 1366, 768), ("tablet", 768, 1024), ("mobile", 390, 844)):
+            with self.subTest(viewport=label):
+                screenshot_dir = self.ARTIFACT_ROOT / label
+                screenshot_dir.mkdir(parents=True, exist_ok=True)
+                page = self.new_page(width, height, install_clock=True)
+                page.clock.pause_at(page.evaluate("Date.now()") + 100)
+                publish_photo("fixture-one")
+                page.clock.fast_forward(2000)
+                wait_until(page, lambda: page.locator("#aircraft-photo").evaluate("image => image.complete && image.naturalWidth === 400"))
+                wait_until(page, lambda: page.locator("#route-photo-panel").is_hidden())
+                self.assertTrue(page.locator("#route-photo-panel").is_hidden())
+                self.assertTrue(page.locator("#route-map").evaluate("element => element.classList.contains('visible')"))
+                self.assertGreater(page.evaluate("window.__overheadMaps[0].layers.size"), 1)
+                map_width = page.locator("#route-map").evaluate("element => element.getBoundingClientRect().width")
+                map_instances = page.evaluate("window.__overheadMaps.length")
+
+                if label == "desktop":
+                    page.clock.fast_forward(9999)
+                    self.assertTrue(page.locator("#route-photo-panel").is_hidden())
+                    page.clock.fast_forward(1)
+                    self.assertFalse(page.locator("#route-photo-panel").is_hidden())
+                    photo_size = page.locator("#aircraft-photo").evaluate("image => ({width:image.getBoundingClientRect().width,height:image.getBoundingClientRect().height,naturalWidth:image.naturalWidth,naturalHeight:image.naturalHeight,objectFit:getComputedStyle(image).objectFit})")
+                    self.assertEqual(photo_size["width"], map_width)
+                    self.assertEqual(photo_size["objectFit"], "contain")
+                    self.assertEqual(photo_size["naturalWidth"] / photo_size["naturalHeight"], 2)
+                    page.screenshot(path=str(screenshot_dir / "route-photo.png"), full_page=False)
+                    page.clock.fast_forward(10000)
+                    self.assertTrue(page.locator("#route-photo-panel").is_hidden())
+                    page.screenshot(path=str(screenshot_dir / "route-map-after-photo.png"), full_page=False)
+                    page.clock.fast_forward(10000)
+                    self.assertFalse(page.locator("#route-photo-panel").is_hidden())
+                    page.evaluate("window.__stalePhotoLoad = document.querySelector('#aircraft-photo').onload")
+                    with self.state.lock:
+                        self.state.payload["aircraft_id"] = "DEF456"
+                        self.state.payload["callsign"] = "TST456"
+                    publish_photo("fixture-two")
+                    page.clock.fast_forward(2000)
+                    wait_until(page, lambda: page.locator("#aircraft-photo").get_attribute("src").endswith("fixture-two"))
+                    page.evaluate("window.__stalePhotoLoad && window.__stalePhotoLoad()")
+                    self.assertTrue(page.locator("#route-photo-panel").is_hidden())
+                    self.assertFalse(page.locator("#route-map").evaluate("element => element.classList.contains('photo-active')"))
+                else:
+                    page.clock.fast_forward(10000)
+                    self.assertFalse(page.locator("#route-photo-panel").is_hidden())
+                    page.screenshot(path=str(screenshot_dir / "route-photo.png"), full_page=False)
+
+                self.assertEqual(page.evaluate("window.__overheadMaps.length"), map_instances)
+                self.assertEqual(page.locator("#route-map").evaluate("element => element.getBoundingClientRect().width"), map_width)
+                if label == "mobile":
+                    publish_photo("", available=False)
+                    page.clock.fast_forward(2000)
+                    wait_until(page, lambda: page.locator("#route-photo-panel").is_hidden())
+                    self.assertTrue(page.locator("#route-photo-panel").is_hidden())
+                    page.clock.fast_forward(10000)
+                    self.assertTrue(page.locator("#route-photo-panel").is_hidden())
+                    page.screenshot(path=str(screenshot_dir / "route-map-no-photo.png"), full_page=False)
+                self.assertEqual(self.page_errors, [])
+                self.assertEqual(self.external_requests, [])
 
     def test_keyboard_shortcut_and_modal_focus_behaviour(self) -> None:
         page = self.new_page(1280, 800)
@@ -538,10 +650,19 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.assertGreater(screenshot.stat().st_size, 1000)
         page.locator("#settings-toggle").click()
         page.locator("#settings-location").click()
+        self.wait_for_input_value(page, "#location-latitude", lambda value: value == "51.500000")
         page.locator("#location-use-device").click()
-        self.wait_for_text(page, "#location-latitude", lambda text: abs(float(text) - 34.0522) < 0.0001)
+        self.wait_for_input_value(page, "#location-latitude", lambda value: abs(float(value) - 34.0522) < 0.0001)
+        with self.sessions.lock:
+            self.sessions.next_acquisition_at = 0
         page.locator("#location-save").click()
-        self.wait_for_calls(2)
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and (
+            abs(self.settings.latitude - 34.0522) > 0.0001
+            or abs(self.settings.longitude + 118.2437) > 0.0001
+            or not str(self.state.payload.get("callsign") or "").startswith("NEW")
+        ):
+            time.sleep(0.025)
         self.assertEqual((self.settings.latitude, self.settings.longitude), (34.0522, -118.2437))
         self.assertEqual((self.state.payload["home_latitude"], self.state.payload["home_longitude"]), (34.0522, -118.2437))
         self.assertTrue(self.state.payload["callsign"].startswith("NEW"))
@@ -599,7 +720,7 @@ class BrowserAcceptanceTests(unittest.TestCase):
         page.locator("#settings-toggle").click()
         page.locator("#settings-location").click()
         page.locator("#location-use-device").click()
-        self.wait_for_text(page, "#location-latitude", lambda text: abs(float(text) - 34.0522) < 0.0001)
+        self.wait_for_input_value(page, "#location-latitude", lambda value: abs(float(value) - 34.0522) < 0.0001)
         before_location = self.provider.count()
         page.locator("#location-save").click()
         self.wait_for_calls(before_location + 1)
@@ -629,6 +750,8 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.assertFalse(self.lease.active())
         self.assertEqual(self.provider.count(), before_hidden)
         self.force_inactive_status = False
+        with self.sessions.lock:
+            self.sessions.next_acquisition_at = 0
         page.evaluate("fetch('/status?active=1')")
         self.wait_for_calls(before_hidden + 1)
 
@@ -637,6 +760,8 @@ class BrowserAcceptanceTests(unittest.TestCase):
         page.close()
         with self.lease.lock:
             self.lease.last_seen = time.monotonic() - 13
+        with self.sessions.lock:
+            self.sessions.next_acquisition_at = 0
         reopened = browser_context.new_page()
         reopened.on("pageerror", lambda error: self.page_errors.append(str(error)))
         reopened.goto(self.base_url + "/", wait_until="domcontentloaded")

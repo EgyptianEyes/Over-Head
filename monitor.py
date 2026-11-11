@@ -10,6 +10,7 @@ import concurrent.futures
 import hashlib
 import ipaddress
 import json
+import logging
 import math
 import os
 import re
@@ -30,7 +31,9 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from xml.etree import ElementTree
 
-from overhead import AircraftFeedRateLimited, AircraftFeedUnavailable, AircraftPositionInvalid, AircraftPositionStale, DEMO, Settings, aircraft_provider_status, fetch_provider_aircraft, fetch_aircraft, haversine_nm, load_settings, render, save_frame, select_nearest, validate_location
+from overhead import _retry_after_seconds
+from route_failures import RouteFailureLog, configured_log
+from overhead import AircraftFeedRateLimited, AircraftFeedUnavailable, AircraftPositionInvalid, AircraftPositionStale, DEMO, NORMAL_ACQUISITION_INTERVAL_SECONDS, Settings, aircraft_provider_status, fetch_provider_aircraft, fetch_aircraft, haversine_nm, load_settings, render, save_frame, select_nearest, validate_location
 
 
 SOARING_INDEX_URL = (
@@ -73,7 +76,6 @@ RADAR_RANGES = (5, 10, 15, 25, 40, 60, 100)
 TRACK_RADAR_RANGES = (5, 10, 15, 25, 40, 60, 100, 150, 250, 400, 600, 1000, 1500, 2500, 4000, 6000, 10000)
 MAX_TRACKING_CALLSIGN_CANDIDATES = 3
 FLIGHTAWARE_AEROAPI_URL = "https://aeroapi.flightaware.com/aeroapi"
-ADSBIM_ROUTESET_URL = "https://adsb.im/api/0/routeset"
 ADSLOL_ROUTESET_URL = "https://api.adsb.lol/api/0/routeset"
 ADSLOL_ROUTE_URL = "https://api.adsb.lol/api/0/route/{callsign}/{latitude}/{longitude}"
 ADSLOL_CALLSIGN_URL = "https://api.adsb.lol/v2/callsign/{callsign}"
@@ -505,7 +507,7 @@ def radar_contacts(aircraft: list[dict[str, Any]], settings, selected: dict[str,
 class APIHealthMonitor:
     """Lightweight heartbeat for the public data services used by Over-Head."""
 
-    SERVICES = ("ADSB.lol", "adsb.im", "ADSBDB", "OurAirports")
+    SERVICES = ("ADSB.lol", "ADSBDB", "OurAirports")
 
     def __init__(self, settings) -> None:
         self.settings = settings
@@ -537,26 +539,6 @@ class APIHealthMonitor:
         )
         return self._open_ok(urllib.request.Request(url, headers={"User-Agent": USER_AGENT}))
 
-    def _probe_adsbim(self) -> bool:
-        body = json.dumps({
-            "planes": [{
-                "callsign": "ZZZ999",
-                "lat": float(self.settings.latitude),
-                "lng": float(self.settings.longitude),
-            }]
-        }).encode("utf-8")
-        request = urllib.request.Request(
-            ADSBIM_ROUTESET_URL,
-            data=body,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        return self._open_ok(request)
-
     def _probe_adsbdb(self) -> bool:
         request = urllib.request.Request(ADSBDB_HEALTH_URL, headers={"User-Agent": USER_AGENT})
         return self._open_ok(request)
@@ -572,7 +554,6 @@ class APIHealthMonitor:
     def check(self) -> dict[str, Any]:
         probes = {
             "ADSB.lol": self._probe_adsblol,
-            "adsb.im": self._probe_adsbim,
             "ADSBDB": self._probe_adsbdb,
             "OurAirports": self._probe_ourairports,
         }
@@ -1211,6 +1192,8 @@ class FlightRouteStore:
         self._lock = threading.Lock()
         self._failures: dict[str, float] = {}
         self._flightaware_disabled_until = 0.0
+        self._adsblol_disabled_until = 0.0
+        self._lookup_local = threading.local()
         self._debug: dict[str, Any] = {
             "decision": "No route lookup has run yet",
             "flightaware_configured": bool(self.api_key),
@@ -1237,6 +1220,14 @@ class FlightRouteStore:
     @classmethod
     def registration(cls, plane: dict[str, Any] | None) -> str:
         return cls._clean(plane.get("r")) if plane else ""
+
+    @staticmethod
+    def _alternative_callsign(callsign: str) -> str:
+        match = re.fullmatch(r"([A-Z]+)(0[0-9]+)", callsign)
+        if not match:
+            return ""
+        prefix, number = match.groups()
+        return prefix + (number.lstrip("0") or "0")
 
     @classmethod
     def _cache_key(cls, plane: dict[str, Any] | None) -> str:
@@ -1350,10 +1341,19 @@ class FlightRouteStore:
             url,
             headers={"User-Agent": USER_AGENT, "x-apikey": self.api_key},
         )
+        event = {"callsign": ident}
+        if not hasattr(self._lookup_local, "aeroapi_requests"):
+            self._lookup_local.aeroapi_requests = []
+        self._lookup_local.aeroapi_requests.append(event)
         try:
+            self._lookup_local.request_count = getattr(self._lookup_local, "request_count", 0) + 1
             with urllib.request.urlopen(request, timeout=8) as response:
+                self._lookup_local.http_status = getattr(response, "status", None)
+                event["http_status"] = self._lookup_local.http_status
                 payload = json.load(response)
         except urllib.error.HTTPError as exc:
+            self._lookup_local.http_status = exc.code
+            event["http_status"] = exc.code
             if exc.code in (401, 402, 403):
                 self._flightaware_disabled_until = time.time() + 3600
             raise
@@ -1531,14 +1531,16 @@ class FlightRouteStore:
             },
             method="POST",
         )
+        self._lookup_local.request_count = getattr(self._lookup_local, "request_count", 0) + 1
         with urllib.request.urlopen(request, timeout=6) as response:
-            payload = json.load(response)
+            self._lookup_local.http_status = getattr(response, "status", None)
+            body = response.read()
+        if not body.strip():
+            return {}
+        payload = json.loads(body)
         if isinstance(payload, list) and payload and isinstance(payload[0], dict):
             return payload[0]
         return payload if isinstance(payload, dict) else {}
-
-    def _adsbim_routeset(self, callsign: str, plane: dict[str, Any] | None) -> dict[str, Any]:
-        return self._routeset(ADSBIM_ROUTESET_URL, callsign, plane)
 
     def _adsblol_routeset(self, callsign: str, plane: dict[str, Any] | None) -> dict[str, Any]:
         return self._routeset(ADSLOL_ROUTESET_URL, callsign, plane)
@@ -1554,7 +1556,9 @@ class FlightRouteStore:
             longitude=f"{longitude:.6f}",
         )
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        self._lookup_local.request_count = getattr(self._lookup_local, "request_count", 0) + 1
         with urllib.request.urlopen(request, timeout=6) as response:
+            self._lookup_local.http_status = getattr(response, "status", None)
             payload = json.load(response)
         return payload if isinstance(payload, dict) else {}
 
@@ -1615,18 +1619,32 @@ class FlightRouteStore:
         temporary.replace(self.cache_path)
 
     def _set_debug(self, debug: dict[str, Any]) -> None:
+        for attempt in debug.get("attempts", []):
+            if attempt.get("source") == "FlightAware AeroAPI" and attempt.get("requested"):
+                attempt["requests"] = getattr(self._lookup_local, "aeroapi_requests", [])
+        if any(attempt.get("requested") for attempt in debug.get("attempts", [])):
+            debug["lookup_id"] = secrets.token_hex(16)
         self._debug = json.loads(json.dumps(debug, default=str))
+        self._lookup_local.debug = self._debug
+
+    def _current_lookup_debug(self) -> dict[str, Any]:
+        return getattr(self._lookup_local, "debug", {})
 
     def debug_snapshot(self) -> dict[str, Any]:
         with self._lock:
             return json.loads(json.dumps(self._debug, default=str))
 
     def get(self, plane: dict[str, Any] | None) -> dict[str, Any]:
+        self._lookup_local.request_count = 0
+        self._lookup_local.http_status = None
+        self._lookup_local.aeroapi_requests = []
         callsign = self.callsign(plane)
         registration = self.registration(plane)
         position = self._plane_position(plane)
         debug: dict[str, Any] = {
             "callsign": callsign,
+            "original_callsign": callsign,
+            "alternative_callsign": self._alternative_callsign(callsign),
             "registration": registration,
             "position": {"latitude": position[0], "longitude": position[1]} if position else None,
             "flightaware_configured": bool(self.api_key),
@@ -1645,6 +1663,9 @@ class FlightRouteStore:
                 age = time.time() - float(cached.get("cached_at", 0))
                 debug["attempts"].append({
                     "source": "cache",
+                    "callsign": callsign,
+                    "airport_information_returned": True,
+                    "geographical_validation_passed": plausible,
                     "route": cached.get("route"),
                     "route_source": cached.get("route_source"),
                     "age_seconds": round(age, 1),
@@ -1672,16 +1693,31 @@ class FlightRouteStore:
                     flight = self._select_flightaware_flight(plane)
                 except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
                     flight = {}
-                    debug["attempts"].append({"source": "FlightAware AeroAPI", "error": type(exc).__name__})
+                    debug["attempts"].append({
+                        "source": "FlightAware AeroAPI", "callsign": callsign,
+                        "airport_information_returned": False,
+                        "geographical_validation_passed": None, "accepted": False,
+                        "error": type(exc).__name__, "reason": "provider request failed",
+                        "requested": bool(self._lookup_local.request_count),
+                        "request_count": self._lookup_local.request_count,
+                        "http_status": self._lookup_local.http_status,
+                    })
                 route = self._normalise_flightaware(flight) if flight else {}
                 if route:
                     plausible, detail = self._plausibility(route, plane)
                     debug["attempts"].append({
                         "source": "FlightAware AeroAPI",
+                        "callsign": callsign,
+                        "airport_information_returned": True,
+                        "geographical_validation_passed": plausible,
                         "route": route.get("route"),
                         "commercial_flight": route.get("commercial_flight"),
                         "accepted": plausible,
                         "validation": detail,
+                        "reason": detail["reason"],
+                        "requested": bool(self._lookup_local.request_count),
+                        "request_count": self._lookup_local.request_count,
+                        "http_status": self._lookup_local.http_status,
                     })
                     if plausible:
                         self._records[key] = route
@@ -1690,52 +1726,104 @@ class FlightRouteStore:
                         self._set_debug(debug)
                         return route
                 elif flight:
-                    debug["attempts"].append({"source": "FlightAware AeroAPI", "accepted": False, "reason": "flight had no usable airport pair"})
+                    debug["attempts"].append({
+                        "source": "FlightAware AeroAPI", "callsign": callsign,
+                        "airport_information_returned": bool(flight.get("origin") or flight.get("destination")),
+                        "geographical_validation_passed": None, "accepted": False,
+                        "reason": "flight had no usable airport pair",
+                        "requested": bool(self._lookup_local.request_count),
+                        "request_count": self._lookup_local.request_count,
+                        "http_status": self._lookup_local.http_status,
+                    })
+                elif not any(attempt.get("source") == "FlightAware AeroAPI" for attempt in debug["attempts"]):
+                    debug["attempts"].append({
+                        "source": "FlightAware AeroAPI", "callsign": callsign,
+                        "requested": bool(self._lookup_local.request_count),
+                        "request_count": self._lookup_local.request_count,
+                        "http_status": self._lookup_local.http_status, "accepted": False,
+                        "reason": "no matching flight returned",
+                    })
             else:
                 debug["attempts"].append({"source": "FlightAware AeroAPI", "skipped": True, "reason": "no API key configured"})
 
             free_route_attempts = (
-                ("adsb.im routeset", self._adsbim_routeset),
                 ("ADSB.lol routeset", self._adsblol_routeset),
                 ("ADSB.lol route", self._adsblol),
             )
-            for source_name, lookup in free_route_attempts:
-                try:
-                    raw = lookup(callsign, plane)
-                except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError, TimeoutError) as exc:
-                    raw = {}
-                    debug["attempts"].append({"source": source_name, "error": type(exc).__name__})
-                if not raw:
-                    continue
-
-                route = self._normalise_routeset(raw, source_name)
-                raw_summary = {
-                    "airport_codes": raw.get("airport_codes"),
-                    "airport_codes_iata": raw.get("_airport_codes_iata"),
-                    "provider_plausible": raw.get("plausible"),
-                }
-                if route:
-                    plausible, detail = self._plausibility(route, plane)
-                    debug["attempts"].append({
+            lookup_callsigns = [callsign]
+            if debug["alternative_callsign"]:
+                lookup_callsigns.append(debug["alternative_callsign"])
+            for lookup_callsign in lookup_callsigns:
+                for source_name, lookup in free_route_attempts:
+                    attempt: dict[str, Any] = {
                         "source": source_name,
-                        "raw": raw_summary,
-                        "route": route.get("route"),
-                        "accepted": plausible,
-                        "validation": detail,
-                    })
+                        "callsign": lookup_callsign,
+                        "airport_information_returned": False,
+                        "geographical_validation_passed": None,
+                        "accepted": False,
+                    }
+                    debug["attempts"].append(attempt)
+                    if time.time() < self._adsblol_disabled_until:
+                        attempt.update(skipped=True, reason="ADSB.lol provider cooldown")
+                        continue
+                    try:
+                        self._lookup_local.request_count = 0
+                        self._lookup_local.http_status = None
+                        raw = lookup(lookup_callsign, plane)
+                    except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
+                        attempt.update(error=type(exc).__name__, reason="provider request failed")
+                        if isinstance(exc, urllib.error.HTTPError):
+                            attempt["http_status"] = exc.code
+                            retry = _retry_after_seconds(exc.headers.get("Retry-After") if exc.headers else None)
+                            if exc.code in (403, 429) or retry is not None:
+                                minimum = 300 if exc.code == 403 else ROUTE_FAILURE_RETRY_SECONDS
+                                self._adsblol_disabled_until = time.time() + max(minimum, retry or 0)
+                        continue
+                    finally:
+                        attempt["requested"] = bool(self._lookup_local.request_count)
+                        attempt["request_count"] = self._lookup_local.request_count
+                        if self._lookup_local.http_status is not None:
+                            attempt["http_status"] = self._lookup_local.http_status
+                    if not raw:
+                        attempt["reason"] = "provider returned no route data"
+                        continue
+                    route = self._normalise_routeset(raw, source_name)
+                    airport_codes = (
+                        raw.get("airport_codes"), raw.get("_airport_codes_iata"),
+                    )
+                    airports = raw.get("_airports")
+                    attempt["airport_information_returned"] = bool(
+                        any(str(value or "").strip().casefold() not in ("", "unknown", "n/a", "none")
+                            for value in airport_codes)
+                        or isinstance(airports, list) and any(
+                            isinstance(airport, dict) and (airport.get("iata") or airport.get("icao"))
+                            for airport in airports
+                        )
+                    )
+                    attempt["raw"] = {
+                        "airport_codes": raw.get("airport_codes"),
+                        "airport_codes_iata": raw.get("_airport_codes_iata"),
+                        "provider_plausible": raw.get("plausible"),
+                        "airports": [
+                            {field: str(airport.get(field) or "")[:128] for field in ("iata", "icao")}
+                            for airport in raw.get("_airports", [])[:16] if isinstance(airport, dict)
+                        ] if isinstance(raw.get("_airports"), list) else [],
+                    }
+                    if not route:
+                        attempt["reason"] = f"{source_name} returned no usable airport pair"
+                        continue
+                    plausible, detail = self._plausibility(route, plane)
+                    attempt.update(
+                        route=route.get("route"), accepted=plausible,
+                        geographical_validation_passed=plausible, validation=detail,
+                        reason=detail["reason"],
+                    )
                     if plausible:
                         self._records[key] = route
                         self._save()
                         debug["decision"] = f"Accepted {source_name} after independent live-position validation"
                         self._set_debug(debug)
                         return route
-                else:
-                    debug["attempts"].append({
-                        "source": source_name,
-                        "raw": raw_summary,
-                        "accepted": False,
-                        "reason": f"{source_name} returned no usable airport pair",
-                    })
 
             self._failures[key] = time.time()
             debug["decision"] = "No trustworthy route. Display N/A to N/A."
@@ -1835,6 +1923,7 @@ PAGE = b"""<!doctype html>
     html.cursor-hidden,html.cursor-hidden * { cursor:none !important; }
     .wall { width:100vw; height:100vh; padding:clamp(18px,2.4vw,52px); display:grid; grid-template-rows:auto 1fr auto; gap:clamp(14px,2vh,28px); background:radial-gradient(circle at 76% 48%,rgba(20,236,255,.075),transparent 28%),linear-gradient(145deg,#06121a 0%,var(--bg) 52%); }
     header,footer { display:flex; align-items:center; justify-content:space-between; }
+    header { position:relative; z-index:1000; }
     .header-tools { display:flex; align-items:center; gap:clamp(14px,1.5vw,28px); transition:transform 220ms ease; }
     .wall:not(.radar-open):not(.settings-open) .header-tools { transform:translateY(clamp(-46px,-4.15vh,-34px)); }
     .wall.radar-open .header-tools { transform:translateY(calc(-15% - 7px)); }
@@ -1886,7 +1975,7 @@ PAGE = b"""<!doctype html>
     .snapshot-toast.error { color:var(--red); border-color:rgba(255,62,82,.6); }
 
     .brand { width:clamp(220px,24vw,440px); height:clamp(52px,4.4vw,82px); display:flex; align-items:center; justify-content:flex-start; }
-    .brand-logo { display:block; visibility:hidden; max-width:100%; max-height:100%; width:auto; height:auto; object-fit:contain; object-position:left center; filter:grayscale(0) saturate(1) brightness(1); opacity:1; transition:filter 900ms ease,opacity 900ms ease; }
+    .brand-logo { display:block; visibility:hidden; max-width:100%; max-height:100%; width:auto; height:auto; object-fit:contain; object-position:left center; transform:translateY(10px); filter:grayscale(0) saturate(1) brightness(1); opacity:1; transition:filter 900ms ease,opacity 900ms ease; }
     .brand-logo.ready { visibility:visible; }
     .wall.aircraft-active .brand-logo { filter:grayscale(1) saturate(0) brightness(.82) contrast(1.62); opacity:.82; }
     .wall.aircraft-active.brand-pulse .brand-logo { filter:grayscale(0) saturate(1.08) brightness(1.04) contrast(1.18); opacity:1; }
@@ -1930,11 +2019,12 @@ PAGE = b"""<!doctype html>
     .route-map .leaflet-tile-pane { opacity:.78; filter:grayscale(1) sepia(.14) hue-rotate(132deg) saturate(.58) brightness(.62) contrast(1.62); }
     .route-map .leaflet-tooltip.route-label { padding:2px 5px; border:1px solid rgba(108,154,172,.5); border-radius:5px; background:rgba(2,5,10,.82); box-shadow:none; color:#e8f6ff; font:750 10px/1 "Segoe UI",sans-serif; letter-spacing:.06em; }
     .route-map .leaflet-tooltip.route-label::before { display:none; }
+    .route-map.photo-active { background:#02050a; }
+    .route-map.photo-active > :not(.route-photo-panel),.route-map.photo-active::before,.route-map.photo-active::after { visibility:hidden; }
     .route-photo-panel { position:absolute; inset:0; z-index:900; overflow:hidden; background:#02050a; pointer-events:none; }
     .route-photo-panel[hidden] { display:none; }
-    .route-photo-panel img { position:absolute; left:50%; top:50%; display:block; width:82%; height:76%; transform:translate(-50%,-50%); object-fit:cover; object-position:center; border-radius:clamp(10px,1vw,16px); filter:saturate(1.06) brightness(1.03) contrast(1.03); box-shadow:0 12px 30px rgba(0,0,0,.28); }
-    .route-photo-panel::after { content:""; position:absolute; inset:12% 9%; border-radius:clamp(10px,1vw,16px); background:linear-gradient(to bottom,rgba(2,5,10,.03),rgba(2,5,10,0) 68%,rgba(2,5,10,.12)); }
-    .aircraft-photo-credit { position:absolute; right:calc(9% + clamp(8px,.7vw,12px)); bottom:calc(12% + clamp(7px,.7vh,11px)); z-index:2; padding:.36em .55em; border-radius:5px; background:rgba(2,5,10,.62); color:rgba(232,246,255,.90); font:700 clamp(6px,.48vw,8px)/1.1 "Segoe UI",sans-serif; letter-spacing:.07em; }
+    .route-photo-panel img { position:absolute; inset:0; display:block; width:100%; height:100%; object-fit:contain; object-position:center; filter:saturate(1.06) brightness(1.03) contrast(1.03); }
+    .aircraft-photo-credit { position:absolute; right:8px; bottom:8px; z-index:2; padding:.36em .55em; border-radius:5px; background:rgba(2,5,10,.62); color:rgba(232,246,255,.90); font:700 clamp(6px,.48vw,8px)/1.1 "Segoe UI",sans-serif; letter-spacing:.07em; }
     .route-direction-flow { pointer-events:none; animation:route-flow 10s linear infinite; filter:drop-shadow(0 0 4px rgba(232,246,255,.95)) drop-shadow(0 0 8px rgba(20,236,255,.7)); }
     .snapshot-render .route-direction-flow { animation:none; }
     @keyframes route-flow { from { stroke-dashoffset:100; } to { stroke-dashoffset:0; } }
@@ -2046,9 +2136,6 @@ PAGE = b"""<!doctype html>
     #radar { width:min(100%,52vh); aspect-ratio:1; overflow:visible; }
 
     /* The radar, commentary and photograph occupy one rotating display stage. */
-    .radar-stage .route-photo-panel { z-index:6; border-radius:clamp(8px,1vw,16px); }
-    .wall.photo-view #radar, .wall.photo-view .radar-commentary { visibility:hidden; }
-    .wall.photo-view .radar-zoom { visibility:hidden; }
     .radar-commentary { position:absolute; left:50%; top:50%; z-index:4; width:min(92%,560px); max-width:calc(100% - 12px); transform:translate(-50%,-50%) scale(.985); opacity:0; display:flex; align-items:center; justify-content:center; padding:clamp(12px,1.15vw,22px); border-radius:clamp(12px,1vw,18px); background:rgba(2,5,10,.76); box-shadow:0 0 38px rgba(2,5,10,.76); color:rgba(232,246,255,.99); font:760 clamp(26px,2.2vw,42px)/1.16 "Segoe UI",sans-serif; letter-spacing:.003em; text-align:center; white-space:pre-line; overflow:visible; pointer-events:none; transition:opacity 180ms ease,transform 180ms ease; }
     .wall.commentary-view .radar-commentary.visible { opacity:1; transform:translate(-50%,-50%) scale(1); }
     .wall.commentary-view #radar { visibility:hidden; }
@@ -2287,8 +2374,7 @@ PAGE = b"""<!doctype html>
         border-radius:10px;
       }
       .route-map .leaflet-tooltip.route-label { font-size:8px; padding:2px 4px; }
-      .route-photo-panel img { object-position:center; }
-      .aircraft-photo-credit { right:6px; bottom:6px; font-size:5px; padding:.35em .45em; }
+    .aircraft-photo-credit { right:5px; bottom:5px; font-size:5px; padding:.35em .45em; }
 
       .metrics,
       .wall.radar-open .metrics,
@@ -2477,7 +2563,7 @@ PAGE = b"""<!doctype html>
       <div class="idle-message" id="idle-message">Looking out&hellip;</div>
       <div class="tracking-message" id="tracking-message"></div>
       <section class="information">
-        <div class="flight-heading"><div class="flight-copy"><div class="callsign" id="callsign">-</div><div class="identity"><span class="registration" id="registration"></span><span class="aircraft-name" id="aircraft-name"></span></div><div class="destination-summary" id="destination-summary" hidden></div></div><div class="route-visual"><div class="route-brand" id="route-brand"><span class="route-brand-name" id="route-brand-name"></span><img class="route-brand-logo" id="operator-logo" alt=""></div><div class="route-map" id="route-map" aria-label="Route map centred on the tracked aircraft"></div></div></div>
+        <div class="flight-heading"><div class="flight-copy"><div class="callsign" id="callsign">-</div><div class="identity"><span class="registration" id="registration"></span><span class="aircraft-name" id="aircraft-name"></span></div><div class="destination-summary" id="destination-summary" hidden></div></div><div class="route-visual"><div class="route-brand" id="route-brand"><span class="route-brand-name" id="route-brand-name"></span><img class="route-brand-logo" id="operator-logo" alt=""></div><div class="route-map" id="route-map" aria-label="Route map centred on the tracked aircraft"><div class="route-photo-panel" id="route-photo-panel" hidden><img id="aircraft-photo" alt=""><span class="aircraft-photo-credit">PHOTO &middot; AIRPORT-DATA.COM via ADSBDB</span></div></div></div></div>
         <div class="metrics">
           <div class="metric"><div class="metric-label">ALTITUDE</div><div class="metric-value" id="altitude">--</div><div class="metric-history" aria-label="Previous altitude values"><div class="metric-history-row"><span class="metric-history-age">30S</span><span class="metric-history-value" id="altitude-history-30">--</span></div><div class="metric-history-row"><span class="metric-history-age">60S</span><span class="metric-history-value" id="altitude-history-60">--</span></div><div class="metric-history-row"><span class="metric-history-age">90S</span><span class="metric-history-value" id="altitude-history-90">--</span></div></div></div>
           <div class="metric"><div class="metric-label">GROUND SPEED</div><div class="metric-value" id="speed">--</div><div class="metric-history" aria-label="Previous ground speed values"><div class="metric-history-row"><span class="metric-history-age">30S</span><span class="metric-history-value" id="speed-history-30">--</span></div><div class="metric-history-row"><span class="metric-history-age">60S</span><span class="metric-history-value" id="speed-history-60">--</span></div><div class="metric-history-row"><span class="metric-history-age">90S</span><span class="metric-history-value" id="speed-history-90">--</span></div></div></div>
@@ -2493,7 +2579,7 @@ PAGE = b"""<!doctype html>
         <path class="radar-axis" d="M50 4V96M4 50H96"/><text x="50" y="2.8" text-anchor="middle" fill="#6c9aac" font-size="3">N</text>
         <g class="radar-sweep" aria-hidden="true"><path class="radar-sweep-beam" d="M50 50 L50 4 A46 46 0 0 1 72 9.6 Z"/><line class="radar-sweep-line" x1="50" y1="50" x2="50" y2="4"/></g>
         <g id="radar-contacts"></g><circle class="radar-home" cx="50" cy="50" r="1.25"/>
-      </svg><div class="radar-commentary" id="radar-commentary" aria-live="polite"></div><div class="route-photo-panel" id="route-photo-panel" hidden><img id="aircraft-photo" alt=""><span class="aircraft-photo-credit">PHOTO &middot; AIRPORT-DATA.COM via ADSBDB</span></div></div>
+    </svg><div class="radar-commentary" id="radar-commentary" aria-live="polite"></div></div>
       <div class="radar-foot"><form class="radar-track" id="radar-track-form"><div class="track-input-wrap"><input class="track-input" id="track-flight" type="text" maxlength="10" autocomplete="off" spellcheck="false" aria-label="Flight number or callsign to track" placeholder="BA703"><button class="track-clear" id="track-clear" type="button" aria-label="Clear flight selection" title="Clear" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7l10 10M17 7L7 17" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg></button></div><button class="track-button" id="track-button" type="submit" aria-pressed="false">TRACK</button></form><div class="radar-zoom"><button class="zoom-button" id="zoom-in" type="button" aria-label="Zoom in and reduce tracking range"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg></button><span id="radar-range">25 NM</span><button class="zoom-button" id="zoom-out" type="button" aria-label="Zoom out and increase tracking range"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12M12 6v12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg></button></div></div>
     </aside>
     <aside class="settings-panel" aria-label="Display settings">
@@ -2624,6 +2710,7 @@ PAGE = b"""<!doctype html>
     function formatDistanceValue(value,digits=1){ const converted=distanceFromNm(value); return converted==null?'--':converted.toFixed(digits); }
     function smartDistanceNm(value,precise=false){ const converted=distanceFromNm(value); if(converted==null)return ''; const digits=precise||converted<1?2:converted<10?1:0; return converted.toFixed(digits)+' '+distanceUnitSpec().label; }
     const routeMapElement=byId('route-map'); let routeMap=null,routeMapLayers=[],routeMapRenderKey='';
+    let routePhotoAircraftId='',routePhotoRevision='',routePhotoTimer=null,routePhotoRequest=0,routePhotoInPhotoView=false;
     let routeFlowKey='',routeFlowStartedAt=Date.now();
     let currentHomeLatitude=null,currentHomeLongitude=null,currentLocationRevision=0;
     let locationMap=null,locationMarker=null,locationAccuracyCircle=null,locationDialogRevision=0;
@@ -2707,13 +2794,12 @@ PAGE = b"""<!doctype html>
     }
     const ROTATION_INTERVAL_MS=15000;
     const prefersReducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    const rotationViews=['radar','commentary','photo'];
+    const rotationViews=['radar','commentary'];
     let rotationView='radar',rotationStartedAt=Date.now();
     function availableRotationViews(){
       const d=lastDisplayStatus||{};
       const views=['radar'];
       if(commentaryEnabled&&d.aircraft_id&&String(byId('radar-commentary').textContent||'').trim())views.push('commentary');
-      if(d.aircraft_id&&d.aircraft_photo_available)views.push('photo');
       return views;
     }
     function advanceRotation(){
@@ -2769,7 +2855,7 @@ PAGE = b"""<!doctype html>
     function syncCommentaryPresentation(){
       const wall=byId('wall'),button=byId('commentary-toggle');
       const showing=commentaryIsShowing();
-      if(wall){wall.classList.toggle('commentary-view',showing);wall.classList.toggle('photo-view',rotationView==='photo'&&wall.classList.contains('radar-open')&&!wall.classList.contains('settings-open'));}
+    if(wall)wall.classList.toggle('commentary-view',showing);
       if(button){
         button.classList.toggle('active',commentaryEnabled);
         button.setAttribute('aria-pressed',String(commentaryEnabled));
@@ -2777,8 +2863,8 @@ PAGE = b"""<!doctype html>
         button.title=commentaryEnabled?'Disable commentary':'Enable commentary';
       }
       const heading=byId('radar-heading-title'),count=byId('radar-count');
-      if(heading)heading.textContent=rotationView==='photo'?'AIRCRAFT PHOTO':showing?'COMMENTARY':'WIDER AREA';
-      if(count)count.hidden=showing||rotationView==='photo';
+    if(heading)heading.textContent=showing?'COMMENTARY':'WIDER AREA';
+    if(count)count.hidden=showing;
       if(showing)scheduleCommentaryFit();
       if(lastDisplayStatus)renderAircraftPhoto(lastDisplayStatus,Boolean(lastDisplayStatus.aircraft_id));
     }
@@ -3016,18 +3102,45 @@ PAGE = b"""<!doctype html>
       target.hidden=false;
     }
     function renderAircraftPhoto(d,hasAircraft){
-      const panel=byId('route-photo-panel'),img=byId('aircraft-photo'),wall=byId('wall'),commentary=byId('radar-commentary');
+            const panel=byId('route-photo-panel'),img=byId('aircraft-photo'),map=routeMapElement;
       if(!panel||!img)return;
-      const commentaryVisible=commentaryIsShowing();
+            const aircraftId=hasAircraft?String(d.aircraft_id||''):'';
+            if(aircraftId!==routePhotoAircraftId){
+                clearInterval(routePhotoTimer); routePhotoTimer=null; routePhotoAircraftId=aircraftId; routePhotoRequest++;
+                routePhotoRevision=''; routePhotoInPhotoView=false; panel.hidden=true; map.classList.remove('photo-active'); img.removeAttribute('src');
+            }
       const available=Boolean(d&&d.aircraft_photo_available);
-      if(!hasAircraft||rotationView!=='photo'||!available){ panel.hidden=true; return; }
+            if(!hasAircraft||!available){
+                routePhotoRequest++;
+                clearInterval(routePhotoTimer); routePhotoTimer=null; routePhotoRevision=''; routePhotoInPhotoView=false;
+                panel.hidden=true; map.classList.remove('photo-active'); img.removeAttribute('src'); return;
+            }
       const revision=String(d.aircraft_photo_revision||'');
       const url='/aircraft-photo?v='+encodeURIComponent(revision)+snapshotAssetSuffix;
+            if(routePhotoRevision===revision&&img.getAttribute('src')===url){
+                if(img.complete&&img.naturalWidth&&!routePhotoTimer)img.onload();
+                return;
+            }
+            routePhotoRevision=revision;
+            const request=++routePhotoRequest;
+            panel.hidden=true; map.classList.remove('photo-active'); map.classList.add('visible');
       img.alt=(String(d.registration||'Aircraft').trim()||'Aircraft')+' aircraft photo';
-      img.onload=()=>{ if(rotationView==='photo')panel.hidden=false; };
-      img.onerror=()=>{ panel.hidden=true; };
-      if(img.getAttribute('src')!==url)img.src=url;
-      else if(img.complete&&img.naturalWidth)panel.hidden=false;
+            img.onload=()=>{
+                if(request!==routePhotoRequest||aircraftId!==routePhotoAircraftId||img.getAttribute('src')!==url)return;
+                clearInterval(routePhotoTimer); routePhotoInPhotoView=false; panel.hidden=true; map.classList.remove('photo-active');
+                routePhotoTimer=setInterval(()=>{
+                    if(aircraftId!==routePhotoAircraftId||!img.complete||!img.naturalWidth)return;
+                    routePhotoInPhotoView=!routePhotoInPhotoView;
+                    panel.hidden=!routePhotoInPhotoView;
+                    map.classList.toggle('photo-active',routePhotoInPhotoView);
+                },10000);
+            };
+            img.onerror=()=>{
+                if(request!==routePhotoRequest||aircraftId!==routePhotoAircraftId)return;
+                clearInterval(routePhotoTimer); routePhotoTimer=null; panel.hidden=true; map.classList.remove('photo-active');
+            };
+            if(img.getAttribute('src')!==url)img.src=url;
+            else if(img.complete&&img.naturalWidth)img.onload();
     }
     function renderHeading(d,hasAircraft){
       const heading=byId('callsign'); heading.replaceChildren(); const routeKnown=Boolean(d.route); heading.classList.toggle('route-known',hasAircraft&&routeKnown); heading.classList.toggle('route-unknown',hasAircraft&&!routeKnown);
@@ -4472,6 +4585,7 @@ def shift_metric_history(
 class FrameState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
+        self.route_failure_log: RouteFailureLog | None = None
         self.last_enrichment_future: concurrent.futures.Future[Any] | None = None
         self.location_lock = threading.Lock()
         self.location_revision = 0
@@ -4499,6 +4613,7 @@ class FrameState:
         self.metric_observations: list[dict[str, Any]] = []
         self.metric_observation_key: tuple[Any, ...] | None = None
         self.last_tracking_result: dict[str, Any] | None = None
+        self.last_automatic_tracking_result: dict[str, Any] | None = None
         self.commentary_aircraft_id = ""
         self.commentary_samples: list[dict[str, Any]] = []
         self.payload: dict[str, Any] = {"mode": "starting", "updated": "never", "total": 0, "location_revision": 0}
@@ -4536,7 +4651,7 @@ class FrameState:
             "tracking_found": bool(tracking.get("found")),
             "tracking_acquisition_outcome": tracking.get("acquisition_outcome", "waiting"),
             "acquisition_outcome": mode if mode in {"stale", "invalid_data"} else tracking.get("acquisition_outcome", mode),
-            "acquisition_interval_seconds": TRACKING_ACQUISITION_INTERVAL_SECONDS if tracking.get("active") else settings.refresh_seconds,
+            "acquisition_interval_seconds": TRACKING_ACQUISITION_INTERVAL_SECONDS if tracking.get("active") or plane else NORMAL_ACQUISITION_INTERVAL_SECONDS,
             "observation_source": plane.get("source"),
             "observation_timestamp": plane.get("observed_at"),
             "origin": route.get("origin", ""), "destination": route.get("destination", ""),
@@ -4960,7 +5075,7 @@ class SnapshotStore:
                     self.pending.pop(snapshot_id, None)
 
 
-def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, identities: AircraftIdentityStore, routes: FlightRouteStore | None = None, flags: FlagStore | None = None, tracker: FlightTrackingState | None = None, health: APIHealthMonitor | None = None, places: NearbyPlaceStore | None = None, persist_frame: bool = True, cached_acquisition: dict[str, Any] | None = None, tracking_only: bool = False, cached_tracking_result: dict[str, Any] | None = None, perform_tracking_lookup: bool = True) -> None:
+def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, identities: AircraftIdentityStore, routes: FlightRouteStore | None = None, flags: FlagStore | None = None, tracker: FlightTrackingState | None = None, health: APIHealthMonitor | None = None, places: NearbyPlaceStore | None = None, persist_frame: bool = True, cached_acquisition: dict[str, Any] | None = None, tracking_only: bool = False, cached_tracking_result: dict[str, Any] | None = None, perform_tracking_lookup: bool = True, automatic_tracking: tuple[str, tuple[str, ...]] | None = None, cached_automatic_tracking_result: dict[str, Any] | None = None, perform_automatic_tracking: bool = False) -> None:
     with state.lock:
         sample_settings = copy.copy(settings)
         location_revision = state.location_revision
@@ -4968,7 +5083,7 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
             cached_acquisition = None
         cached_aircraft = list(state.last_live_aircraft)
         cached_aircraft_received_at = state.last_live_aircraft_received_at
-        if not demo and cached_acquisition is None and (not tracking_only or perform_tracking_lookup):
+        if not demo and cached_acquisition is None and (not tracking_only or perform_tracking_lookup or perform_automatic_tracking):
             state.last_acquisition_attempted_at = time.time()
     tracking = tracker.snapshot() if tracker else {"active": False, "query": "", "candidates": (), "resolved_callsign": "", "last_plane": None, "revision": 0}
     tracking_revision = int(tracking.get("revision") or 0)
@@ -5082,6 +5197,7 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
     tracked_position_received_at: float | None = None
     reported_position_observed_at: float | None = None
     new_position_observation = False
+    automatic_result_to_remember = None
 
     if tracking.get("active") and not demo:
         resolved_callsign = str(tracking.get("resolved_callsign") or "")
@@ -5192,6 +5308,50 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
             aircraft_position_observed_at(plane, local_position_received_at)
             if plane is not None and local_position_received_at is not None else None
         )
+        if automatic_tracking and plane and aircraft_identity(plane) == automatic_tracking[0]:
+            automatic_result = cached_automatic_tracking_result
+            automatic_result_is_new = False
+            if automatic_result is None and perform_automatic_tracking:
+                attempted_at = time.monotonic()
+                automatic_result = {
+                    "aircraft_id": automatic_tracking[0],
+                    "plane": None,
+                    "observed_at": None,
+                    "received_at": attempted_at,
+                    "attempted_at": attempted_at,
+                    "outcome": "not_observed",
+                }
+                automatic_result_is_new = True
+                try:
+                    tracked_plane, _ = fetch_tracked_aircraft(automatic_tracking[1])
+                    if tracked_plane and aircraft_identity(tracked_plane) == automatic_tracking[0]:
+                        received_at = time.monotonic()
+                        automatic_result = {
+                            "aircraft_id": automatic_tracking[0],
+                            "plane": dict(tracked_plane),
+                            "observed_at": aircraft_position_observed_at(tracked_plane, received_at),
+                            "received_at": received_at,
+                            "attempted_at": attempted_at,
+                            "outcome": "live",
+                        }
+                except AircraftPositionStale:
+                    automatic_result["outcome"] = "stale"
+                except AircraftFeedRateLimited:
+                    automatic_result["outcome"] = "rate_limited"
+                except (AircraftFeedUnavailable, OSError, ValueError, json.JSONDecodeError, urllib.error.URLError, TimeoutError):
+                    automatic_result["outcome"] = "provider_unavailable"
+            tracked_plane = automatic_result.get("plane") if automatic_result else None
+            observed_at = automatic_result.get("observed_at") if automatic_result else None
+            received_at = automatic_result.get("received_at") if automatic_result else None
+            if automatic_result_is_new:
+                automatic_result_to_remember = automatic_result
+            if tracked_plane and observed_at is not None and received_at is not None:
+                plane = age_aircraft_positions([tracked_plane], max(0.0, time.monotonic() - float(received_at)))[0]
+                distance = tracking_distance_nm(plane, sample_settings)
+                aircraft = merge_tracked_aircraft(aircraft, plane)
+                reported_position_observed_at = float(observed_at)
+                local_position_received_at = float(received_at)
+                mode = "live"
 
     if mode == "live" and plane is None:
         mode = "scanning"
@@ -5230,6 +5390,9 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
             new_position_observation=new_position_observation,
             preserve_radar_radius=not bool(tracking.get("active")),
         )
+        if automatic_result_to_remember is not None:
+            with state.lock:
+                state.last_automatic_tracking_result = automatic_result_to_remember
     if demo or plane is None or not _enrichment_slots.acquire(blocking=False):
         return
 
@@ -5274,6 +5437,9 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
                     new_position_observation=False,
                     preserve_radar_radius=not bool(tracking.get("active")),
                 )
+                if state.route_failure_log is not None:
+                    debug = routes._current_lookup_debug() if isinstance(routes, FlightRouteStore) else {}
+                    state.route_failure_log.observe(plane, route, debug)
         except Exception:
             with state.lock:
                 if state.location_revision == location_revision and state.payload.get("aircraft_id") == aircraft_identity(plane):
@@ -5384,7 +5550,7 @@ VISITOR_SESSION_TTL_SECONDS = 30 * 60
 VISITOR_SNAPSHOT_RETENTION_SECONDS = VISITOR_SESSION_TTL_SECONDS
 SNAPSHOT_RECONCILE_INTERVAL_SECONDS = 60.0
 MAX_VISITOR_SESSIONS = 64
-GLOBAL_ACQUISITION_MIN_INTERVAL_SECONDS = 300.0
+GLOBAL_ACQUISITION_MIN_INTERVAL_SECONDS = NORMAL_ACQUISITION_INTERVAL_SECONDS
 TRACKING_ACQUISITION_INTERVAL_SECONDS = 30.0
 MAX_VISITOR_SNAPSHOTS = 50
 MAX_ENRICHMENT_WORKERS = 4
@@ -5409,12 +5575,15 @@ class VisitorSession:
         self.cookie_issued_at = self.last_access_at
         self.last_fetch_at = 0.0
         self.last_tracking_at = 0.0
+        self.last_auto_tracking_at = 0.0
+        self.auto_tracking_key: tuple[str, ...] | None = None
         self.last_tracking_success_at = 0.0
         self.last_scheduled_at = 0.0
         self.refresh_requested_at: float | None = None
         self.refresh_reasons: set[str] = set()
         self.cached_acquisition: dict[str, Any] | None = None
         self.cached_tracking_result: dict[str, Any] | None = None
+        self.cached_auto_tracking_result: dict[str, Any] | None = None
         self.acquisition_kind = "normal"
         self.last_track_action_at = 0.0
         self.last_snapshot_at = 0.0
@@ -5444,8 +5613,10 @@ class VisitorSessionStore:
         session_ttl_seconds: float = VISITOR_SESSION_TTL_SECONDS,
         max_sessions: int = MAX_VISITOR_SESSIONS,
         global_min_interval_seconds: float | None = None,
+        route_failure_log: RouteFailureLog | None = None,
     ) -> None:
         self.defaults = copy.copy(defaults)
+        self.route_failure_log = route_failure_log
         self.snapshot_root = snapshot_root or Path(__file__).resolve().with_name("screenshots") / "visitors"
         self.session_ttl_seconds = max(1.0, float(session_ttl_seconds))
         self.max_sessions = max(1, int(max_sessions))
@@ -5456,6 +5627,7 @@ class VisitorSessionStore:
         self.snapshot_lock = threading.Lock()
         self.shared_aircraft_results: list[dict[str, Any]] = []
         self.shared_tracking_results: dict[tuple[str, ...], dict[str, Any]] = {}
+        self.shared_auto_tracking_results: dict[tuple[str, ...], dict[str, Any]] = {}
         self.sessions: dict[str, VisitorSession] = {}
         self.next_acquisition_at = 0.0
         self.next_tracking_at = 0.0
@@ -5562,6 +5734,7 @@ class VisitorSessionStore:
                     session = VisitorSession(session_id, self.defaults, self.snapshot_root)
                     self.sessions[session_id] = session
             if session is not None:
+                session.state.route_failure_log = self.route_failure_log
                 if touch_existing:
                     session.last_access_at = now
             elif create and len(self.sessions) < self.max_sessions:
@@ -5569,6 +5742,7 @@ class VisitorSessionStore:
                 while new_id in self.sessions:
                     new_id = secrets.token_urlsafe(32)
                 session = VisitorSession(new_id, self.defaults, self.snapshot_root)
+                session.state.route_failure_log = self.route_failure_log
                 session.last_access_at = now
                 self.sessions[new_id] = session
                 created = True
@@ -5652,7 +5826,7 @@ class VisitorSessionStore:
                 required_radius = min(250.0, max(1.0, float(session.settings.query_radius_nm)))
             except (TypeError, ValueError):
                 return None
-        cache_ttl = max(1.0, self.global_min_interval_seconds)
+        cache_ttl = max(NORMAL_ACQUISITION_INTERVAL_SECONDS, self.global_min_interval_seconds)
         for result in sorted(self.shared_aircraft_results, key=lambda item: item["fetched_at"], reverse=True):
             age = now - result["fetched_at"]
             if age < 0 or age >= cache_ttl:
@@ -5725,6 +5899,57 @@ class VisitorSessionStore:
         )
         return tuple(sorted(hex_candidates)) or tuple(sorted(str(candidate).strip().upper() for candidate in candidates)) or None
 
+    @staticmethod
+    def automatic_tracking_target(session: VisitorSession) -> tuple[str, tuple[str, ...]] | None:
+        if session.tracker.snapshot()["active"]:
+            return None
+        with session.state.lock:
+            selected_id = str(session.state.payload.get("aircraft_id") or "")
+            plane = next(
+                (item for item in session.state.last_live_aircraft if aircraft_identity(item) == selected_id),
+                None,
+            )
+        if not selected_id or not plane:
+            return None
+        hex_code = normalise_adsb_hex(plane.get("hex"))
+        candidate = "hex:" + hex_code if hex_code else normalise_flight_query(plane.get("flight"))
+        return (selected_id, (candidate,)) if candidate else None
+
+    def _cached_automatic_tracking_unlocked(
+        self, key: tuple[str, ...], aircraft_id: str, now: float,
+    ) -> dict[str, Any] | None:
+        result = self.shared_auto_tracking_results.get(key)
+        if result is None:
+            result = self.shared_tracking_results.get(key)
+        if (
+            result is None
+            or (
+                result.get("aircraft_id") != aircraft_id
+                and aircraft_identity(result.get("plane") or {}) != aircraft_id
+            )
+            or result.get("received_at") is None
+            or now < float(result["received_at"])
+            or now - float(result.get("attempted_at", result["received_at"])) >= TRACKING_ACQUISITION_INTERVAL_SECONDS
+        ):
+            return None
+        return dict(result)
+
+    def remember_automatic_tracking_result(self, session: VisitorSession) -> None:
+        target = self.automatic_tracking_target(session)
+        if target is None:
+            return
+        with session.state.lock:
+            result = copy.deepcopy(session.state.last_automatic_tracking_result)
+        if result is None or result.get("aircraft_id") != target[0]:
+            return
+        with self.lock:
+            self.shared_auto_tracking_results[target[1]] = result
+            self.shared_tracking_results[target[1]] = result
+            self.tracking_next_due[target[1]] = float(result.get("attempted_at", result["received_at"])) + TRACKING_ACQUISITION_INTERVAL_SECONDS
+            while len(self.shared_auto_tracking_results) > 128:
+                del self.shared_auto_tracking_results[next(iter(self.shared_auto_tracking_results))]
+            self.wake.set()
+
     def _cached_tracking_unlocked(self, session: VisitorSession, now: float) -> dict[str, Any] | None:
         key = self.tracking_share_key(session)
         result = self.shared_tracking_results.get(key) if key else None
@@ -5782,10 +6007,11 @@ class VisitorSessionStore:
                 for session in self.sessions.values()
                 if session.lease.active()
             ]
+            normal_interval = max(NORMAL_ACQUISITION_INTERVAL_SECONDS, self.global_min_interval_seconds)
             due = [
                 session for session in active
                 if bool(session.refresh_reasons - {"tracking"})
-                or current - session.last_fetch_at >= max(1.0, session.settings.refresh_seconds)
+                or current - session.last_fetch_at >= normal_interval
             ]
             tracking_due = [
                 session for session in active
@@ -5795,10 +6021,19 @@ class VisitorSessionStore:
                     or current - session.last_tracking_at >= TRACKING_ACQUISITION_INTERVAL_SECONDS
                 )
             ]
+            automatic_due = []
+            for session in active:
+                target = self.automatic_tracking_target(session)
+                target_key = target[1] if target else None
+                if target_key != session.auto_tracking_key:
+                    session.auto_tracking_key = target_key
+                    session.last_auto_tracking_at = current
+                if target and current - session.last_auto_tracking_at >= TRACKING_ACQUISITION_INTERVAL_SECONDS:
+                    automatic_due.append(session)
             due.sort(key=lambda item: (
                 item.refresh_requested_at
                 if item.refresh_requested_at is not None
-                else item.last_fetch_at + max(1.0, item.settings.refresh_seconds),
+                else item.last_fetch_at + normal_interval,
                 item.last_scheduled_at,
             ))
             tracking_due.sort(key=lambda item: (
@@ -5812,10 +6047,13 @@ class VisitorSessionStore:
             self.tracking_next_due = {key: deadline for key, deadline in self.tracking_next_due.items() if key in active_keys or deadline > current}
             normal_wait = max(0.0, self.next_acquisition_at - current)
             tracking_wait = min((max(0.0, self.tracking_next_due.get(self.tracking_share_key(item), 0.0) - current) for item in tracking_due), default=0.0)
+            automatic_wait = min((max(0.0, self.tracking_next_due.get(item.auto_tracking_key, 0.0) - current) for item in automatic_due), default=0.0)
             if normal_wait < 0.001:
                 normal_wait = 0.0
             if tracking_wait < 0.001:
                 tracking_wait = 0.0
+            if automatic_wait < 0.001:
+                automatic_wait = 0.0
             session = None
             if tracking_due:
                 for candidate in tracking_due:
@@ -5827,25 +6065,52 @@ class VisitorSessionStore:
                         session.last_tracking_at = float(cached_result.get("attempted_at", cached_result["received_at"]))
                         session.refresh_reasons.discard("tracking")
                         break
-                eligible = [item for item in tracking_due if self.tracking_next_due.get(self.tracking_share_key(item), 0.0) <= current]
-                if session is None and eligible:
-                    session = eligible[0]
-                    tracking_due.remove(session)
-                    combine_normal = False
-                    session.acquisition_kind = "combined" if combine_normal else "tracking"
-                    session.cached_tracking_result = None
-                    session.last_tracking_at = current
+            if session is None and automatic_due:
+                for candidate in automatic_due:
+                    target = self.automatic_tracking_target(candidate)
+                    if target is None:
+                        continue
+                    cached_result = self._cached_automatic_tracking_unlocked(target[1], target[0], current)
+                    if cached_result is not None:
+                        session = candidate
+                        session.cached_auto_tracking_result = cached_result
+                        session.acquisition_kind = "automatic_tracking_cache"
+                        session.last_auto_tracking_at = float(cached_result.get("attempted_at", cached_result["received_at"]))
+                        automatic_due.remove(candidate)
+                        break
+                eligible_automatic = [
+                    item for item in automatic_due
+                    if self.tracking_next_due.get(item.auto_tracking_key, 0.0) <= current
+                ]
+                if session is None and eligible_automatic:
+                    session = eligible_automatic[0]
+                    automatic_due.remove(session)
+                    session.cached_auto_tracking_result = None
+                    session.acquisition_kind = "automatic_tracking"
+                    session.last_auto_tracking_at = current
                     session.last_scheduled_at = current
-                    session.refresh_reasons.discard("tracking")
-                    if combine_normal:
-                        due.remove(session)
-                        session.last_fetch_at = current
-                        self.next_acquisition_at = current + self.global_min_interval_seconds
-                        session.refresh_reasons.clear()
-                    self.next_tracking_at = current + TRACKING_ACQUISITION_INTERVAL_SECONDS
-                    key = self.tracking_share_key(session)
+                    key = session.auto_tracking_key
                     if key is not None:
-                        self.tracking_next_due[key] = self.next_tracking_at
+                        self.tracking_next_due[key] = current + TRACKING_ACQUISITION_INTERVAL_SECONDS
+            eligible = [item for item in tracking_due if self.tracking_next_due.get(self.tracking_share_key(item), 0.0) <= current]
+            if session is None and eligible:
+                session = eligible[0]
+                tracking_due.remove(session)
+                combine_normal = False
+                session.acquisition_kind = "combined" if combine_normal else "tracking"
+                session.cached_tracking_result = None
+                session.last_tracking_at = current
+                session.last_scheduled_at = current
+                session.refresh_reasons.discard("tracking")
+                if combine_normal:
+                    due.remove(session)
+                    session.last_fetch_at = current
+                    self.next_acquisition_at = current + normal_interval
+                    session.refresh_reasons.clear()
+                self.next_tracking_at = current + TRACKING_ACQUISITION_INTERVAL_SECONDS
+                key = self.tracking_share_key(session)
+                if key is not None:
+                    self.tracking_next_due[key] = self.next_tracking_at
             if session is not None:
                 if session in due:
                     due.remove(session)
@@ -5873,7 +6138,7 @@ class VisitorSessionStore:
                     session.last_scheduled_at = current
                     session.refresh_requested_at = None
                     session.refresh_reasons.clear()
-                    self.next_acquisition_at = current + self.global_min_interval_seconds
+                    self.next_acquisition_at = current + normal_interval
             if session is not None:
                 with session.state.lock:
                     session.state.payload["acquisition_status"] = "acquiring"
@@ -5883,18 +6148,26 @@ class VisitorSessionStore:
                 queue = tracking_due
                 queue_wait = tracking_wait
                 interval = 0.0
+            elif session is not None and session.acquisition_kind in {"automatic_tracking", "automatic_tracking_cache"}:
+                queue = automatic_due
+                queue_wait = automatic_wait
+                interval = TRACKING_ACQUISITION_INTERVAL_SECONDS
             elif session is not None:
                 queue = due
                 queue_wait = max(0.0, self.next_acquisition_at - current)
-                interval = self.global_min_interval_seconds
+                interval = normal_interval
             elif tracking_due and tracking_wait > 0.0:
                 queue = tracking_due
                 queue_wait = tracking_wait
                 interval = TRACKING_ACQUISITION_INTERVAL_SECONDS
+            elif automatic_due and automatic_wait > 0.0:
+                queue = automatic_due
+                queue_wait = automatic_wait
+                interval = TRACKING_ACQUISITION_INTERVAL_SECONDS
             elif due and session is None:
                 queue = due
                 queue_wait = normal_wait
-                interval = self.global_min_interval_seconds
+                interval = normal_interval
             else:
                 queue = []
                 queue_wait = 0.0
@@ -5909,6 +6182,7 @@ class VisitorSessionStore:
         self._remove_snapshot_folders(expired_paths)
         wait_until_next = min(
             tracking_wait if tracking_due else float("inf"),
+            automatic_wait if automatic_due else float("inf"),
             normal_wait if due else float("inf"),
         )
         if session is not None:
@@ -5933,7 +6207,7 @@ def refresh_loop(state: FrameState, settings, demo: bool, logos: LogoStore, iden
         location_changed = location_revision != last_location_revision
         # A home-location change needs a fresh geographic query immediately;
         # ordinary radar zoom and UI refreshes must still honour the request budget.
-        if not location_changed and not lease_activated and time.monotonic() - last_fetch < max(1.0, settings.refresh_seconds):
+        if not location_changed and not lease_activated and time.monotonic() - last_fetch < NORMAL_ACQUISITION_INTERVAL_SECONDS:
             time.sleep(1.0)
             continue
         last_location_revision = location_revision
@@ -5974,15 +6248,21 @@ def visitor_refresh_loop(
             session.cached_acquisition = None
             cached_tracking_result = session.cached_tracking_result
             session.cached_tracking_result = None
+            cached_auto_tracking_result = session.cached_auto_tracking_result
+            session.cached_auto_tracking_result = None
             acquisition_kind = session.acquisition_kind
+        automatic_target = sessions.automatic_tracking_target(session) if acquisition_kind in {"automatic_tracking", "automatic_tracking_cache"} else None
         try:
             update_state(
                 session.state, session.settings, demo, logos, identities,
                 routes, flags, session.tracker, health, places,
                 persist_frame=False, cached_acquisition=cached_acquisition,
-                tracking_only=acquisition_kind in {"tracking", "tracking_cache"},
+                tracking_only=acquisition_kind in {"tracking", "tracking_cache", "automatic_tracking", "automatic_tracking_cache"},
                 cached_tracking_result=cached_tracking_result,
                 perform_tracking_lookup=acquisition_kind in {"tracking", "combined"},
+                automatic_tracking=automatic_target,
+                cached_automatic_tracking_result=cached_auto_tracking_result,
+                perform_automatic_tracking=acquisition_kind == "automatic_tracking",
             )
         except Exception as exc:
             with session.state.lock:
@@ -5991,6 +6271,8 @@ def visitor_refresh_loop(
                 session.state.payload["error"] = type(exc).__name__
         if acquisition_kind in {"tracking", "combined"} and cached_tracking_result is None:
             sessions.remember_tracking_result(session)
+        if acquisition_kind in {"automatic_tracking", "automatic_tracking_cache"}:
+            sessions.remember_automatic_tracking_result(session)
         if acquisition_kind in {"normal", "combined"} and cached_acquisition is None:
             sessions.remember_shared_result(session)
         with session.state.lock:
@@ -6840,16 +7122,21 @@ def main() -> int:
     snapshots = SnapshotStore()
     refresh_event = threading.Event()
     lease = ActiveMonitorLease()
-    sessions = VisitorSessionStore(settings, snapshots.root / "visitors")
+    try:
+        failure_log = configured_log(config_path)
+    except (OSError, ValueError, TypeError) as exc:
+        logging.getLogger(__name__).error("Route failure logging configuration invalid (%s)", type(exc).__name__)
+        failure_log = None
+    sessions = VisitorSessionStore(settings, snapshots.root / "visitors", route_failure_log=failure_log)
     # API health polling disabled
     threading.Thread(target=visitor_refresh_loop, args=(sessions, args.demo, logos, identities, routes, flags, health, places), daemon=True).start()
     tone_path = Path(__file__).resolve().with_name("beep-tone.mp3")
     server = ThreadingHTTPServer((args.host, args.port), handler_factory(state, settings, refresh_event, tone_path, config_path, routes, logos, tracker, snapshots, args.demo, lease, sessions))
     print(f"Over-Head monitor running at {url}"); print("UI revision: commentary-hide-radar-v91")
     if route_api_key:
-        print("Route data: FlightAware AeroAPI primary / adsb.im + ADSB.lol live-validated fallbacks")
+        print("Route data: FlightAware AeroAPI primary / ADSB.lol live-validated fallbacks")
     else:
-        print("Route data: adsb.im + ADSB.lol live-validated fallbacks (FlightAware key not configured)")
+        print("Route data: ADSB.lol live-validated fallbacks (FlightAware key not configured)")
         print("Set FLIGHTAWARE_AEROAPI_KEY or flightaware_api_key in config.json for schedule-aware primary resolution.")
     print("Double-click the display to enter browser full-screen mode.")
     if args.open_browser and not browser_opened:
@@ -6864,4 +7151,3 @@ def main() -> int:
 
 
 if __name__ == "__main__": raise SystemExit(main())
-
