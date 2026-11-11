@@ -18,6 +18,69 @@ class OverHeadTests(unittest.TestCase):
         self.assertEqual(plane["flight"].strip(), "BAW283")
         self.assertGreaterEqual(distance, 0)
 
+    def test_automatic_selection_requires_nearest_aircraft_inside_selected_radius(self):
+        settings = Settings(latitude=51.5, longitude=-0.1, radius_nm=5)
+
+        def aircraft_at(distance, hex_code, flight):
+            latitude, longitude = monitor.destination_point(
+                settings.latitude, settings.longitude, 90, distance,
+            )
+            return {
+                "hex": hex_code, "flight": flight, "lat": latitude, "lon": longitude,
+                "seen_pos": 1,
+            }
+
+        outside = aircraft_at(8.9, "outside", "SFY8DU")
+        nearer = aircraft_at(3.2, "nearer", "NEAR32")
+        farther_eligible = aircraft_at(4.4, "eligible", "NEAR44")
+        self.assertIsNone(monitor.select_nearest_within_radius(
+            [outside], settings, monitor.POSITION_FRESHNESS_SECONDS,
+        )[0])
+        selected, distance = monitor.select_nearest_within_radius(
+            [outside], Settings(latitude=51.5, longitude=-0.1, radius_nm=10),
+            monitor.POSITION_FRESHNESS_SECONDS,
+        )
+        self.assertEqual(selected["hex"], "outside")
+        self.assertAlmostEqual(distance, 8.9, delta=0.1)
+        selected, distance = monitor.select_nearest_within_radius(
+            [outside, farther_eligible, nearer], settings, monitor.POSITION_FRESHNESS_SECONDS,
+        )
+        self.assertEqual(selected["hex"], "nearer")
+        self.assertAlmostEqual(distance, 3.2, delta=0.1)
+        boundary = aircraft_at(5, "boundary", "EDGE5")
+        self.assertIsNone(monitor.select_nearest_within_radius(
+            [boundary], settings, monitor.POSITION_FRESHNESS_SECONDS,
+        )[0])
+
+    def test_automatic_selection_uses_each_visitors_radius_independently(self):
+        class EmptyStore:
+            def get(self, *_args):
+                return {}
+
+        nearby_settings = Settings(latitude=51.5, longitude=-0.1, radius_nm=5)
+        wider_settings = Settings(latitude=51.5, longitude=-0.1, radius_nm=10)
+        latitude, longitude = monitor.destination_point(51.5, -0.1, 90, 8.9)
+        observation = {
+            "hex": "aabb81", "flight": "SFY8DU", "lat": latitude, "lon": longitude,
+            "seen_pos": 0.1,
+        }
+        nearby_state, wider_state = FrameState(), FrameState()
+        with patch("monitor.fetch_aircraft", return_value=[observation]):
+            update_state(
+                nearby_state, nearby_settings, False, EmptyStore(), EmptyStore(),
+                persist_frame=False,
+            )
+            update_state(
+                wider_state, wider_settings, False, EmptyStore(), EmptyStore(),
+                persist_frame=False,
+            )
+
+        self.assertEqual(nearby_state.payload["mode"], "scanning")
+        self.assertEqual(nearby_state.payload["aircraft_id"], "")
+        self.assertFalse(nearby_state.payload["radar_contacts"])
+        self.assertEqual(wider_state.payload["aircraft_id"], "AABB81")
+        self.assertEqual(len(wider_state.payload["radar_contacts"]), 1)
+
     def test_selection_skips_malformed_rows_and_keeps_fresh_aircraft(self):
         valid = {"hex": "abc123", "lat": 51.51, "lon": -0.13, "seen_pos": 0.1}
         aircraft = [None, {"lat": 51.5, "lon": -0.1, "seen_pos": "unknown"},
@@ -207,6 +270,45 @@ class OverHeadTests(unittest.TestCase):
         self.assertEqual(len(state.metric_observations), 2)
         self.assertEqual(state.payload["metric_history"]["30"]["altitude"], 10000)
         self.assertEqual(state.payload["altitude"], 12000)
+
+    def test_automatic_target_update_cannot_restore_aircraft_outside_radar_range(self):
+        class EmptyStore:
+            def get(self, *_args):
+                return {}
+
+        settings = Settings(latitude=51.5, longitude=-0.1, radius_nm=5)
+
+        def aircraft_at(distance, hex_code, flight):
+            latitude, longitude = monitor.destination_point(
+                settings.latitude, settings.longitude, 90, distance,
+            )
+            return {
+                "hex": hex_code, "flight": flight, "lat": latitude, "lon": longitude,
+                "seen_pos": 0.1, "alt_baro": 20000,
+            }
+
+        target = aircraft_at(2, "tracked1", "SFY8DU")
+        next_nearest = aircraft_at(4, "next001", "NEAR40")
+        state = FrameState()
+        with patch("monitor.fetch_aircraft", return_value=[target, next_nearest]):
+            update_state(state, settings, False, EmptyStore(), EmptyStore(), persist_frame=False)
+        self.assertEqual(state.payload["aircraft_id"], "TRACKED1")
+        selected_id = state.payload["aircraft_id"]
+        future = state.last_enrichment_future
+        if future is not None:
+            future.result(timeout=5)
+
+        moved_target = aircraft_at(8.9, "tracked1", "SFY8DU")
+        with patch("monitor.fetch_tracked_aircraft", return_value=(moved_target, "SFY8DU")):
+            update_state(
+                state, settings, False, EmptyStore(), EmptyStore(), persist_frame=False,
+                tracking_only=True, automatic_tracking=(selected_id, ("hex:TRACKED1",)),
+                perform_automatic_tracking=True,
+            )
+        self.assertEqual(state.payload["aircraft_id"], "NEXT001")
+        self.assertEqual(state.payload["callsign"], "NEAR40")
+        self.assertLessEqual(state.payload["distance_nm"], settings.radius_nm)
+        self.assertNotEqual(state.payload["mode"], "tracking")
 
     def test_automatic_target_lookup_retains_provider_failure_outcome(self):
         class EmptyStore:
@@ -644,7 +746,6 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn(b'class="wall no-aircraft loading" id="wall"', PAGE)
         self.assertIn(b'id="idle-message">Looking out&hellip;</div>', PAGE)
         self.assertIn(b"scanning:'Scanning'", PAGE)
-        self.assertIn("if mode == \"live\" and plane is None:", Path(__file__).with_name("monitor.py").read_text(encoding="utf-8"))
         self.assertIn(b".wall.loading .information { visibility:hidden; }", PAGE)
         self.assertIn(b"byId('wall').classList.remove('loading');", PAGE)
 
@@ -890,8 +991,16 @@ class OverHeadTests(unittest.TestCase):
     def test_no_aircraft_uses_scanning_message_not_giant_hyphen(self):
         self.assertIn(b'id="idle-message">Looking out&hellip;</div>', PAGE)
         self.assertIn(b"scanning:'Scanning'", PAGE)
-        self.assertIn("if mode == \"live\" and plane is None:", Path(__file__).with_name("monitor.py").read_text(encoding="utf-8"))
         self.assertIn(b"if(!hasAircraft){ heading.textContent=''; return; }", PAGE)
+        class EmptyStore:
+            def get(self, *_args):
+                return {}
+
+        state = FrameState()
+        with patch("monitor.fetch_aircraft", return_value=[]):
+            update_state(state, Settings(), False, EmptyStore(), EmptyStore(), persist_frame=False)
+        self.assertEqual(state.payload["mode"], "scanning")
+        self.assertEqual(state.payload["aircraft_id"], "")
 
     def test_footer_credits_flightaware_conditionally_and_ourairports(self):
         self.assertIn(b'id="flightaware-credit" hidden', PAGE)
@@ -1331,6 +1440,7 @@ class OverHeadTests(unittest.TestCase):
                 self.assertEqual(route["commercial_flight"], "BAW5")
                 self.assertEqual(route["origin_latitude"], 51.47)
                 self.assertEqual(route["destination_longitude"], 139.7798)
+                self.assertEqual(store.cached_route(aircraft)["route"], "LHR to HND")
                 cached = store.get(aircraft)
                 self.assertEqual(cached["route"], "LHR to HND")
                 lookup.assert_called_once()
@@ -1340,7 +1450,7 @@ class OverHeadTests(unittest.TestCase):
                     return None
 
             settings = Settings(
-                latitude=51.5074, longitude=-0.1278, radius_nm=25,
+                latitude=latitude, longitude=longitude, radius_nm=25,
                 output_rgb=str(Path(temporary) / "frame.rgb"),
                 output_png=str(Path(temporary) / "frame.png"),
             )
@@ -1359,6 +1469,65 @@ class OverHeadTests(unittest.TestCase):
             self.assertEqual(state.payload["route"], "LHR to HND")
             self.assertEqual(state.payload["origin"], "LHR")
             self.assertEqual(state.payload["destination"], "HND")
+
+    def test_automatically_selected_aircraft_starts_route_lookup_without_tracking(self):
+        route_started = threading.Event()
+        identity_started = threading.Event()
+        finish_identity = threading.Event()
+
+        class EmptyStore:
+            def get(self, *_args):
+                return None
+
+        class Routes:
+            api_key = ""
+
+            def cached_route(self, _plane):
+                return {}
+
+            def get(self, _plane):
+                route_started.set()
+                return {
+                    "route": "EWR to LHR", "origin": "EWR", "destination": "LHR",
+                    "route_source": "ADSB.lol route + live validation",
+                }
+
+        class Identities:
+            def get(self, _plane):
+                identity_started.set()
+                if not finish_identity.wait(5):
+                    raise TimeoutError("identity fixture was not released")
+                return {}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = Settings(
+                latitude=51.5, longitude=-0.1, radius_nm=25,
+                output_rgb=str(Path(temporary) / "frame.rgb"),
+                output_png=str(Path(temporary) / "frame.png"),
+            )
+            state = FrameState()
+            plane = {
+                "hex": "406B82", "flight": "BAW49N", "r": "G-STBM",
+                "lat": 51.6, "lon": -0.2, "seen_pos": 0.1, "alt_baro": 28000,
+            }
+            try:
+                with patch("monitor.fetch_aircraft", return_value=[plane]):
+                    update_state(
+                        state, settings, False, EmptyStore(), Identities(),
+                        routes=Routes(), flags=EmptyStore(), persist_frame=False,
+                    )
+                    future = state.last_enrichment_future
+                    self.assertIsNotNone(future)
+                    self.assertTrue(route_started.wait(2), "Automatic selection did not start route lookup")
+                    self.assertTrue(identity_started.is_set())
+                    self.assertFalse(state.payload["tracking_active"])
+                    self.assertEqual(state.payload["route_resolution_status"], "pending")
+                    finish_identity.set()
+                    future.result(timeout=5)
+                self.assertEqual(state.payload["route"], "EWR to LHR")
+                self.assertEqual(state.payload["route_resolution_status"], "resolved")
+            finally:
+                finish_identity.set()
 
     def test_failed_free_route_lookup_retries_after_thirty_seconds(self):
         class Routes(FlightRouteStore):
@@ -1638,7 +1807,7 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn("def do_DELETE(self) -> None:", source)
         self.assertIn("restored_radius = tracker.stop()", source)
         self.assertIn("if tracking.get(\"active\") and not demo:", source)
-        self.assertIn("else:\n        plane, distance = select_nearest(aircraft, sample_settings, selection_position_age_limit)", source)
+        self.assertIn("plane, distance = select_nearest_within_radius(", source)
 
     def test_tracking_input_updates_without_status_refresh_overwriting_user_typing(self):
         self.assertIn(b"if(flightTrackingActive)input.value=flightTrackingQuery", PAGE)

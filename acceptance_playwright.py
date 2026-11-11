@@ -184,7 +184,7 @@ class BrowserAcceptanceTests(unittest.TestCase):
             monitor.handler_factory(
                 self.state, self.settings, self.refresh_event, Path(__file__).with_name("beep-tone.mp3"),
                 self.config, self.routes, self.logos, self.tracker, self.snapshots, False, self.lease,
-                self.sessions,
+                self.sessions, self.identities, self.flags,
             ),
         )
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
@@ -352,18 +352,30 @@ class BrowserAcceptanceTests(unittest.TestCase):
     def test_desktop_radar_ranges_units_reprojection_and_limits(self) -> None:
         page = self.new_page(1280, 800)
         self.wait_for_text(page, "#radar-range", lambda text: text == "25 NM")
+        session_cookie = next(cookie["value"] for cookie in page.context.cookies(self.base_url) if cookie["name"] == "overhead_session")
+        session = self.sessions.sessions[session_cookie]
+        with self.sessions.lock:
+            session.refresh_reasons.clear()
+            session.last_fetch_at = time.monotonic()
+            self.sessions.next_acquisition_at = time.monotonic() + 60
         requests_before = self.provider.count()
         contact = page.locator("#radar-contacts .contact").first
         position_before = contact.get_attribute("transform")
 
         page.locator("#zoom-out").click()
         self.wait_for_text(page, "#radar-range", lambda text: text == "30 NM")
+        page.wait_for_function(
+            "(previous) => document.querySelector('#radar-contacts .contact')?.getAttribute('transform') !== previous",
+            arg=position_before,
+        )
         position_after = page.locator("#radar-contacts .contact").first.get_attribute("transform")
         self.assertNotEqual(position_before, position_after)
         for _ in range(4):
             page.locator("#zoom-out").click()
         self.wait_for_text(page, "#radar-range", lambda text: text == "50 NM")
         self.assertEqual(self.provider.count(), requests_before)
+        self.assertGreaterEqual(session.settings.query_radius_nm, 50)
+        self.assertIn("radar_range", session.refresh_reasons)
 
         page.locator("#settings-toggle").click()
         distance = page.locator("#settings-distance-unit")
@@ -395,6 +407,132 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.wait_for_text(page, "#radar-range", lambda text: text == "100 NM")
         self.assertEqual(self.page_errors, [])
         self.assertEqual(self.external_requests, [])
+
+    def test_radar_range_immediately_reselects_nearest_eligible_aircraft(self) -> None:
+        page = self.new_page(1280, 800)
+        settings = self.settings
+        current_observations = []
+        monitor.fetch_aircraft.side_effect = lambda *_args, **_kwargs: list(current_observations)
+
+        def aircraft_at(distance, hex_code, flight):
+            latitude, longitude = monitor.destination_point(
+                settings.latitude, settings.longitude, 90, distance,
+            )
+            return {
+                "hex": hex_code, "flight": flight, "r": hex_code.upper(),
+                "lat": latitude, "lon": longitude, "seen_pos": 0.1, "alt_baro": 20000,
+            }
+
+        def set_observations(*planes):
+            current_observations[:] = planes
+            with self.state.lock:
+                self.state.last_live_aircraft = list(planes)
+                self.state.last_live_aircraft_received_at = time.monotonic()
+                self.state.last_live_aircraft_query_radius_nm = 100
+
+        def reproject_range(radius):
+            return page.evaluate("""radius => fetch('/radar-range?radius='+radius, {cache:'no-store'})
+              .then(response => response.json())""", radius)
+
+        def wait_for_aircraft(hex_code):
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline:
+                with self.state.lock:
+                    if self.state.payload.get("aircraft_id") == hex_code:
+                        return
+                time.sleep(0.025)
+            self.fail(f"Expected selected aircraft {hex_code}, got {self.state.payload.get('aircraft_id')!r}")
+
+        def wait_for_none(allowed_modes=("scanning",)):
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline:
+                with self.state.lock:
+                    if not self.state.payload.get("aircraft_id"):
+                        self.assertIn(self.state.payload["mode"], allowed_modes)
+                        self.assertEqual(self.state.payload["radar_contacts"], [])
+                        return
+                time.sleep(0.025)
+            self.fail(f"Out-of-range aircraft remained selected: {self.state.payload.get('aircraft_id')!r}")
+
+        outside = aircraft_at(8.9, "aabb81", "SFY8DU")
+        set_observations(outside)
+        for expected in ("20 NM", "15 NM", "10 NM"):
+            page.locator("#zoom-in").click()
+            self.wait_for_text(page, "#radar-range", lambda text, expected=expected: text == expected)
+        wait_for_aircraft("AABB81")
+        self.assertEqual(self.state.payload["callsign"], "SFY8DU")
+
+        page.locator("#zoom-in").click()
+        self.wait_for_text(page, "#radar-range", lambda text: text == "5 NM")
+        wait_for_none()
+
+        nearer = aircraft_at(3.2, "aabb82", "NEAR32")
+        farther = aircraft_at(4.4, "aabb83", "NEAR44")
+        set_observations(outside, farther, nearer)
+        reproject_range(5)
+        wait_for_aircraft("AABB82")
+        self.assertLessEqual(self.state.payload["distance_nm"], 5)
+
+        moved_outside = aircraft_at(6.2, "aabb82", "NEAR32")
+        set_observations(moved_outside, farther, outside)
+        reproject_range(5)
+        wait_for_aircraft("AABB83")
+        self.assertEqual(self.state.payload["callsign"], "NEAR44")
+        self.assertLessEqual(self.state.payload["distance_nm"], 5)
+
+        set_observations(outside)
+        reproject_range(5)
+        wait_for_none()
+
+        set_observations(moved_outside, outside)
+        reproject_range(10)
+        wait_for_aircraft("AABB82")
+        self.assertAlmostEqual(self.state.payload["distance_nm"], 6.2, delta=0.1)
+
+        response = page.evaluate("""async () => {
+          const response=await fetch('/location',{method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({latitude:40,longitude:-75})});
+          return response.json();
+        }""")
+        self.assertTrue(response["saved"])
+        wait_for_none(("starting", "scanning"))
+        relocated = aircraft_at(3, "aabb84", "NEAR30")
+        set_observations(relocated)
+        reproject_range(5)
+        wait_for_aircraft("AABB84")
+        self.assertEqual(self.page_errors, [])
+        self.assertEqual(self.external_requests, [])
+
+    def test_automatic_route_resolution_displays_pending_then_unresolved(self) -> None:
+        page = self.new_page(1280, 800)
+        previous_future = self.state.last_enrichment_future
+        if previous_future is not None:
+            previous_future.result(timeout=5)
+        route_started = threading.Event()
+        finish_route = threading.Event()
+        original_get = self.routes.get
+
+        def delayed_route(_plane):
+            route_started.set()
+            if not finish_route.wait(5):
+                raise TimeoutError("route fixture was not released")
+            return {}
+
+        self.routes.get = delayed_route
+        try:
+            self.update_now()
+            future = self.state.last_enrichment_future
+            self.assertIsNotNone(future)
+            self.assertTrue(route_started.wait(2), "Automatic aircraft selection did not start route lookup")
+            self.assertFalse(self.state.payload["tracking_active"])
+            self.wait_for_text(page, "#callsign", lambda text: text == "Resolving route…")
+            finish_route.set()
+            future.result(timeout=5)
+            self.wait_for_text(page, "#callsign", lambda text: text == "N/A to N/A")
+            self.assertEqual(self.state.payload["route_resolution_status"], "unresolved")
+        finally:
+            finish_route.set()
+            self.routes.get = original_get
 
     def test_layout_and_controls_across_five_viewports(self) -> None:
         viewports = (
@@ -465,6 +603,20 @@ class BrowserAcceptanceTests(unittest.TestCase):
                 time.sleep(0.025)
             self.fail("Timed out waiting for the local photo fixture state")
 
+        def assert_photo_layout(page: Page) -> None:
+            photo_layout = page.locator("#aircraft-photo").evaluate("""image => {
+              const imageBox=image.getBoundingClientRect();
+              const mapBox=document.querySelector('#route-map').getBoundingClientRect();
+              return {imageX:imageBox.x,imageRight:imageBox.right,mapX:mapBox.x,mapRight:mapBox.right,
+                mapWidth:mapBox.width,mask:getComputedStyle(image).maskImage,
+                objectFit:getComputedStyle(image).objectFit};
+            }""")
+            self.assertGreaterEqual(photo_layout["imageX"], photo_layout["mapX"] + photo_layout["mapWidth"] * 0.2)
+            self.assertLessEqual(photo_layout["imageRight"], photo_layout["mapRight"] + 1)
+            self.assertNotEqual(photo_layout["mask"], "none")
+            self.assertEqual(photo_layout["objectFit"], "contain")
+            self.assertTrue(page.locator(".aircraft-photo-credit").is_visible())
+
         for label, width, height in (("desktop", 1366, 768), ("tablet", 768, 1024), ("mobile", 390, 844)):
             with self.subTest(viewport=label):
                 screenshot_dir = self.ARTIFACT_ROOT / label
@@ -487,9 +639,10 @@ class BrowserAcceptanceTests(unittest.TestCase):
                     page.clock.fast_forward(1)
                     self.assertFalse(page.locator("#route-photo-panel").is_hidden())
                     photo_size = page.locator("#aircraft-photo").evaluate("image => ({width:image.getBoundingClientRect().width,height:image.getBoundingClientRect().height,naturalWidth:image.naturalWidth,naturalHeight:image.naturalHeight,objectFit:getComputedStyle(image).objectFit})")
-                    self.assertEqual(photo_size["width"], map_width)
+                    self.assertLess(photo_size["width"], map_width)
                     self.assertEqual(photo_size["objectFit"], "contain")
                     self.assertEqual(photo_size["naturalWidth"] / photo_size["naturalHeight"], 2)
+                    assert_photo_layout(page)
                     page.screenshot(path=str(screenshot_dir / "route-photo.png"), full_page=False)
                     page.clock.fast_forward(10000)
                     self.assertTrue(page.locator("#route-photo-panel").is_hidden())
@@ -509,6 +662,7 @@ class BrowserAcceptanceTests(unittest.TestCase):
                 else:
                     page.clock.fast_forward(10000)
                     self.assertFalse(page.locator("#route-photo-panel").is_hidden())
+                    assert_photo_layout(page)
                     page.screenshot(path=str(screenshot_dir / "route-photo.png"), full_page=False)
 
                 self.assertEqual(page.evaluate("window.__overheadMaps.length"), map_instances)

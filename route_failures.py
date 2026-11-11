@@ -196,6 +196,11 @@ class RouteFailureLog:
                     """, (key, lookup_id, stamp, bool(classification), json.dumps({
                         "original_callsign": callsign, "alternative_callsign": alternative,
                         "fallback_attempted": fallback, "fallback_succeeded": fallback_success,
+                        "resolution_elapsed_seconds": (
+                            max(0.0, float(debug["elapsed_seconds"]))
+                            if isinstance(debug.get("elapsed_seconds"), (int, float))
+                            and math.isfinite(float(debug["elapsed_seconds"])) else None
+                        ),
                         "origin": origin, "destination": destination,
                         "classification": classification, "decision": self._text(debug.get("decision")),
                         "attempts": attempts,

@@ -28,6 +28,7 @@ class RouteFailureLogTests(unittest.TestCase):
             "original_callsign": "AMX008",
             "alternative_callsign": alternative,
             "decision": "No trustworthy route",
+            "elapsed_seconds": 0.842,
             "attempts": attempts or [
                 {"source": "ADSB.lol route", "callsign": "AMX008", "requested": True,
                  "request_count": 1, "http_status": 200, "accepted": False,
@@ -64,6 +65,7 @@ class RouteFailureLogTests(unittest.TestCase):
         self.assertEqual(record["fallback_attempts"], 1)
         self.assertEqual(record["fallback_successes"], 0)
         self.assertEqual(record["history"][0]["attempts"][1]["http_status"], 200)
+        self.assertEqual(record["history"][0]["resolution_elapsed_seconds"], 0.842)
         self.assertEqual(record["history"][0]["attempts"][1]["airports"]["returned"][0],
                          {"iata": "LHR", "icao": "EGLL"})
         serialized = json.dumps(record)

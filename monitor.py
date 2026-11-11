@@ -272,9 +272,17 @@ def aircraft_within_radius(aircraft: list[dict[str, Any]], settings, radius_nm: 
             latitude, longitude = validate_location(plane.get("lat"), plane.get("lon"))
         except ValueError:
             continue
-        if haversine_nm(settings.latitude, settings.longitude, latitude, longitude) <= radius:
+        distance = haversine_nm(settings.latitude, settings.longitude, latitude, longitude)
+        if distance < radius and not math.isclose(distance, radius, rel_tol=0.0, abs_tol=1e-9):
             filtered.append(plane)
     return filtered
+
+
+def select_nearest_within_radius(
+    aircraft: list[dict[str, Any]], settings, max_position_age_seconds: float,
+) -> tuple[dict[str, Any] | None, float | None]:
+    eligible = aircraft_within_radius(aircraft, settings, settings.radius_nm)
+    return select_nearest(eligible, settings, max_position_age_seconds)
 
 
 def remove_position_data(plane: dict[str, Any]) -> dict[str, Any]:
@@ -467,7 +475,7 @@ def radar_contacts(aircraft: list[dict[str, Any]], settings, selected: dict[str,
     latitude_scale = 60.0405
     longitude_scale = latitude_scale * math.cos(math.radians(settings.latitude))
     contacts: list[dict[str, Any]] = []
-    for plane in aircraft:
+    for plane in aircraft_within_radius(aircraft, settings, settings.radius_nm):
         if not isinstance(plane, dict):
             continue
         lat, lon = plane.get("lat"), plane.get("lon")
@@ -484,8 +492,6 @@ def radar_contacts(aircraft: list[dict[str, Any]], settings, selected: dict[str,
         east = (longitude - settings.longitude) * longitude_scale
         north = (latitude - settings.latitude) * latitude_scale
         distance = math.hypot(east, north)
-        if distance > settings.radius_nm:
-            continue
         flight = str(plane.get("flight") or "").strip()
         callsign = flight or str(plane.get("r") or plane.get("hex") or "").strip()
         hex_code = normalise_adsb_hex(plane.get("hex"))
@@ -1619,6 +1625,9 @@ class FlightRouteStore:
         temporary.replace(self.cache_path)
 
     def _set_debug(self, debug: dict[str, Any]) -> None:
+        started_at = debug.pop("_started_at", None)
+        if started_at is not None:
+            debug["elapsed_seconds"] = round(max(0.0, time.monotonic() - started_at), 3)
         for attempt in debug.get("attempts", []):
             if attempt.get("source") == "FlightAware AeroAPI" and attempt.get("requested"):
                 attempt["requests"] = getattr(self._lookup_local, "aeroapi_requests", [])
@@ -1633,6 +1642,52 @@ class FlightRouteStore:
     def debug_snapshot(self) -> dict[str, Any]:
         with self._lock:
             return json.loads(json.dumps(self._debug, default=str))
+
+    def cached_route(self, plane: dict[str, Any] | None) -> dict[str, Any]:
+        callsign = self.callsign(plane)
+        debug: dict[str, Any] = {
+            "callsign": callsign,
+            "original_callsign": callsign,
+            "alternative_callsign": self._alternative_callsign(callsign),
+            "registration": self.registration(plane),
+            "attempts": [],
+            "_started_at": time.monotonic(),
+        }
+        if not callsign:
+            debug["decision"] = "No usable ATC callsign"
+            self._set_debug(debug)
+            return {}
+        key = self._cache_key(plane)
+        with self._lock:
+            cached = self._records.get(key)
+            if not isinstance(cached, dict) or not cached.get("origin") or not cached.get("destination"):
+                return {}
+            plausible, detail = self._plausibility(cached, plane)
+            age = time.time() - float(cached.get("cached_at", 0))
+            debug["attempts"].append({
+                "source": "cache",
+                "callsign": callsign,
+                "airport_information_returned": True,
+                "geographical_validation_passed": plausible,
+                "route": cached.get("route"),
+                "route_source": cached.get("route_source"),
+                "age_seconds": round(age, 1),
+                "accepted": age < self.ttl_seconds and plausible,
+                "validation": detail,
+            })
+            if age >= self.ttl_seconds or not plausible:
+                debug["decision"] = "Cached route is expired or geographically implausible"
+                self._set_debug(debug)
+                return {}
+            route = dict(cached)
+        route["route"] = f"{route['origin']} to {route['destination']}"
+        if not route.get("origin_name"):
+            route["origin_name"] = str(self.airports.get(route["origin"]).get("name") or "").strip()
+        if not route.get("destination_name"):
+            route["destination_name"] = str(self.airports.get(route["destination"]).get("name") or "").strip()
+        debug["decision"] = f"Accepted cached {route.get('route_source', 'route')}"
+        self._set_debug(debug)
+        return route
 
     def get(self, plane: dict[str, Any] | None) -> dict[str, Any]:
         self._lookup_local.request_count = 0
@@ -1649,6 +1704,7 @@ class FlightRouteStore:
             "position": {"latitude": position[0], "longitude": position[1]} if position else None,
             "flightaware_configured": bool(self.api_key),
             "attempts": [],
+            "_started_at": time.monotonic(),
         }
         if not callsign:
             debug["decision"] = "No usable ATC callsign"
@@ -1996,6 +2052,7 @@ PAGE = b"""<!doctype html>
     .callsign { overflow:visible; color:var(--white); font-size:clamp(64px,10.5vw,198px); font-weight:800; letter-spacing:-.065em; line-height:.88; white-space:nowrap; display:flex; align-items:center; gap:.12em; }
     .callsign.route-known { font-size:clamp(64px,7.2vw,138px); }
     .callsign.route-unknown { color:var(--muted); font-weight:400; letter-spacing:0; }
+    .callsign.route-resolving { max-width:100%; overflow:hidden; color:var(--muted); font-size:clamp(26px,4vw,70px); font-weight:650; letter-spacing:.015em; text-overflow:ellipsis; }
     .route-airport { width:1.32em; height:.88em; flex:0 0 1.32em; min-width:1.32em; min-height:.88em; max-width:1.32em; max-height:.88em; overflow:visible; filter:drop-shadow(0 0 8px rgba(108,154,172,.16)); }
     .route-airport-outline { fill:none; stroke:#6c9aac; stroke-width:2.1; stroke-linejoin:round; paint-order:stroke; vector-effect:non-scaling-stroke; }
     .route-join { color:var(--muted); font-size:.45em; font-weight:650; letter-spacing:0; }
@@ -2021,9 +2078,9 @@ PAGE = b"""<!doctype html>
     .route-map .leaflet-tooltip.route-label::before { display:none; }
     .route-map.photo-active { background:#02050a; }
     .route-map.photo-active > :not(.route-photo-panel),.route-map.photo-active::before,.route-map.photo-active::after { visibility:hidden; }
-    .route-photo-panel { position:absolute; inset:0; z-index:900; overflow:hidden; background:#02050a; pointer-events:none; }
+    .route-photo-panel { position:absolute; inset:0; z-index:900; overflow:hidden; background:transparent; pointer-events:none; }
     .route-photo-panel[hidden] { display:none; }
-    .route-photo-panel img { position:absolute; inset:0; display:block; width:100%; height:100%; object-fit:contain; object-position:center; filter:saturate(1.06) brightness(1.03) contrast(1.03); }
+    .route-photo-panel img { position:absolute; top:38%; right:0; display:block; width:44%; height:62%; object-fit:contain; object-position:right center; filter:saturate(1.06) brightness(1.03) contrast(1.03); mask-image:linear-gradient(to right,transparent 0%,#000 24%,#000 82%,transparent 100%),linear-gradient(to bottom,transparent 0%,#000 24%,#000 76%,transparent 100%); mask-composite:intersect; }
     .aircraft-photo-credit { position:absolute; right:8px; bottom:8px; z-index:2; padding:.36em .55em; border-radius:5px; background:rgba(2,5,10,.62); color:rgba(232,246,255,.90); font:700 clamp(6px,.48vw,8px)/1.1 "Segoe UI",sans-serif; letter-spacing:.07em; }
     .route-direction-flow { pointer-events:none; animation:route-flow 10s linear infinite; filter:drop-shadow(0 0 4px rgba(232,246,255,.95)) drop-shadow(0 0 8px rgba(20,236,255,.7)); }
     .snapshot-render .route-direction-flow { animation:none; }
@@ -3143,10 +3200,11 @@ PAGE = b"""<!doctype html>
             else if(img.complete&&img.naturalWidth)img.onload();
     }
     function renderHeading(d,hasAircraft){
-      const heading=byId('callsign'); heading.replaceChildren(); const routeKnown=Boolean(d.route); heading.classList.toggle('route-known',hasAircraft&&routeKnown); heading.classList.toggle('route-unknown',hasAircraft&&!routeKnown);
-      byId('wall').classList.toggle('route-unavailable',hasAircraft&&!routeKnown);
+      const heading=byId('callsign'); heading.replaceChildren(); const routeKnown=Boolean(d.route),routePending=hasAircraft&&!routeKnown&&d.route_resolution_status==='pending'; heading.classList.toggle('route-known',hasAircraft&&routeKnown); heading.classList.toggle('route-unknown',hasAircraft&&!routeKnown); heading.classList.toggle('route-resolving',routePending);
+      byId('wall').classList.toggle('route-unavailable',hasAircraft&&!routeKnown&&!routePending);
       renderDestinationSummary(d,hasAircraft);
       if(!hasAircraft){ heading.textContent=''; return; }
+      if(routePending){ heading.textContent='Resolving route'+String.fromCodePoint(0x2026); return; }
       if(!routeKnown){ heading.textContent='N/A to N/A'; return; }
       const airport=(side,code,country,available,revision)=>{
         const svg=document.createElementNS(svgNS,'svg'); svg.setAttribute('class','route-airport'); svg.setAttribute('viewBox','0 0 150 100'); svg.setAttribute('role','img'); svg.setAttribute('aria-label',String(code||''));
@@ -5302,13 +5360,18 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
         elif tracking_only and plane is None:
             mode = {"rate_limited": "rate_limited", "provider_unavailable": "provider_unavailable", "stale": "position_unavailable"}.get(tracking_outcome, "scanning")
     else:
-        plane, distance = select_nearest(aircraft, sample_settings, selection_position_age_limit)
+        plane, distance = select_nearest_within_radius(
+            aircraft, sample_settings, selection_position_age_limit,
+        )
         tracking = {**tracking, "found": False}
         reported_position_observed_at = (
             aircraft_position_observed_at(plane, local_position_received_at)
             if plane is not None and local_position_received_at is not None else None
         )
-        if automatic_tracking and plane and aircraft_identity(plane) == automatic_tracking[0]:
+        acquisition_position_received_at = local_position_received_at
+        if automatic_tracking and (
+            perform_automatic_tracking or cached_automatic_tracking_result is not None
+        ):
             automatic_result = cached_automatic_tracking_result
             automatic_result_is_new = False
             if automatic_result is None and perform_automatic_tracking:
@@ -5346,14 +5409,25 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
             if automatic_result_is_new:
                 automatic_result_to_remember = automatic_result
             if tracked_plane and observed_at is not None and received_at is not None:
-                plane = age_aircraft_positions([tracked_plane], max(0.0, time.monotonic() - float(received_at)))[0]
-                distance = tracking_distance_nm(plane, sample_settings)
-                aircraft = merge_tracked_aircraft(aircraft, plane)
-                reported_position_observed_at = float(observed_at)
-                local_position_received_at = float(received_at)
-                mode = "live"
+                tracked_plane = age_aircraft_positions(
+                    [tracked_plane], max(0.0, time.monotonic() - float(received_at)),
+                )[0]
+                aircraft = merge_tracked_aircraft(aircraft, tracked_plane)
+                plane, distance = select_nearest_within_radius(
+                    aircraft, sample_settings, selection_position_age_limit,
+                )
+                if plane is not None and aircraft_identity(plane) == automatic_tracking[0]:
+                    reported_position_observed_at = float(observed_at)
+                    local_position_received_at = float(received_at)
+                else:
+                    reported_position_observed_at = (
+                        aircraft_position_observed_at(plane, acquisition_position_received_at)
+                        if plane is not None and acquisition_position_received_at is not None else None
+                    )
+                    local_position_received_at = acquisition_position_received_at
+                mode = "live" if plane is not None else "scanning"
 
-    if mode == "live" and plane is None:
+    if mode in {"live", "cached"} and plane is None and not tracking.get("active"):
         mode = "scanning"
 
     if tracker and int(tracker.snapshot().get("revision") or 0) != tracking_revision:
@@ -5370,6 +5444,10 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
             mode == "live" and local_position_received_at is not None
             and reported_position_observed_at is not None
         )
+    cached_route = (
+        routes.cached_route(plane)
+        if routes is not None and plane is not None and hasattr(routes, "cached_route") else {}
+    )
     image = render(plane, distance, mode)
     with state.location_lock:
         with state.lock:
@@ -5383,13 +5461,17 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
             save_frame(image, sample_settings)
         state.update(
             image, mode, plane, distance, aircraft, sample_settings,
-            None, {}, {}, None, None,
+            None, {}, cached_route, None, None,
             bool(routes and routes.api_key), tracking, health.snapshot() if health else None, position_observed_at, {},
             expected_location_revision=location_revision,
             reported_position_observed_at=reported_position_observed_at,
             new_position_observation=new_position_observation,
             preserve_radar_radius=not bool(tracking.get("active")),
         )
+        with state.lock:
+            state.payload["route_resolution_status"] = (
+                "resolved" if cached_route else "pending" if routes is not None and plane is not None else "unavailable"
+            )
         if automatic_result_to_remember is not None:
             with state.lock:
                 state.last_automatic_tracking_result = automatic_result_to_remember
@@ -5398,10 +5480,12 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
 
     def enrich_and_publish() -> None:
         try:
-            identity = identities.get(plane) or {}
-            aircraft_photo = identities.photo_asset(identity, plane) if hasattr(identities, "photo_asset") else None
-            aircraft_photo_debug = identities.photo_debug(identity, plane) if hasattr(identities, "photo_debug") else {}
-            route = (routes.get(plane) or {}) if routes is not None else {}
+            route_started_at = time.monotonic()
+            route = cached_route or ((routes.get(plane) or {}) if routes is not None else {})
+            route_elapsed = max(0.0, time.monotonic() - route_started_at)
+            identity = identities.get(plane) or {} if identities is not None else {}
+            aircraft_photo = identities.photo_asset(identity, plane) if identities is not None and hasattr(identities, "photo_asset") else None
+            aircraft_photo_debug = identities.photo_debug(identity, plane) if identities is not None and hasattr(identities, "photo_debug") else {}
             origin_flag = flags.get(route.get("origin_country", "")) if flags else None
             destination_flag = flags.get(route.get("destination_country", "")) if flags else None
             code = identity.get("operator_code") or operator_code(plane)
@@ -5437,13 +5521,17 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
                     new_position_observation=False,
                     preserve_radar_radius=not bool(tracking.get("active")),
                 )
+                with state.lock:
+                    state.payload["route_resolution_status"] = "resolved" if route else "unresolved"
                 if state.route_failure_log is not None:
                     debug = routes._current_lookup_debug() if isinstance(routes, FlightRouteStore) else {}
+                    debug.setdefault("elapsed_seconds", round(route_elapsed, 3))
                     state.route_failure_log.observe(plane, route, debug)
         except Exception:
             with state.lock:
                 if state.location_revision == location_revision and state.payload.get("aircraft_id") == aircraft_identity(plane):
                     state.payload["enrichment_status"] = "unavailable"
+                    state.payload["route_resolution_status"] = "unresolved"
 
     try:
         future = _enrichment_executor.submit(enrich_and_publish)
@@ -6522,7 +6610,7 @@ def overhead_logo_asset(base_dir: Path) -> tuple[bytes, str] | None:
     return None
 
 
-def handler_factory(state: FrameState, settings, refresh_event: threading.Event, tone_path: Path, config_path: Path, routes: FlightRouteStore, logos: LogoStore, tracker: FlightTrackingState, snapshots: SnapshotStore, demo: bool = False, lease: ActiveMonitorLease | None = None, sessions: VisitorSessionStore | None = None):
+def handler_factory(state: FrameState, settings, refresh_event: threading.Event, tone_path: Path, config_path: Path, routes: FlightRouteStore, logos: LogoStore, tracker: FlightTrackingState, snapshots: SnapshotStore, demo: bool = False, lease: ActiveMonitorLease | None = None, sessions: VisitorSessionStore | None = None, identities: AircraftIdentityStore | None = None, flags: FlagStore | None = None, health: APIHealthMonitor | None = None, places: NearbyPlaceStore | None = None):
     asset_dir = Path(__file__).resolve().parent
     visitor_get_paths = {
         "/frame.png", "/status", "/snapshots", "/snapshot-state", "/snapshot-image",
@@ -6826,15 +6914,24 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                         self.send(HTTPStatus.CONFLICT, "application/json", b'{"error":"Radar range is automatic while flight tracking is active"}', cache=False)
                         return
                     with state.lock:
+                        previous_radius = settings.radius_nm
+                        observation_radius = state.last_live_aircraft_query_radius_nm
                         settings.radius_nm = float(radius)
+                        settings.query_radius_nm = max(
+                            float(settings.query_radius_nm or 0.0), float(radius),
+                        )
                         tracker.set_manual_radius(float(radius))
                         state.payload["radar_radius_nm"] = radius
-                        # Reproject cached positions immediately. The upstream feed may
-                        # be scheduled for five minutes, but radar zoom is local state.
-                        selected_hex = str(state.payload.get("aircraft_id") or "")
-                        selected = {"hex": selected_hex} if selected_hex else None
-                        state.payload["radar_contacts"] = radar_contacts(state.last_live_aircraft, settings, selected)
-                        contacts = state.payload["radar_contacts"]
+                    update_state(
+                        state, settings, demo, logos, identities, routes, flags, tracker,
+                        health, places, persist_frame=False, tracking_only=True,
+                    )
+                    if radius > previous_radius and (
+                        observation_radius is None or radius > observation_radius
+                    ):
+                        self.request_refresh(session, "radar_range")
+                    with state.lock:
+                        contacts = list(state.payload.get("radar_contacts") or [])
                     self.send(HTTPStatus.OK, "application/json", json.dumps({"radius_nm": radius, "radar_contacts": contacts}).encode(), cache=False)
             else: self.send(HTTPStatus.NOT_FOUND, "text/plain", b"Not found")
 
@@ -7131,7 +7228,10 @@ def main() -> int:
     # API health polling disabled
     threading.Thread(target=visitor_refresh_loop, args=(sessions, args.demo, logos, identities, routes, flags, health, places), daemon=True).start()
     tone_path = Path(__file__).resolve().with_name("beep-tone.mp3")
-    server = ThreadingHTTPServer((args.host, args.port), handler_factory(state, settings, refresh_event, tone_path, config_path, routes, logos, tracker, snapshots, args.demo, lease, sessions))
+    server = ThreadingHTTPServer((args.host, args.port), handler_factory(
+        state, settings, refresh_event, tone_path, config_path, routes, logos, tracker,
+        snapshots, args.demo, lease, sessions, identities, flags, health, places,
+    ))
     print(f"Over-Head monitor running at {url}"); print("UI revision: commentary-hide-radar-v91")
     if route_api_key:
         print("Route data: FlightAware AeroAPI primary / ADSB.lol live-validated fallbacks")
