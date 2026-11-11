@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from monitor import FlightRouteStore, FrameState, flight_details
+from monitor import ROUTE_FAILURE_RETRY_SECONDS, FlightRouteStore, FrameState, flight_details
 from overhead import Settings
 
 
@@ -79,6 +79,24 @@ class FlightRouteRegressionTests(unittest.TestCase):
         self.assertTrue(attempt["geographical_validation_passed"])
         self.assertTrue(attempt["accepted"])
         self.assertIn("Accepted ADSB.lol route", debug["decision"])
+
+    def test_unknown_route_negative_cache_suppresses_duplicate_requests_then_expires(self):
+        aircraft = copy.deepcopy(self.plane)
+        aircraft["flight"] = "OAT26"
+        aircraft["hex"] = "408435"
+        self.assertEqual(self.store.get(aircraft), {})
+        self.assertEqual(len(self.requests), 2)
+
+        self.requests.clear()
+        self.assertEqual(self.store.get(aircraft), {})
+        self.assertEqual(self.requests, [])
+        self.assertIn("waiting before retry", self.store.debug_snapshot()["decision"])
+
+        key = self.store._cache_key(aircraft)
+        self.store._failures[key] -= ROUTE_FAILURE_RETRY_SECONDS
+        self.assertEqual(self.store.get(aircraft), {})
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(ROUTE_FAILURE_RETRY_SECONDS, 300)
 
     def test_success_is_persisted_under_original_identity_and_reused(self):
         route = self.store.get(self.plane)
@@ -183,7 +201,7 @@ class FlightRouteRegressionTests(unittest.TestCase):
         with patch("monitor.time.time", return_value=1031):
             self.assertEqual(self.store.get(self.plane), {})
         self.assertEqual(self.network.call_count, 1)
-        with patch("monitor.time.time", return_value=1121):
+        with patch("monitor.time.time", return_value=1301):
             self.assertEqual(self.store.get(self.plane)["route"], "LHR to MEX")
 
     def test_failed_identity_cooldown_covers_original_and_alternative(self):

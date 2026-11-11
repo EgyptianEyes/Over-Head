@@ -500,6 +500,18 @@ class BrowserAcceptanceTests(unittest.TestCase):
         set_observations(relocated)
         reproject_range(5)
         wait_for_aircraft("AABB84")
+
+        with self.state.lock:
+            self.state.position_observed_at_monotonic = time.monotonic() - monitor.POSITION_FRESHNESS_SECONDS - 1
+        stale_status = page.evaluate("""async () => {
+          const response=await fetch('/status?active=1',{cache:'no-store'});
+          return response.json();
+        }""")
+        self.assertEqual(stale_status["aircraft_id"], "")
+        self.assertEqual(stale_status["mode"], "scanning")
+        self.assertEqual(stale_status["position_state"], "unavailable")
+        page.evaluate("update()")
+        self.wait_for_class(page, "#wall", "no-aircraft")
         self.assertEqual(self.page_errors, [])
         self.assertEqual(self.external_requests, [])
 
@@ -525,10 +537,12 @@ class BrowserAcceptanceTests(unittest.TestCase):
             self.assertIsNotNone(future)
             self.assertTrue(route_started.wait(2), "Automatic aircraft selection did not start route lookup")
             self.assertFalse(self.state.payload["tracking_active"])
-            self.wait_for_text(page, "#callsign", lambda text: text == "Resolving route…")
+            self.wait_for_text(page, "#route-lookup-status", lambda text: text == "Looking up route…")
+            self.assertEqual(page.locator("#callsign").text_content(), "")
             finish_route.set()
             future.result(timeout=5)
             self.wait_for_text(page, "#callsign", lambda text: text == "N/A to N/A")
+            self.assertTrue(page.locator("#route-lookup-status").is_hidden())
             self.assertEqual(self.state.payload["route_resolution_status"], "unresolved")
         finally:
             finish_route.set()
@@ -549,7 +563,7 @@ class BrowserAcceptanceTests(unittest.TestCase):
                 screenshot_dir.mkdir(parents=True, exist_ok=True)
                 page.screenshot(path=str(screenshot_dir / "initial.png"), full_page=False)
                 self.assertEqual(page.locator("header").evaluate("element => getComputedStyle(element).zIndex"), "1000")
-                self.assertEqual(page.locator("#brand-logo").evaluate("element => getComputedStyle(element).transform"), "matrix(1, 0, 0, 1, 0, 10)")
+                self.assertEqual(page.locator("#brand-logo").evaluate("element => getComputedStyle(element).transform"), "matrix(1, 0, 0, 1, 0, 0)")
                 for selector in ("#sound-toggle", "#radar-toggle", "#camera-toggle", "#snapshots-toggle", "#fullscreen-toggle", "#settings-toggle"):
                     button = page.locator(selector)
                     if button.is_visible():

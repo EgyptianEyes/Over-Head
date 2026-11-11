@@ -82,7 +82,7 @@ ADSLOL_CALLSIGN_URL = "https://api.adsb.lol/v2/callsign/{callsign}"
 ADSLOL_HEX_URL = "https://api.adsb.lol/v2/hex/{hex_code}"
 OURAIRPORTS_URL = "https://davidmegginson.github.io/ourairports-data/airports.csv"
 ROUTE_CACHE_TTL_SECONDS = 900
-ROUTE_FAILURE_RETRY_SECONDS = 30
+ROUTE_FAILURE_RETRY_SECONDS = 300
 OURAIRPORTS_TTL_SECONDS = 7 * 24 * 60 * 60
 API_HEALTH_INTERVAL_SECONDS = 30
 METRIC_HISTORY_AGES_SECONDS = (30, 60, 90)
@@ -282,7 +282,9 @@ def select_nearest_within_radius(
     aircraft: list[dict[str, Any]], settings, max_position_age_seconds: float,
 ) -> tuple[dict[str, Any] | None, float | None]:
     eligible = aircraft_within_radius(aircraft, settings, settings.radius_nm)
-    return select_nearest(eligible, settings, max_position_age_seconds)
+    return select_nearest(
+        eligible, settings, min(float(max_position_age_seconds), POSITION_FRESHNESS_SECONDS),
+    )
 
 
 def remove_position_data(plane: dict[str, Any]) -> dict[str, Any]:
@@ -1977,7 +1979,7 @@ PAGE = b"""<!doctype html>
     html,body { width:100%; height:100%; margin:0; overflow:hidden; background:var(--bg); }
     body { color:var(--white); font-family:"Segoe UI",Arial,sans-serif; cursor:default; -webkit-font-smoothing:antialiased; text-rendering:geometricPrecision; }
     html.cursor-hidden,html.cursor-hidden * { cursor:none !important; }
-    .wall { width:100vw; height:100vh; padding:clamp(18px,2.4vw,52px); display:grid; grid-template-rows:auto 1fr auto; gap:clamp(14px,2vh,28px); background:radial-gradient(circle at 76% 48%,rgba(20,236,255,.075),transparent 28%),linear-gradient(145deg,#06121a 0%,var(--bg) 52%); }
+    .wall { position:relative; width:100vw; height:100vh; padding:clamp(18px,2.4vw,52px); display:grid; grid-template-rows:auto 1fr auto; gap:clamp(14px,2vh,28px); background:radial-gradient(circle at 76% 48%,rgba(20,236,255,.075),transparent 28%),linear-gradient(145deg,#06121a 0%,var(--bg) 52%); }
     header,footer { display:flex; align-items:center; justify-content:space-between; }
     header { position:relative; z-index:1000; }
     .header-tools { display:flex; align-items:center; gap:clamp(14px,1.5vw,28px); transition:transform 220ms ease; }
@@ -2031,7 +2033,7 @@ PAGE = b"""<!doctype html>
     .snapshot-toast.error { color:var(--red); border-color:rgba(255,62,82,.6); }
 
     .brand { width:clamp(220px,24vw,440px); height:clamp(52px,4.4vw,82px); display:flex; align-items:center; justify-content:flex-start; }
-    .brand-logo { display:block; visibility:hidden; max-width:100%; max-height:100%; width:auto; height:auto; object-fit:contain; object-position:left center; transform:translateY(10px); filter:grayscale(0) saturate(1) brightness(1); opacity:1; transition:filter 900ms ease,opacity 900ms ease; }
+    .brand-logo { display:block; visibility:hidden; max-width:100%; max-height:100%; width:auto; height:auto; object-fit:contain; object-position:left center; transform:translateY(0px); filter:grayscale(0) saturate(1) brightness(1); opacity:1; transition:filter 900ms ease,opacity 900ms ease; }
     .brand-logo.ready { visibility:visible; }
     .wall.aircraft-active .brand-logo { filter:grayscale(1) saturate(0) brightness(.82) contrast(1.62); opacity:.82; }
     .wall.aircraft-active.brand-pulse .brand-logo { filter:grayscale(0) saturate(1.08) brightness(1.04) contrast(1.18); opacity:1; }
@@ -2052,7 +2054,8 @@ PAGE = b"""<!doctype html>
     .callsign { overflow:visible; color:var(--white); font-size:clamp(64px,10.5vw,198px); font-weight:800; letter-spacing:-.065em; line-height:.88; white-space:nowrap; display:flex; align-items:center; gap:.12em; }
     .callsign.route-known { font-size:clamp(64px,7.2vw,138px); }
     .callsign.route-unknown { color:var(--muted); font-weight:400; letter-spacing:0; }
-    .callsign.route-resolving { max-width:100%; overflow:hidden; color:var(--muted); font-size:clamp(26px,4vw,70px); font-weight:650; letter-spacing:.015em; text-overflow:ellipsis; }
+    .route-lookup-status { margin-top:clamp(7px,.8vh,12px); color:var(--muted); font-size:clamp(11px,.85vw,15px); font-weight:600; letter-spacing:.06em; line-height:1.2; }
+    .route-lookup-status[hidden] { display:none; }
     .route-airport { width:1.32em; height:.88em; flex:0 0 1.32em; min-width:1.32em; min-height:.88em; max-width:1.32em; max-height:.88em; overflow:visible; filter:drop-shadow(0 0 8px rgba(108,154,172,.16)); }
     .route-airport-outline { fill:none; stroke:#6c9aac; stroke-width:2.1; stroke-linejoin:round; paint-order:stroke; vector-effect:non-scaling-stroke; }
     .route-join { color:var(--muted); font-size:.45em; font-weight:650; letter-spacing:0; }
@@ -2097,7 +2100,7 @@ PAGE = b"""<!doctype html>
     .metric-value.altitude-high { color:var(--green) !important; }
     .metric-history { margin-top:clamp(7px,.8vh,12px); display:grid; gap:clamp(2px,.28vh,4px); color:var(--muted); font-size:clamp(9px,.7vw,13px); font-weight:650; line-height:1.18; }
     .metric-history-row { min-width:0; display:grid; grid-template-columns:3.2em minmax(0,1fr); align-items:baseline; gap:.6em; white-space:nowrap; }
-    .metric-history-age { color:rgba(108,154,172,.66); font-size:.88em; font-weight:750; letter-spacing:.10em; }
+    .metric-history-age { color:rgba(108,154,172,.66); font-size:.88em; font-weight:750; letter-spacing:.10em; text-transform:lowercase; }
     .metric-history-value { min-width:0; overflow:hidden; text-overflow:ellipsis; color:rgba(108,154,172,.94); letter-spacing:.025em; }
     .radar-panel { display:none; min-width:0; min-height:0; padding:clamp(18px,1.8vw,30px); border:1px solid var(--line); border-radius:clamp(16px,2vw,32px); background:rgba(0,2,7,.78); grid-template-rows:auto minmax(0,1fr) auto; overflow:hidden; box-shadow:inset 0 0 60px rgba(20,236,255,.025),0 28px 80px rgba(0,0,0,.28); }
     .wall.radar-open .radar-panel { display:grid; }
@@ -2271,7 +2274,7 @@ PAGE = b"""<!doctype html>
     }
     .footer-attribution { color:inherit; text-decoration:none; white-space:nowrap; }
     .footer-attribution:hover { color:var(--muted); }
-    #footer-status { flex:0 0 auto; white-space:nowrap; }
+    #footer-status { position:absolute; right:clamp(18px,2.4vw,52px); bottom:calc(clamp(18px,2.4vw,52px) + clamp(16px,1.4vw,24px)); max-width:min(44vw,560px); overflow:hidden; color:#52717e; font:600 clamp(8px,.65vw,11px)/1.2 "Segoe UI",sans-serif; letter-spacing:.04em; text-align:right; text-overflow:ellipsis; white-space:nowrap; pointer-events:none; }
     @media (max-width:1150px) { .wall.radar-open .content,.wall.settings-open .content { grid-template-columns:minmax(0,1fr) minmax(280px,36vw); } .wall.radar-open .metrics,.wall.settings-open .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); } }
         @media (min-width:701px) and (max-width:950px) {
             .wall.radar-open .radar-foot { flex-wrap:wrap; gap:8px; }
@@ -2525,9 +2528,9 @@ PAGE = b"""<!doctype html>
         min-height:0;
         display:grid;
         grid-template-columns:minmax(0,1fr) auto;
-        grid-template-rows:repeat(3,minmax(0,1fr));
+        grid-template-rows:auto auto auto;
         column-gap:7px;
-        row-gap:0;
+        row-gap:2px;
         overflow:hidden;
         align-items:center;
         font-size:clamp(6.2px,1.85vw,7.5px);
@@ -2542,7 +2545,7 @@ PAGE = b"""<!doctype html>
       .footer-credit-line {
         display:block;
         min-width:0;
-        white-space:nowrap;
+        white-space:normal;
         overflow:visible;
       }
       .footer-credit-line-2::before,.footer-credit-line-3::before { content:none; }
@@ -2550,12 +2553,9 @@ PAGE = b"""<!doctype html>
       .footer-credit-line-2 { grid-column:1 / -1; grid-row:2; }
       .footer-credit-line-3 { grid-column:1; grid-row:3; }
       #footer-status {
-        grid-column:2;
-        grid-row:3;
-        align-self:center;
-        justify-self:end;
-        flex:none;
-        white-space:nowrap;
+        right:10px;
+        bottom:calc(8px + 8em);
+        max-width:58vw;
         font-size:clamp(5.8px,1.65vw,6.8px);
         line-height:1;
       }
@@ -2620,12 +2620,12 @@ PAGE = b"""<!doctype html>
       <div class="idle-message" id="idle-message">Looking out&hellip;</div>
       <div class="tracking-message" id="tracking-message"></div>
       <section class="information">
-        <div class="flight-heading"><div class="flight-copy"><div class="callsign" id="callsign">-</div><div class="identity"><span class="registration" id="registration"></span><span class="aircraft-name" id="aircraft-name"></span></div><div class="destination-summary" id="destination-summary" hidden></div></div><div class="route-visual"><div class="route-brand" id="route-brand"><span class="route-brand-name" id="route-brand-name"></span><img class="route-brand-logo" id="operator-logo" alt=""></div><div class="route-map" id="route-map" aria-label="Route map centred on the tracked aircraft"><div class="route-photo-panel" id="route-photo-panel" hidden><img id="aircraft-photo" alt=""><span class="aircraft-photo-credit">PHOTO &middot; AIRPORT-DATA.COM via ADSBDB</span></div></div></div></div>
+        <div class="flight-heading"><div class="flight-copy"><div class="callsign" id="callsign">-</div><div class="route-lookup-status" id="route-lookup-status" aria-live="polite" hidden></div><div class="identity"><span class="registration" id="registration"></span><span class="aircraft-name" id="aircraft-name"></span></div><div class="destination-summary" id="destination-summary" hidden></div></div><div class="route-visual"><div class="route-brand" id="route-brand"><span class="route-brand-name" id="route-brand-name"></span><img class="route-brand-logo" id="operator-logo" alt=""></div><div class="route-map" id="route-map" aria-label="Route map centred on the tracked aircraft"><div class="route-photo-panel" id="route-photo-panel" hidden><img id="aircraft-photo" alt=""><span class="aircraft-photo-credit">PHOTO &middot; AIRPORT-DATA.COM via ADSBDB</span></div></div></div></div>
         <div class="metrics">
-          <div class="metric"><div class="metric-label">ALTITUDE</div><div class="metric-value" id="altitude">--</div><div class="metric-history" aria-label="Previous altitude values"><div class="metric-history-row"><span class="metric-history-age">30S</span><span class="metric-history-value" id="altitude-history-30">--</span></div><div class="metric-history-row"><span class="metric-history-age">60S</span><span class="metric-history-value" id="altitude-history-60">--</span></div><div class="metric-history-row"><span class="metric-history-age">90S</span><span class="metric-history-value" id="altitude-history-90">--</span></div></div></div>
-          <div class="metric"><div class="metric-label">GROUND SPEED</div><div class="metric-value" id="speed">--</div><div class="metric-history" aria-label="Previous ground speed values"><div class="metric-history-row"><span class="metric-history-age">30S</span><span class="metric-history-value" id="speed-history-30">--</span></div><div class="metric-history-row"><span class="metric-history-age">60S</span><span class="metric-history-value" id="speed-history-60">--</span></div><div class="metric-history-row"><span class="metric-history-age">90S</span><span class="metric-history-value" id="speed-history-90">--</span></div></div></div>
-          <div class="metric"><div class="metric-label">VERTICAL</div><div class="metric-value" id="vertical">--</div><div class="metric-history" aria-label="Previous vertical rate values"><div class="metric-history-row"><span class="metric-history-age">30S</span><span class="metric-history-value" id="vertical-history-30">--</span></div><div class="metric-history-row"><span class="metric-history-age">60S</span><span class="metric-history-value" id="vertical-history-60">--</span></div><div class="metric-history-row"><span class="metric-history-age">90S</span><span class="metric-history-value" id="vertical-history-90">--</span></div></div></div>
-          <div class="metric metric-distance"><div class="metric-label">DISTANCE</div><div class="metric-value"><span id="distance-main">--</span> <span id="distance-unit">NM</span></div><div class="metric-history" aria-label="Previous distance values"><div class="metric-history-row"><span class="metric-history-age">30S</span><span class="metric-history-value" id="distance-history-30">--</span></div><div class="metric-history-row"><span class="metric-history-age">60S</span><span class="metric-history-value" id="distance-history-60">--</span></div><div class="metric-history-row"><span class="metric-history-age">90S</span><span class="metric-history-value" id="distance-history-90">--</span></div></div></div>
+          <div class="metric"><div class="metric-label">ALTITUDE</div><div class="metric-value" id="altitude">--</div><div class="metric-history" aria-label="Previous altitude values"><div class="metric-history-row"><span class="metric-history-age">30s</span><span class="metric-history-value" id="altitude-history-30">--</span></div><div class="metric-history-row"><span class="metric-history-age">60s</span><span class="metric-history-value" id="altitude-history-60">--</span></div><div class="metric-history-row"><span class="metric-history-age">90s</span><span class="metric-history-value" id="altitude-history-90">--</span></div></div></div>
+          <div class="metric"><div class="metric-label">GROUND SPEED</div><div class="metric-value" id="speed">--</div><div class="metric-history" aria-label="Previous ground speed values"><div class="metric-history-row"><span class="metric-history-age">30s</span><span class="metric-history-value" id="speed-history-30">--</span></div><div class="metric-history-row"><span class="metric-history-age">60s</span><span class="metric-history-value" id="speed-history-60">--</span></div><div class="metric-history-row"><span class="metric-history-age">90s</span><span class="metric-history-value" id="speed-history-90">--</span></div></div></div>
+          <div class="metric"><div class="metric-label">VERTICAL</div><div class="metric-value" id="vertical">--</div><div class="metric-history" aria-label="Previous vertical rate values"><div class="metric-history-row"><span class="metric-history-age">30s</span><span class="metric-history-value" id="vertical-history-30">--</span></div><div class="metric-history-row"><span class="metric-history-age">60s</span><span class="metric-history-value" id="vertical-history-60">--</span></div><div class="metric-history-row"><span class="metric-history-age">90s</span><span class="metric-history-value" id="vertical-history-90">--</span></div></div></div>
+          <div class="metric metric-distance"><div class="metric-label">DISTANCE</div><div class="metric-value"><span id="distance-main">--</span> <span id="distance-unit">NM</span></div><div class="metric-history" aria-label="Previous distance values"><div class="metric-history-row"><span class="metric-history-age">30s</span><span class="metric-history-value" id="distance-history-30">--</span></div><div class="metric-history-row"><span class="metric-history-age">60s</span><span class="metric-history-value" id="distance-history-60">--</span></div><div class="metric-history-row"><span class="metric-history-age">90s</span><span class="metric-history-value" id="distance-history-90">--</span></div></div></div>
         </div>
       </section>
     </main>
@@ -2649,7 +2649,8 @@ PAGE = b"""<!doctype html>
       <div class="settings-foot">SETTINGS ARE SAVED ON THIS DISPLAY</div>
     </aside>
     </div>
-    <footer><span class="footer-credits"><span class="footer-credit-line footer-credit-line-1">For Sam <span class="api-heart" id="api-heart" aria-label="API heartbeat normal" title="API heartbeat: waiting for first response"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg></span>&nbsp;&nbsp;&nbsp;&nbsp;Data: <a class="footer-attribution" href="https://adsb.lol/" target="_blank" rel="noopener">ADSB.lol</a> + <a class="footer-attribution" href="https://opendata.adsb.fi/" target="_blank" rel="noopener">ADSB.fi</a><span id="flightaware-credit" hidden> + <a class="footer-attribution" href="https://www.flightaware.com/commercial/aeroapi/" target="_blank" rel="noopener">FlightAware</a></span> + <a class="footer-attribution" href="https://www.adsbdb.com/" target="_blank" rel="noopener">ADSBDB</a> + <a class="footer-attribution" href="https://ourairports.com/data/" target="_blank" rel="noopener">OurAirports</a></span><span class="footer-credit-line footer-credit-line-2">Map: <a class="footer-attribution" href="https://leafletjs.com/" target="_blank" rel="noopener">Leaflet</a> + &copy; <a class="footer-attribution" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>&nbsp;&nbsp;/&nbsp;&nbsp;Places: <a class="footer-attribution" href="https://nominatim.org/" target="_blank" rel="noopener">Nominatim</a>&nbsp;&nbsp;/&nbsp;&nbsp;Logos: <a class="footer-attribution" href="https://github.com/soaring-symbols/soaring-symbols" target="_blank" rel="noopener">Soaring Symbols</a>&nbsp;&nbsp;/&nbsp;&nbsp;Flags: <a class="footer-attribution" href="https://github.com/catamphetamine/country-flag-icons" target="_blank" rel="noopener">country-flag-icons</a></span><span class="footer-credit-line footer-credit-line-3">Sound: arunangshubanerjee via <a class="footer-attribution" href="https://pixabay.com/" target="_blank" rel="noopener">Pixabay</a></span></span><span id="footer-status">Connecting</span></footer>
+    <footer><span class="footer-credits"><span class="footer-credit-line footer-credit-line-1">For Sam <span class="api-heart" id="api-heart" aria-label="API heartbeat normal" title="API heartbeat: waiting for first response"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg></span>&nbsp;&nbsp;&nbsp;&nbsp;Data: <a class="footer-attribution" href="https://adsb.lol/" target="_blank" rel="noopener">ADSB.lol</a> + <a class="footer-attribution" href="https://opendata.adsb.fi/" target="_blank" rel="noopener">ADSB.fi</a><span id="flightaware-credit" hidden> + <a class="footer-attribution" href="https://www.flightaware.com/commercial/aeroapi/" target="_blank" rel="noopener">FlightAware</a></span> + <a class="footer-attribution" href="https://www.adsbdb.com/" target="_blank" rel="noopener">ADSBDB</a> + <a class="footer-attribution" href="https://ourairports.com/data/" target="_blank" rel="noopener">OurAirports</a></span><span class="footer-credit-line footer-credit-line-2">Map: <a class="footer-attribution" href="https://leafletjs.com/" target="_blank" rel="noopener">Leaflet</a> + &copy; <a class="footer-attribution" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>&nbsp;&nbsp;/&nbsp;&nbsp;Places: <a class="footer-attribution" href="https://nominatim.org/" target="_blank" rel="noopener">Nominatim</a>&nbsp;&nbsp;/&nbsp;&nbsp;Logos: <a class="footer-attribution" href="https://github.com/soaring-symbols/soaring-symbols" target="_blank" rel="noopener">Soaring Symbols</a>&nbsp;&nbsp;/&nbsp;&nbsp;Flags: <a class="footer-attribution" href="https://github.com/catamphetamine/country-flag-icons" target="_blank" rel="noopener">country-flag-icons</a></span><span class="footer-credit-line footer-credit-line-3">Sound: arunangshubanerjee via <a class="footer-attribution" href="https://pixabay.com/" target="_blank" rel="noopener">Pixabay</a></span></span></footer>
+    <div id="footer-status" aria-live="polite">Connecting</div>
   </section>
   <div class="snapshot-flash" id="snapshot-flash" aria-hidden="true"></div>
   <div class="snapshot-countdown" id="snapshot-countdown" aria-hidden="true"><div class="snapshot-countdown-panel"><span class="snapshot-countdown-label" id="snapshot-countdown-label">SNAPSHOT IN</span><strong class="snapshot-countdown-number" id="snapshot-countdown-number"></strong></div></div>
@@ -3109,7 +3110,7 @@ PAGE = b"""<!doctype html>
                     if(target){
                         target.textContent=historicalMetricValue(metric,sample);
                         const label=target.parentElement&&target.parentElement.querySelector('.metric-history-age');
-                        if(label)label.textContent=sample?formatObservationAge(sample.age_seconds).toUpperCase():String(age)+'S';
+                        if(label)label.textContent=String(age)+'s';
                     }
         }
       }
@@ -3200,11 +3201,17 @@ PAGE = b"""<!doctype html>
             else if(img.complete&&img.naturalWidth)img.onload();
     }
     function renderHeading(d,hasAircraft){
-      const heading=byId('callsign'); heading.replaceChildren(); const routeKnown=Boolean(d.route),routePending=hasAircraft&&!routeKnown&&d.route_resolution_status==='pending'; heading.classList.toggle('route-known',hasAircraft&&routeKnown); heading.classList.toggle('route-unknown',hasAircraft&&!routeKnown); heading.classList.toggle('route-resolving',routePending);
+      const heading=byId('callsign'),lookup=byId('route-lookup-status');
+      heading.replaceChildren();
+      const routeKnown=Boolean(d.route),hasCallsign=Boolean(String(d.callsign||'').trim());
+      const routePending=hasAircraft&&hasCallsign&&!routeKnown&&d.route_resolution_status==='pending';
+      heading.classList.toggle('route-known',hasAircraft&&routeKnown);
+      heading.classList.toggle('route-unknown',hasAircraft&&!routeKnown);
+      if(lookup){ lookup.hidden=!routePending; lookup.textContent=routePending?'Looking up route\\u2026':''; }
       byId('wall').classList.toggle('route-unavailable',hasAircraft&&!routeKnown&&!routePending);
       renderDestinationSummary(d,hasAircraft);
       if(!hasAircraft){ heading.textContent=''; return; }
-      if(routePending){ heading.textContent='Resolving route'+String.fromCodePoint(0x2026); return; }
+      if(routePending)return;
       if(!routeKnown){ heading.textContent='N/A to N/A'; return; }
       const airport=(side,code,country,available,revision)=>{
         const svg=document.createElementNS(svgNS,'svg'); svg.setAttribute('class','route-airport'); svg.setAttribute('viewBox','0 0 150 100'); svg.setAttribute('role','img'); svg.setAttribute('aria-label',String(code||''));
@@ -4604,21 +4611,34 @@ def empty_metric_history() -> dict[str, dict[str, Any] | None]:
 
 def previous_metric_observations(
     observations: list[dict[str, Any]], now_monotonic: float, max_age_seconds: float,
-) -> list[dict[str, Any]]:
-    """Return up to three prior genuine observations, newest first, with real ages."""
-    previous = observations[:-1][-3:]
-    result = []
-    for sample in reversed(previous):
-        age = max(0.0, now_monotonic - float(sample["observed_at"]))
-        if age <= max_age_seconds:
-            result.append({
+) -> list[dict[str, Any] | None]:
+    """Return genuine prior samples nearest to the fixed 30/60/90-second slots."""
+    slots: dict[str, dict[str, Any] | None] = {
+        str(target): None for target in METRIC_HISTORY_AGES_SECONDS
+    }
+    tolerance = METRIC_HISTORY_STEP_SECONDS / 2
+    maximum_age = min(float(max_age_seconds), METRIC_HISTORY_AGES_SECONDS[-1] + tolerance)
+    for sample in observations[:-1]:
+        try:
+            age = float(now_monotonic) - float(sample["observed_at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(age) or age <= 0 or age > maximum_age:
+            continue
+        target = min(METRIC_HISTORY_AGES_SECONDS, key=lambda value: (abs(age - value), value))
+        if abs(age - target) > tolerance:
+            continue
+        key = str(target)
+        current = slots[key]
+        if current is None or abs(age - target) < abs(float(current["age_seconds"]) - target):
+            slots[key] = {
                 "age_seconds": age,
                 "altitude": sample.get("altitude"),
                 "speed": sample.get("speed"),
                 "vertical_rate": sample.get("vertical_rate"),
                 "distance_nm": sample.get("distance_nm"),
-            })
-    return result
+            }
+    return [slots[str(target)] for target in METRIC_HISTORY_AGES_SECONDS]
 
 
 def shift_metric_history(
@@ -4811,12 +4831,15 @@ class FrameState:
             payload["last_acquisition_attempted_at"] = self.last_acquisition_attempted_at
             payload["last_acquisition_succeeded_at"] = self.last_acquisition_succeeded_at
             self.metric_history_aircraft_id = current_aircraft_id
-            self.metric_history = empty_metric_history()
-            for sample in self.metric_observations[:-1]:
-                sample_age = max(0.0, history_now - sample["observed_at"])
-                slot = str(int(round(sample_age / METRIC_HISTORY_STEP_SECONDS) * METRIC_HISTORY_STEP_SECONDS))
-                if slot in self.metric_history:
-                    self.metric_history[slot] = {**sample, "age_seconds": sample_age}
+            metric_history_observations = previous_metric_observations(
+                self.metric_observations,
+                history_now,
+                metric_history_retention_seconds(settings.refresh_seconds),
+            )
+            self.metric_history = {
+                str(age): sample
+                for age, sample in zip(METRIC_HISTORY_AGES_SECONDS, metric_history_observations)
+            }
 
             if current_aircraft_id != self.commentary_aircraft_id:
                 self.commentary_aircraft_id = current_aircraft_id
@@ -4862,9 +4885,7 @@ class FrameState:
                 age: (dict(sample) if sample is not None else None)
                 for age, sample in self.metric_history.items()
             }
-            payload["metric_history_observations"] = previous_metric_observations(
-                self.metric_observations, history_now, metric_history_retention_seconds(settings.refresh_seconds)
-            )
+            payload["metric_history_observations"] = metric_history_observations
             payload["commentary_facts"] = (
                 build_commentary_facts(
                     self.commentary_samples, commentary_distance, plane, route, projection, nearby_place,
@@ -5469,8 +5490,16 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
             preserve_radar_radius=not bool(tracking.get("active")),
         )
         with state.lock:
+            route_lookup_available = bool(
+                routes is not None
+                and plane is not None
+                and (
+                    not hasattr(routes, "callsign")
+                    or routes.callsign(plane)
+                )
+            )
             state.payload["route_resolution_status"] = (
-                "resolved" if cached_route else "pending" if routes is not None and plane is not None else "unavailable"
+                "resolved" if cached_route else "pending" if route_lookup_available else "unavailable"
             )
         if automatic_result_to_remember is not None:
             with state.lock:
@@ -5501,6 +5530,12 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
                     if str(state.payload.get("aircraft_id") or "") != aircraft_identity(plane):
                         return
                     latest_observation = state.position_observed_at_monotonic
+                    if not tracking.get("active"):
+                        if (
+                            latest_observation is None
+                            or time.monotonic() - latest_observation > POSITION_FRESHNESS_SECONDS
+                        ):
+                            return
                     if (
                         reported_position_observed_at is not None
                         and latest_observation is not None
@@ -5993,11 +6028,22 @@ class VisitorSessionStore:
             return None
         with session.state.lock:
             selected_id = str(session.state.payload.get("aircraft_id") or "")
-            plane = next(
-                (item for item in session.state.last_live_aircraft if aircraft_identity(item) == selected_id),
-                None,
-            )
-        if not selected_id or not plane:
+            aircraft = list(session.state.last_live_aircraft)
+            received_at = session.state.last_live_aircraft_received_at
+            position_observed_at = session.state.position_observed_at_monotonic
+            settings = copy.copy(session.settings)
+        if (
+            not selected_id or received_at is None or position_observed_at is None
+            or time.monotonic() - position_observed_at > POSITION_FRESHNESS_SECONDS
+        ):
+            return None
+        aged_aircraft = age_aircraft_positions(
+            aircraft, max(0.0, time.monotonic() - received_at),
+        )
+        plane, _ = select_nearest_within_radius(
+            aged_aircraft, settings, POSITION_FRESHNESS_SECONDS,
+        )
+        if not plane or aircraft_identity(plane) != selected_id:
             return None
         hex_code = normalise_adsb_hex(plane.get("hex"))
         candidate = "hex:" + hex_code if hex_code else normalise_flight_query(plane.get("flight"))
@@ -6753,8 +6799,44 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                         snapshot["mode"] = "last_known"
                     elif position_state == "unavailable" and snapshot.get("aircraft_id"):
                         snapshot["mode"] = "position_unavailable"
+                if (
+                    not snapshot.get("tracking_active")
+                    and snapshot.get("aircraft_id")
+                    and position_state != "reported"
+                ):
+                    snapshot.update({
+                        "mode": "scanning",
+                        "aircraft_id": "",
+                        "callsign": "",
+                        "registration": "",
+                        "flight_details": "",
+                        "aircraft_type": "",
+                        "aircraft_name": "",
+                        "route": "",
+                        "route_source": "",
+                        "commercial_flight": "",
+                        "origin": "",
+                        "destination": "",
+                        "origin_name": "",
+                        "destination_name": "",
+                        "route_resolution_status": "unavailable",
+                        "aircraft_latitude": None,
+                        "aircraft_longitude": None,
+                        "distance_nm": None,
+                        "altitude": None,
+                        "speed": None,
+                        "vertical_rate": None,
+                        "track": 0,
+                        "telemetry": {},
+                        "metric_history": empty_metric_history(),
+                        "metric_history_observations": [],
+                        "radar_contacts": [],
+                        "position_age_seconds": None,
+                        "position_state": "unavailable",
+                    })
                 if snapshot.get("acquisition_status") == "queued" and position_state != "reported":
-                    snapshot["mode"] = "queued"
+                    if snapshot.get("tracking_active"):
+                        snapshot["mode"] = "queued"
                 snapshot["browser_status_checked_at"] = time.time()
                 elapsed_since_update = max(0.0, now_monotonic - state_updated_at) if state_updated_at is not None else 0.0
                 contacts = []

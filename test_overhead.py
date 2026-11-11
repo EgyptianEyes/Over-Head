@@ -208,13 +208,14 @@ class OverHeadTests(unittest.TestCase):
                 )
 
         observe(1000.0, "abc123", 10000, 200, 8.0)
-        self.assertEqual(state.payload["metric_history_observations"], [])
+        self.assertEqual(state.payload["metric_history_observations"], [None, None, None])
         observe(1030.0, "abc123", 12000, 210, 7.0)
         observe(1060.0, "abc123", 14000, 220, 6.0)
         observations = state.payload["metric_history_observations"]
-        self.assertEqual(len(observations), 2)
+        self.assertEqual(len(observations), 3)
         self.assertAlmostEqual(observations[0]["age_seconds"], 30.0, delta=0.2)
         self.assertAlmostEqual(observations[1]["age_seconds"], 60.0, delta=0.2)
+        self.assertIsNone(observations[2])
         self.assertEqual(observations[0]["altitude"], 12000)
         self.assertEqual(observations[1]["altitude"], 10000)
         self.assertEqual(state.payload["metric_history"]["30"]["altitude"], 12000)
@@ -234,7 +235,24 @@ class OverHeadTests(unittest.TestCase):
         observe(1090.0, "def456", 18000, 300, 12.0)
         self.assertEqual(state.metric_observation_aircraft_id, "DEF456")
         self.assertEqual(len(state.metric_observations), 1)
-        self.assertEqual(state.payload["metric_history_observations"], [])
+        self.assertEqual(state.payload["metric_history_observations"], [None, None, None])
+
+    def test_metric_history_labels_are_fixed_lowercase_intervals(self):
+        self.assertIn(b"const metricHistoryAges=[30,60,90]", PAGE)
+        self.assertIn(b"label.textContent=String(age)+'s'", PAGE)
+        self.assertNotIn(b"formatObservationAge(sample.age_seconds).toUpperCase()", PAGE)
+        for label in (b">30s</span>", b">60s</span>", b">90s</span>"):
+            self.assertEqual(PAGE.count(label), 4)
+
+    def test_metric_history_never_uses_observations_outside_fixed_windows(self):
+        samples = [
+            {"observed_at": 1000.0, "altitude": 10000},
+            {"observed_at": 1240.0, "altitude": 12000},
+        ]
+        self.assertEqual(
+            monitor.previous_metric_observations(samples, 1240.0, 900),
+            [None, None, None],
+        )
 
     def test_automatic_target_lookup_populates_history_from_provider_observations(self):
         class EmptyStore:
@@ -949,6 +967,9 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn(b".footer-credits { min-width:0; flex:1 1 auto; }", PAGE)
         self.assertIn(b"byId('footer-status').textContent='Updated '+d.updated", PAGE)
         self.assertNotIn(b"d.total+' CONTACTS  /  UPDATED '", PAGE)
+        footer = PAGE[PAGE.index(b"<footer>"):PAGE.index(b"</footer>") + len(b"</footer>")]
+        self.assertNotIn(b"footer-status", footer)
+        self.assertIn(b'<div id="footer-status" aria-live="polite">Connecting</div>', PAGE)
 
     def test_route_direction_animation_survives_status_refreshes(self):
         self.assertIn(b"let routeFlowKey='',routeFlowStartedAt=Date.now()", PAGE)
@@ -1001,6 +1022,25 @@ class OverHeadTests(unittest.TestCase):
             update_state(state, Settings(), False, EmptyStore(), EmptyStore(), persist_frame=False)
         self.assertEqual(state.payload["mode"], "scanning")
         self.assertEqual(state.payload["aircraft_id"], "")
+
+    def test_automatic_selection_rejects_stale_cached_position(self):
+        class EmptyStore:
+            def get(self, *_args):
+                return {}
+
+        settings = Settings(latitude=51.5, longitude=-0.1, radius_nm=10)
+        aircraft = {
+            "hex": "408435", "flight": "OAT26", "lat": 51.51, "lon": -0.1,
+            "seen_pos": 25, "alt_baro": 20000,
+        }
+        state = FrameState()
+        state.last_live_aircraft = [aircraft]
+        state.last_live_aircraft_received_at = time.monotonic()
+        with patch("monitor.fetch_aircraft", side_effect=OSError("fixture outage")):
+            update_state(state, settings, False, EmptyStore(), EmptyStore(), persist_frame=False)
+        self.assertEqual(state.payload["mode"], "reconnecting")
+        self.assertEqual(state.payload["aircraft_id"], "")
+        self.assertIsNone(state.payload["distance_nm"])
 
     def test_footer_credits_flightaware_conditionally_and_ourairports(self):
         self.assertIn(b'id="flightaware-credit" hidden', PAGE)
@@ -1168,7 +1208,7 @@ class OverHeadTests(unittest.TestCase):
         source = Path(__file__).with_name("monitor.py").read_text(encoding="utf-8")
         self.assertIn('cache/flight-routes-v6.json', source)
         self.assertIn('ROUTE_CACHE_TTL_SECONDS = 900', source)
-        self.assertIn('ROUTE_FAILURE_RETRY_SECONDS = 30', source)
+        self.assertIn('ROUTE_FAILURE_RETRY_SECONDS = 300', source)
 
     def test_locating_button_uses_gentle_pulse_only(self):
         self.assertIn(b"#location-use-device.locating { color:var(--white)", PAGE)
@@ -1529,7 +1569,7 @@ class OverHeadTests(unittest.TestCase):
             finally:
                 finish_identity.set()
 
-    def test_failed_free_route_lookup_retries_after_thirty_seconds(self):
+    def test_failed_free_route_lookup_retries_after_failure_cooldown(self):
         class Routes(FlightRouteStore):
             calls = 0
 
@@ -1546,10 +1586,10 @@ class OverHeadTests(unittest.TestCase):
             plane = {"hex": "406b82", "flight": "BAW5", "r": "G-YMMO", "lat": 51, "lon": 0}
             key = store._cache_key(plane)
             store._failures[key] = 1000
-            with patch("monitor.time.time", return_value=1029):
+            with patch("monitor.time.time", return_value=1000 + monitor.ROUTE_FAILURE_RETRY_SECONDS - 1):
                 self.assertEqual(store.get(plane), {})
             self.assertEqual(store.calls, 0)
-            with patch("monitor.time.time", return_value=1031):
+            with patch("monitor.time.time", return_value=1000 + monitor.ROUTE_FAILURE_RETRY_SECONDS + 1):
                 self.assertEqual(store.get(plane), {})
             self.assertEqual(store.calls, 2)
 
@@ -1772,10 +1812,11 @@ class OverHeadTests(unittest.TestCase):
             state.last_acquisition_succeeded_at = 100.0
             with patch("monitor.fetch_aircraft", side_effect=OSError("offline")):
                 update_state(state, settings, False, EmptyStore(), EmptyStore())
-            self.assertEqual(state.payload["callsign"], "TST123")
+            self.assertEqual(state.payload["callsign"], "")
+            self.assertEqual(state.payload["aircraft_id"], "")
             self.assertEqual(state.payload["mode"], "reconnecting")
             self.assertEqual(state.last_acquisition_succeeded_at, 100.0)
-            self.assertGreater(state.payload["telemetry"]["seen_pos"], 20)
+            self.assertIsNone(state.payload["aircraft_latitude"])
 
             state.last_live_aircraft_received_at = time.monotonic() - monitor.retained_position_seconds(300) - 1
             with patch("monitor.fetch_aircraft", side_effect=OSError("offline")):
@@ -1916,7 +1957,7 @@ class OverHeadTests(unittest.TestCase):
         self.assertEqual(PAGE.count(b'class="footer-credit-line footer-credit-line-'), 3)
         self.assertIn(b"grid-template-rows:34px minmax(0,1fr) 34px;", PAGE)
         mobile = PAGE.split(b"/* Mobile is a single-view application", 1)[1]
-        self.assertIn(b"grid-template-rows:repeat(3,minmax(0,1fr));", mobile)
+        self.assertIn(b"grid-template-rows:auto auto auto;", mobile)
         self.assertIn(b"font-size:clamp(6.2px,1.85vw,7.5px);", mobile)
         self.assertIn(b".footer-credit-line-1 { grid-column:1 / -1; grid-row:1; }", mobile)
         self.assertIn(b".footer-credit-line-2 { grid-column:1 / -1; grid-row:2; }", mobile)
@@ -2041,8 +2082,8 @@ class OverHeadTests(unittest.TestCase):
     def test_mobile_update_timestamp_shares_third_footer_row(self):
         mobile = PAGE.split(b"/* Mobile is a single-view application", 1)[1]
         self.assertIn(b"#footer-status {", mobile)
-        self.assertIn(b"grid-column:2;", mobile)
-        self.assertIn(b"grid-row:3;", mobile)
+        self.assertIn(b"position:absolute;", mobile)
+        self.assertIn(b"max-width:58vw;", mobile)
 
     def test_readme_documents_three_line_mobile_footer(self):
         readme = Path(__file__).with_name("README.md").read_text(encoding="utf-8")
@@ -2081,6 +2122,13 @@ class OverHeadTests(unittest.TestCase):
             footer.index(b">Pixabay<"),
         ]
         self.assertEqual(positions, sorted(positions))
+
+    def test_header_logo_is_shifted_up_without_moving_toolbar(self):
+        self.assertIn(
+            b".brand-logo { display:block; visibility:hidden; max-width:100%; max-height:100%; width:auto; height:auto; object-fit:contain; object-position:left center; transform:translateY(0px);",
+            PAGE,
+        )
+        self.assertIn(b"header { position:relative; z-index:1000; }", PAGE)
 
 
     def test_snapshot_camera_and_gallery_are_present_without_widening_desktop(self):
@@ -2559,7 +2607,7 @@ class VisitorSessionTests(unittest.TestCase):
         session = self.sessions.sessions[session_id]
         with session.state.lock:
             session.state.position_aircraft_id = "406B82"
-            session.state.position_observed_at_monotonic = time.monotonic() - 21
+            session.state.position_observed_at_monotonic = time.monotonic() - 5
             session.state.last_acquisition_attempted_at = 100.0
             session.state.last_acquisition_succeeded_at = 90.0
             session.state.payload.update({
@@ -2579,11 +2627,12 @@ class VisitorSessionTests(unittest.TestCase):
             })
 
         first = self.get_status(visitor)
-        self.assertEqual(first["mode"], "queued")
+        self.assertEqual(first["mode"], "live")
+        self.assertEqual(first["aircraft_id"], "406B82")
         self.assertEqual(first["acquisition_queue_position"], 2)
         self.assertEqual(first["acquisition_queue_length"], 5)
         self.assertEqual(first["acquisition_retry_in_seconds"], 600)
-        self.assertEqual(first["position_state"], "last_known")
+        self.assertEqual(first["position_state"], "reported")
         self.assertEqual(first["last_acquisition_attempted_at"], 100.0)
         self.assertEqual(first["last_acquisition_succeeded_at"], 90.0)
         self.assertIn("browser_status_checked_at", first)
@@ -2791,6 +2840,8 @@ class VisitorSessionTests(unittest.TestCase):
             with session.state.lock:
                 session.state.last_live_aircraft = [plane]
                 session.state.payload["aircraft_id"] = "ABC123"
+                session.state.last_live_aircraft_received_at = now
+                session.state.position_observed_at_monotonic = now
             session.last_fetch_at = now
             self.assertIsNone(store.claim_due(now=now + 0.02)[0])
             self.assertIsNone(store.claim_due(now=now + 29.99)[0])
@@ -2809,6 +2860,8 @@ class VisitorSessionTests(unittest.TestCase):
             with session.state.lock:
                 session.state.last_live_aircraft = [plane]
                 session.state.payload["aircraft_id"] = "ABC123"
+                session.state.last_live_aircraft_received_at = now
+                session.state.position_observed_at_monotonic = now
             session.last_fetch_at = now
             session.refresh_reasons.clear()
             session.refresh_requested_at = None
