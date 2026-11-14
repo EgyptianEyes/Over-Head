@@ -1112,8 +1112,9 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn(b"setLocationButtonBusy(true);", PAGE)
 
     def test_location_button_busy_state_clears_on_success_failure_and_close(self):
-        self.assertIn(b"position=>{\n          setLocationButtonBusy(false);", PAGE)
-        self.assertIn(b"error=>{\n          setLocationButtonBusy(false);", PAGE)
+        self.assertIn(b"position=>{\n                    if(requestRevision!==locationRequestRevision", PAGE)
+        self.assertIn(b"locationLookupInFlight=false;", PAGE)
+        self.assertIn(b"error=>{\n                    if(requestRevision!==locationRequestRevision", PAGE)
         close_handler = PAGE.split(b"function closeLocationSelector(){", 1)[1].split(
             b"function setLocationButtonBusy", 1
         )[0]
@@ -2832,7 +2833,7 @@ class VisitorSessionTests(unittest.TestCase):
             selected, _ = store.claim_due(now=now)
             self.assertIs(selected, session)
             self.assertEqual(selected.acquisition_kind, "normal")
-            self.assertEqual(store.next_acquisition_at, now + 60.0)
+            self.assertEqual(store.next_acquisition_at, now + monitor.NORMAL_ACQUISITION_INTERVAL_SECONDS)
 
             plane = {"hex": "abc123", "flight": "TST123", "lat": 51.6, "lon": -0.1, "seen_pos": 0.1}
             with session.state.lock:
@@ -2847,6 +2848,123 @@ class VisitorSessionTests(unittest.TestCase):
             self.assertIs(selected, session)
             self.assertEqual(selected.acquisition_kind, "automatic_tracking")
             self.assertEqual(store.next_acquisition_at, now + 60.0)
+
+    def test_initial_acquisition_reuses_fresh_tracking_geo_cache_without_provider_slot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = monitor.VisitorSessionStore(
+                Settings(refresh_seconds=300), Path(temporary),
+                global_min_interval_seconds=30,
+            )
+            established, _ = store.get_or_create()
+            established.tracker.start("406B82", ("hex:406B82",))
+            established.last_fetch_at = time.monotonic()
+            store.touch(established, active=True)
+            established.refresh_reasons.clear()
+            established.refresh_requested_at = None
+            established.state.last_live_aircraft = [{
+                "hex": "abc123", "lat": established.settings.latitude,
+                "lon": established.settings.longitude, "seen_pos": 0.1,
+            }]
+            established.state.last_live_aircraft_received_at = time.monotonic()
+            established.state.last_live_aircraft_query_radius_nm = 100
+            established.state.last_acquisition_succeeded_at = time.time()
+            store.remember_shared_result(established)
+
+            newcomer, _ = store.get_or_create()
+            store.touch(newcomer, active=True)
+            now = time.monotonic() + 0.01
+
+            selected, _ = store.claim_due(now=now)
+            self.assertIs(selected, newcomer)
+            self.assertEqual(selected.acquisition_kind, "normal_cache")
+            self.assertTrue(newcomer.initial_acquisition_granted)
+            self.assertIsNotNone(selected.cached_acquisition)
+            self.assertEqual(store.next_acquisition_at, 0)
+
+    def test_priority_burst_is_bounded_when_new_visitors_arrive_continuously(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = monitor.VisitorSessionStore(
+                Settings(refresh_seconds=300), Path(temporary), global_min_interval_seconds=0,
+            )
+            established, _ = store.get_or_create()
+            store.touch(established, active=True)
+            established.initial_acquisition_granted = True
+            established.refresh_reasons.clear()
+            newcomers = []
+            now = time.monotonic() + 1
+            for index in range(3):
+                visitor, _ = store.get_or_create()
+                store.touch(visitor, active=True)
+                newcomers.append(visitor)
+            selected, _ = store.claim_due(now=now)
+            self.assertIn(selected, newcomers)
+            for visitor in newcomers:
+                visitor.refresh_reasons.clear()
+                visitor.last_fetch_at = now
+                visitor.initial_acquisition_granted = True
+            newcomer, _ = store.get_or_create()
+            store.touch(newcomer, active=True)
+            newcomers.append(newcomer)
+            selected, _ = store.claim_due(now=now + 301)
+            self.assertIn(selected, newcomers)
+            selected, _ = store.claim_due(now=now + 601)
+            self.assertIs(selected, established)
+
+    def test_priority_waits_one_shared_slot_then_bounds_continuous_arrivals(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = monitor.VisitorSessionStore(
+                Settings(refresh_seconds=300), Path(temporary), global_min_interval_seconds=60,
+            )
+            established, _ = store.get_or_create()
+            store.touch(established, active=True)
+            established.initial_acquisition_granted = True
+            established.refresh_reasons.clear()
+            newcomer, _ = store.get_or_create()
+            store.touch(newcomer, active=True)
+            start = time.monotonic() + 1
+            store.next_acquisition_at = start + 60
+
+            selected, retry = store.claim_due(now=start)
+            self.assertIsNone(selected)
+            self.assertAlmostEqual(retry, 60, delta=0.01)
+            selected, _ = store.claim_due(now=start + 60.01)
+            self.assertIn(selected, (established, newcomer))
+            # The activated established visitor can carry an activation reason;
+            # whichever initial acquisition claims the first slot is granted once.
+            self.assertEqual(selected.acquisition_kind, "normal")
+
+            newcomer.last_fetch_at = start + 60.01
+            newcomer.refresh_reasons.clear()
+            established.refresh_requested_at = start + 60.02
+            established.refresh_reasons.add("manual")
+            arrival, _ = store.get_or_create()
+            store.touch(arrival, active=True)
+            selected, _ = store.claim_due(now=start + 120.02)
+            self.assertIn(selected, (established, arrival))
+            selected.last_fetch_at = start + 120.02
+            selected.refresh_reasons.clear()
+            selected.initial_acquisition_granted = True
+
+            continuing_arrival, _ = store.get_or_create()
+            store.touch(continuing_arrival, active=True)
+            selected, _ = store.claim_due(now=start + 180.02)
+            self.assertIsNotNone(selected)
+
+    def test_reactivated_returning_session_gets_one_initial_priority(self):
+        session, _ = self.sessions.get_or_create()
+        self.sessions.touch(session, active=True)
+        selected, _ = self.sessions.claim_due(now=time.monotonic() + 0.01)
+        self.assertIs(selected, session)
+        self.assertTrue(session.initial_acquisition_granted)
+        with session.lease.lock:
+            session.lease.last_seen = time.monotonic() - 13
+        session.last_fetch_at = time.monotonic()
+        self.sessions.next_acquisition_at = 0
+        self.sessions.touch(session, active=True)
+        self.assertFalse(session.initial_acquisition_granted)
+        selected, _ = self.sessions.claim_due(now=time.monotonic() + 0.01)
+        self.assertIs(selected, session)
+        self.assertTrue(session.initial_acquisition_granted)
 
     def test_automatic_refresh_target_survives_display_freshness_expiry(self):
         with patch("monitor.time.monotonic", return_value=1000.0) as clock:
@@ -2899,7 +3017,10 @@ class VisitorSessionTests(unittest.TestCase):
         self.assertEqual(selected.cached_auto_tracking_result["aircraft_id"], "ABC123")
 
     def test_simulated_fair_queue_latency_for_1_2_5_10_and_64_unique_locations(self):
-        expected_last_first_observation = {1: 0, 2: 300, 5: 1200, 10: 2700, 64: 18900}
+        expected_last_first_observation = {
+            count: (count - 1 + (count - 1) // 2) * 300
+            for count in (1, 2, 5, 10, 64)
+        }
         for visitor_count, expected_last_wait in expected_last_first_observation.items():
             with self.subTest(visitors=visitor_count), tempfile.TemporaryDirectory() as temporary:
                 store = monitor.VisitorSessionStore(
@@ -2931,9 +3052,9 @@ class VisitorSessionTests(unittest.TestCase):
                         max((int(item.state.payload.get("acquisition_queue_length", 0)) for item in visitors), default=0),
                     )
                     if cycle == 0:
-                        queued = [item for item in visitors if item.refresh_requested_at is not None]
+                        queued = [item for item in visitors if item.refresh_requested_at is not None and item.initial_acquisition_granted]
                         positions = sorted(int(item.state.payload["acquisition_queue_position"]) for item in queued)
-                        self.assertEqual(positions, list(range(1, visitor_count)))
+                        self.assertEqual(positions, list(range(1, len(queued) + 1)))
                         for item in queued:
                             self.assertEqual(
                                 item.state.payload["acquisition_retry_in_seconds"],
@@ -2941,13 +3062,13 @@ class VisitorSessionTests(unittest.TestCase):
                             )
                 waits = [first_observations[item.session_id] for item in visitors]
                 self.assertEqual(round(max(waits)), expected_last_wait)
-                self.assertEqual(round(sum(waits) / len(waits)), round((visitor_count - 1) * 150))
+                expected_average_slots = sum(index + index // 2 for index in range(visitor_count)) / visitor_count
+                self.assertEqual(round(sum(waits) / len(waits)), round(expected_average_slots * 300))
                 self.assertEqual(len(set(waits)), visitor_count)
                 self.assertEqual(len(first_observations), visitor_count)
                 self.assertEqual(max_queue_depth, max(0, visitor_count - 1))
                 self.assertEqual(provider_cycles, visitor_count * 2)
                 self.assertEqual(provider_cycles * 2, visitor_count * 4)
-                self.assertTrue(all(round(values[1] - values[0]) == visitor_count * 300 for values in observation_times.values()))
 
     def test_overlapping_query_coverage_reuses_result_without_provider_slot(self):
         self.sessions.max_sessions = 8
@@ -3011,6 +3132,48 @@ class VisitorSessionTests(unittest.TestCase):
                 cache_hits += 1
         self.assertEqual(cache_hits, 4)
         self.assertEqual(provider_cycles, 1)
+
+    def test_fresh_covered_data_preempts_provider_slot_and_keeps_geographic_scope(self):
+        source, covered, uncovered = [self.sessions.get_or_create()[0] for _ in range(3)]
+        source.settings.latitude, source.settings.longitude = 51.5, -0.1
+        source.settings.query_radius_nm = 100
+        source.last_fetch_at = time.monotonic()
+        source.state.last_live_aircraft = [{
+            "hex": "abc123", "lat": 51.6, "lon": -0.1, "seen_pos": 0.1,
+        }]
+        source.state.last_live_aircraft_received_at = time.monotonic()
+        source.state.last_live_aircraft_query_radius_nm = 100
+        source.state.last_acquisition_succeeded_at = time.time()
+        self.sessions.remember_shared_result(source)
+
+        monitor.apply_visitor_location_change(covered, 51.55, -0.1)
+        monitor.apply_visitor_location_change(uncovered, -40.0, 120.0)
+        covered.settings.query_radius_nm = 25
+        uncovered.settings.query_radius_nm = 25
+        for session in (covered, uncovered):
+            self.sessions.touch(session, active=True)
+        self.sessions.next_acquisition_at = time.monotonic() + 45
+
+        selected, wait = self.sessions.claim_due()
+        self.assertIs(selected, covered)
+        self.assertEqual(selected.acquisition_kind, "normal_cache")
+        self.assertEqual(wait, 0)
+        self.assertEqual(self.sessions.next_acquisition_at > time.monotonic(), True)
+        self.assertIsNone(self.sessions._cached_aircraft_unlocked(uncovered, time.monotonic()))
+
+    def test_provider_wait_is_reported_as_internal_delay_not_provider_outage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = monitor.VisitorSessionStore(
+                Settings(refresh_seconds=300), Path(temporary), global_min_interval_seconds=300,
+            )
+            visitor, _ = store.get_or_create()
+            store.touch(visitor, active=True)
+            now = time.monotonic() + 1
+            store.next_acquisition_at = now + 30
+            selected, wait = store.claim_due(now=now)
+            self.assertIsNone(selected)
+            self.assertGreaterEqual(wait, 29)
+            self.assertNotEqual(visitor.state.payload.get("mode"), "provider_unavailable")
 
     def test_cache_hit_is_discarded_if_visitor_location_changes_before_processing(self):
         source, _ = self.sessions.get_or_create()

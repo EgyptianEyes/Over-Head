@@ -90,6 +90,7 @@ class ProviderFixture:
         self.mode = "live"
         self.requests: list[tuple[float, float, float | None]] = []
         self.targeted_requests: list[str] = []
+        self.diagnostic_events: list[dict[str, Any]] = []
 
     def set_mode(self, mode: str) -> None:
         with self.lock:
@@ -103,6 +104,11 @@ class ProviderFixture:
         with self.lock:
             mode = self.mode
             self.requests.append((settings.latitude, settings.longitude, radius_nm))
+            self.diagnostic_events.append({
+                "at": time.monotonic(), "kind": "geographic", "mode": mode,
+                "latitude": settings.latitude, "longitude": settings.longitude,
+                "radius_nm": radius_nm,
+            })
         if mode == "empty":
             return []
         if mode == "rate_limited":
@@ -132,6 +138,10 @@ class ProviderFixture:
         with self.lock:
             self.targeted_requests.append(target)
             mode = self.mode
+            self.diagnostic_events.append({
+                "at": time.monotonic(), "kind": "tracking", "mode": mode,
+                "target": target,
+            })
         if target in {"HEX:ABC123", "HEX:DEF456"}:
             if mode == "timeout":
                 raise TimeoutError("fixture timeout")
@@ -225,8 +235,205 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.failed_requests: list[str] = []
         self.external_requests: list[str] = []
         self.force_inactive_status = False
+        self.diagnostic_events: list[dict[str, Any]] = []
+        self.diagnostic_lock = threading.Lock()
+        self.diagnostic_enabled = False
+        self.diagnostic_page: Page | None = None
+
+    def record_diagnostic(self, event: str, **details: Any) -> None:
+        if not self.diagnostic_enabled:
+            return
+        record = {"at": time.monotonic(), "event": event, **details}
+        with self.diagnostic_lock:
+            self.diagnostic_events.append(record)
+
+    def scheduler_diagnostic_snapshot(self) -> dict[str, Any]:
+        with self.sessions.lock:
+            return {
+                "at": time.monotonic(),
+                "next_acquisition_at": self.sessions.next_acquisition_at,
+                "initial_priority_streak": self.sessions.initial_priority_streak,
+                "sessions": [
+                    {
+                        "session_id_suffix": session.session_id[-6:],
+                        "active": session.lease.active(),
+                        "lease_revision": session.lease.revision(),
+                        "active_lease_revision": session.active_lease_revision,
+                        "last_fetch_at": session.last_fetch_at,
+                        "last_tracking_at": session.last_tracking_at,
+                        "refresh_reasons": sorted(session.refresh_reasons),
+                        "refresh_requested_at": session.refresh_requested_at,
+                        "initial_acquisition_granted": session.initial_acquisition_granted,
+                        "acquisition_kind": session.acquisition_kind,
+                        "status": session.state.payload.get("acquisition_status"),
+                        "retry_in_seconds": session.state.payload.get("acquisition_retry_in_seconds"),
+                        "tracker": session.tracker.snapshot(),
+                    }
+                    for session in self.sessions.sessions.values()
+                ],
+            }
+
+    def session_id_suffix_for(self, state: Any) -> str | None:
+        with self.sessions.lock:
+            return next((session.session_id[-6:] for session in self.sessions.sessions.values()
+                         if session.state is state), None)
+
+    def install_claim_due_diagnostics(self) -> None:
+        original = self.sessions.claim_due
+
+        def diagnostic_claim_due(*args, **kwargs):
+            selected, retry_in = original(*args, **kwargs)
+            with self.sessions.lock:
+                record = {
+                    "at": time.monotonic(),
+                    "event": "scheduler_claim",
+                    "selected_session_id_suffix": selected.session_id[-6:] if selected else None,
+                    "selected_kind": selected.acquisition_kind if selected else None,
+                    "retry_in": retry_in,
+                    "next_acquisition_at": self.sessions.next_acquisition_at,
+                    "initial_priority_streak": self.sessions.initial_priority_streak,
+                    "sessions": [
+                        {
+                            "session_id_suffix": item.session_id[-6:],
+                            "active": item.lease.active(),
+                            "lease_revision": item.lease.revision(),
+                            "active_lease_revision": item.active_lease_revision,
+                            "last_fetch_at": item.last_fetch_at,
+                            "last_tracking_at": item.last_tracking_at,
+                            "refresh_reasons": sorted(item.refresh_reasons),
+                            "refresh_requested_at": item.refresh_requested_at,
+                            "initial_acquisition_granted": item.initial_acquisition_granted,
+                            "acquisition_kind": item.acquisition_kind,
+                            "retry_in_seconds": item.state.payload.get("acquisition_retry_in_seconds"),
+                        }
+                        for item in self.sessions.sessions.values()
+                    ],
+                }
+            self.record_diagnostic("scheduler_claim", **{k: v for k, v in record.items() if k != "event"})
+            return selected, retry_in
+
+        self.sessions.claim_due = diagnostic_claim_due
+        self.addCleanup(setattr, self.sessions, "claim_due", original)
+
+    def start_scheduler_diagnostics(self) -> threading.Event:
+        stop = threading.Event()
+
+        def sample() -> None:
+            previous = None
+            while not stop.is_set():
+                snapshot = self.scheduler_diagnostic_snapshot()
+                comparable = {key: value for key, value in snapshot.items() if key != "at"}
+                signature = json.dumps(comparable, sort_keys=True, default=str)
+                if signature != previous:
+                    self.record_diagnostic("scheduler", **snapshot)
+                    previous = signature
+                stop.wait(0.025)
+
+        threading.Thread(target=sample, daemon=True).start()
+        return stop
+
+    def install_location_diagnostics(self, page: Page) -> None:
+        request_sessions: dict[int, str | None] = {}
+
+        def on_request(request) -> None:
+            if request.url.split("?", 1)[0] != self.base_url + "/location":
+                return
+            session_suffix = None
+            cookie_header = request.headers.get("cookie", "")
+            cookie = next((part.partition("=")[2] for part in cookie_header.split(";")
+                           if part.strip().startswith("overhead_session=")), None)
+            if cookie:
+                session_suffix = cookie[-6:]
+            request_sessions[id(request)] = session_suffix
+            try:
+                body = request.post_data_json
+            except Exception:
+                body = None
+            self.record_diagnostic("location_post_submitted", session_id_suffix=session_suffix, body=body)
+
+        def on_response(response) -> None:
+            if response.url.split("?", 1)[0] != self.base_url + "/location":
+                return
+            try:
+                result = response.json()
+            except Exception as exc:
+                result = {"response_body_error": type(exc).__name__}
+            request_id = id(response.request)
+            session_suffix = request_sessions.get(request_id)
+            cookie_header = response.request.headers.get("cookie", "")
+            cookie = next((part.partition("=")[2] for part in cookie_header.split(";")
+                           if part.strip().startswith("overhead_session=")), None)
+            if cookie:
+                session_suffix = cookie[-6:]
+            matching_session = next(
+                (item for item in self.sessions.sessions.values() if item.session_id[-6:] == session_suffix),
+                None,
+            )
+            if matching_session is not None:
+                with matching_session.state.lock:
+                    server_state = {
+                        "latitude": matching_session.settings.latitude,
+                        "longitude": matching_session.settings.longitude,
+                        "location_revision": matching_session.state.location_revision,
+                    }
+            else:
+                server_state = None
+            self.record_diagnostic(
+                "location_post_response", session_id_suffix=session_suffix,
+                status=response.status, result=result, server_state_at_response=server_state,
+            )
+
+        page.on("request", on_request)
+        page.on("response", on_response)
+
+    def install_status_diagnostics(self, page: Page) -> None:
+        def on_response(response) -> None:
+            if "/status" not in response.url:
+                return
+            try:
+                payload = response.json()
+                keys = (
+                    "mode", "tracking_active", "tracking_query", "tracking_resolved_callsign",
+                    "tracking_acquisition_outcome", "acquisition_status",
+                    "acquisition_retry_in_seconds", "location_revision", "home_latitude",
+                    "home_longitude",
+                )
+                payload = {key: payload.get(key) for key in keys if key in payload}
+            except Exception as exc:
+                payload = {"response_body_error": type(exc).__name__}
+            self.record_diagnostic("browser_status_response", status=response.status, payload=payload)
+
+        page.on("response", on_response)
+
+    def install_page_lifecycle_diagnostics(self, page: Page, label: str) -> None:
+        def on_request(request) -> None:
+            if "/status?active=" in request.url:
+                self.record_diagnostic(
+                    "lease_touch_request", label=label,
+                    active="/status?active=1" in request.url,
+                )
+
+        def on_response(response) -> None:
+            if "/status?active=" not in response.url:
+                return
+            self.record_diagnostic(
+                "lease_touch_response", label=label, status=response.status,
+                scheduler=self.scheduler_diagnostic_snapshot(),
+            )
+
+        page.on("request", on_request)
+        page.on("response", on_response)
+
+    def diagnostic_failure(self, message: str) -> str:
+        with self.diagnostic_lock:
+            events = list(self.diagnostic_events)
+        return f"{message}; diagnostics={json.dumps(events, sort_keys=True, default=str)}"
 
     def tearDown(self) -> None:
+        if self.diagnostic_enabled:
+            with self.diagnostic_lock:
+                diagnostic_output = json.dumps(self.diagnostic_events, sort_keys=True, default=str)
+            print(f"ACCEPTANCE_DIAGNOSTICS {diagnostic_output}", flush=True)
         for context in self.contexts:
             context.close()
         for session in self.sessions.sessions.values():
@@ -906,6 +1113,239 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.assertEqual(self.page_errors, [])
         self.assertEqual(self.external_requests, [])
 
+    def test_dynamic_location_prompts_on_load_and_manual_choice_remains_available(self) -> None:
+        page = self.new_page(1280, 800)
+        self.assertTrue(page.locator("#location-activation").is_visible())
+        self.assertEqual(page.evaluate("localStorage.getItem('overhead-location-mode-v1')"), "dynamic")
+        page.locator("#location-manual").click()
+        self.wait_for_class(page, "#location-backdrop", "open")
+        self.assertTrue(page.locator("#location-latitude").is_visible())
+        self.assertFalse(page.locator("#location-activation").is_visible())
+        self.assertEqual(self.external_requests, [])
+
+    def test_previously_granted_location_is_applied_automatically(self) -> None:
+        page = self.new_page(1280, 800, {"latitude": 48.8566, "longitude": 2.3522})
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and abs(self.settings.latitude - 48.8566) > 0.0001:
+            time.sleep(0.025)
+        self.assertAlmostEqual(self.settings.latitude, 48.8566, places=4)
+        self.assertAlmostEqual(self.settings.longitude, 2.3522, places=4)
+        self.assertTrue(page.evaluate("localStorage.getItem('overhead-location-mode-v1') === 'dynamic'"))
+
+    def test_denied_location_does_not_repeat_and_manual_fallback_works(self) -> None:
+        context = self.browser.new_context(viewport={"width": 1280, "height": 800})
+        self.contexts.append(context)
+        context.add_init_script(LEAFLET_SHIM)
+        context.add_init_script("""
+          localStorage.setItem('overhead-location-mode-v1','dynamic');
+          localStorage.setItem('overhead-location-denied-v1','1');
+          Object.defineProperty(navigator,'permissions',{value:{query:()=>Promise.resolve({state:'denied'})}});
+                    window.__locationCalls=0;
+                    Object.defineProperty(navigator,'geolocation',{value:{getCurrentPosition:()=>window.__locationCalls++}});
+        """)
+        context.route("**/*", self._offline_route)
+        page = context.new_page()
+        page.on("pageerror", lambda error: self.page_errors.append(str(error)))
+        page.goto(self.base_url + "/", wait_until="domcontentloaded")
+        self.wait_for_text(page, "#mode", lambda text: text.lower() in {"live", "cached observations", "error"}, timeout=10)
+        self.bind_page_session(page)
+        page.wait_for_selector("#location-activation:not([hidden])")
+        self.assertIn("previously declined", page.locator("#location-activation-message").text_content())
+        self.assertEqual(page.evaluate("window.__locationCalls"), 0)
+        page.locator("#location-manual").click()
+        self.wait_for_class(page, "#location-backdrop", "open")
+        page.locator("#location-latitude").fill("35")
+        page.locator("#location-longitude").fill("-120")
+        page.locator("#location-save").click()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and (
+            self.settings.latitude != 35
+            or self.settings.longitude != -120
+            or self.state.location_revision < 1
+        ):
+            time.sleep(0.025)
+        self.assertEqual(
+            (self.settings.latitude, self.settings.longitude), (35, -120),
+            f"manual save did not update visitor session: revision={self.state.location_revision}; "
+            f"sessions={[(s.session_id, s.settings.latitude, s.settings.longitude) for s in self.sessions.sessions.values()]!r}",
+        )
+        self.assertEqual(page.evaluate("localStorage.getItem('overhead-location-mode-v1')"), "manual")
+        self.assertEqual(self.page_errors, [])
+
+    def test_geolocation_timeout_or_unavailable_coordinates_preserve_manual_fallback(self) -> None:
+        context = self.browser.new_context(viewport={"width": 1280, "height": 800})
+        self.contexts.append(context)
+        context.add_init_script(LEAFLET_SHIM)
+        context.add_init_script("""
+          localStorage.setItem('overhead-location-mode-v1','dynamic');
+          Object.defineProperty(navigator,'permissions',{value:{query:()=>Promise.resolve({state:'granted'})}});
+          Object.defineProperty(navigator,'geolocation',{value:{getCurrentPosition:(success,error)=>error({code:3,message:'timeout'})}});
+        """)
+        context.route("**/*", self._offline_route)
+        page = context.new_page()
+        page.on("pageerror", lambda error: self.page_errors.append(str(error)))
+        page.goto(self.base_url + "/", wait_until="domcontentloaded")
+        self.wait_for_text(page, "#mode", lambda text: text.lower() in {"live", "cached observations", "error"}, timeout=10)
+        self.bind_page_session(page)
+        page.wait_for_selector("#location-activation:not([hidden])")
+        self.assertIn("Could not determine", page.locator("#location-activation-message").text_content())
+        self.assertTrue(page.locator("#location-manual").is_visible())
+        self.assertEqual(page.locator("#mode").text_content(), "Live")
+        self.assertEqual(self.page_errors, [])
+
+    def test_explicit_manual_mode_is_preserved_for_returning_visitor(self) -> None:
+        context = self.browser.new_context(viewport={"width": 1280, "height": 800})
+        self.contexts.append(context)
+        context.add_init_script(LEAFLET_SHIM)
+        context.add_init_script("""
+          localStorage.setItem('overhead-location-mode-v1','manual');
+          Object.defineProperty(navigator,'permissions',{value:{query:()=>Promise.resolve({state:'granted'})}});
+          window.__locationCalls=0;
+          Object.defineProperty(navigator,'geolocation',{value:{getCurrentPosition:()=>window.__locationCalls++}});
+        """)
+        context.route("**/*", self._offline_route)
+        page = context.new_page()
+        page.goto(self.base_url + "/", wait_until="domcontentloaded")
+        page.wait_for_timeout(100)
+        self.assertEqual(page.evaluate("window.__locationCalls"), 0)
+        self.assertEqual(page.evaluate("localStorage.getItem('overhead-location-mode-v1')"), "manual")
+
+    def test_location_permission_denial_keeps_dynamic_preference_and_explicit_activation_can_resume(self) -> None:
+        context = self.browser.new_context(viewport={"width": 1280, "height": 800})
+        self.contexts.append(context)
+        context.add_init_script(LEAFLET_SHIM)
+        context.add_init_script("""
+          localStorage.setItem('overhead-location-mode-v1','dynamic');
+          window.__locationCalls=0;
+          Object.defineProperty(navigator,'permissions',{value:{query:()=>Promise.resolve({state:'prompt'})}});
+          Object.defineProperty(navigator,'geolocation',{value:{getCurrentPosition:(success,error)=>{
+            window.__locationCalls++;
+            if(window.__locationCalls===1)error({code:1,message:'denied'});
+            else success({coords:{latitude:35,longitude:-120,accuracy:10}});
+          }}});
+        """)
+        context.route("**/*", self._offline_route)
+        page = context.new_page()
+        page.on("pageerror", lambda error: self.page_errors.append(str(error)))
+        page.goto(self.base_url + "/", wait_until="domcontentloaded")
+        self.wait_for_text(page, "#mode", lambda text: text.lower() in {"live", "cached observations", "error"}, timeout=10)
+        self.bind_page_session(page)
+        page.wait_for_selector("#location-activation:not([hidden])")
+        self.assertEqual(page.evaluate("localStorage.getItem('overhead-location-mode-v1')"), "dynamic")
+        self.assertEqual(page.evaluate("localStorage.getItem('overhead-location-denied-v1')"), "1")
+        page.locator("#location-activate").click()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and self.settings.latitude != 35:
+            time.sleep(0.025)
+        self.assertEqual(self.settings.latitude, 35)
+        self.assertEqual(page.evaluate("localStorage.getItem('overhead-location-mode-v1')"), "dynamic")
+        self.assertIsNone(page.evaluate("localStorage.getItem('overhead-location-denied-v1')"))
+
+    def test_permissions_api_unavailable_attempts_geolocation_without_blocking(self) -> None:
+        context = self.browser.new_context(viewport={"width": 1280, "height": 800})
+        self.contexts.append(context)
+        context.add_init_script(LEAFLET_SHIM)
+        context.add_init_script("""
+          localStorage.setItem('overhead-location-mode-v1','dynamic');
+          Object.defineProperty(navigator,'permissions',{value:undefined});
+          window.__locationCalls=0;
+                    window.__pendingGeolocationSuccess=null;
+          Object.defineProperty(navigator,'geolocation',{value:{getCurrentPosition:(success)=>{
+            window.__locationCalls++;
+                        window.__pendingGeolocationSuccess=success;
+          }}});
+        """)
+        context.route("**/*", self._offline_route)
+        page = context.new_page()
+        page.on("pageerror", lambda error: self.page_errors.append(str(error)))
+        page.goto(self.base_url + "/", wait_until="domcontentloaded")
+        self.wait_for_text(page, "#mode", lambda text: text.lower() in {"live", "cached observations", "error"}, timeout=10)
+        self.assertEqual(page.evaluate("window.__locationCalls"), 1)
+        page.evaluate("window.__pendingGeolocationSuccess({coords:{latitude:35,longitude:-120,accuracy:25}})")
+        self.bind_page_session(page)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and self.settings.latitude != 35:
+            time.sleep(0.025)
+        self.assertEqual(self.settings.latitude, 35)
+        self.assertEqual(self.page_errors, [])
+
+    def test_stale_geolocation_callback_cannot_override_manual_save(self) -> None:
+        context = self.browser.new_context(viewport={"width": 1280, "height": 800})
+        self.contexts.append(context)
+        context.add_init_script(LEAFLET_SHIM)
+        context.add_init_script("""
+          localStorage.setItem('overhead-location-mode-v1','dynamic');
+          Object.defineProperty(navigator,'permissions',{value:{query:()=>Promise.resolve({state:'granted'})}});
+          window.__pendingGeolocationSuccess=null;
+          Object.defineProperty(navigator,'geolocation',{value:{getCurrentPosition:(success)=>{window.__pendingGeolocationSuccess=success;}}});
+        """)
+        context.route("**/*", self._offline_route)
+        page = context.new_page()
+        self.diagnostic_enabled = True
+        self.install_location_diagnostics(page)
+        page.on("pageerror", lambda error: self.page_errors.append(str(error)))
+        page.goto(self.base_url + "/", wait_until="domcontentloaded")
+        self.wait_for_text(page, "#mode", lambda text: text.lower() in {"live", "cached observations", "error"}, timeout=10)
+        self.wait_for_text(page, "#location-activation", lambda _text: True)
+        self.assertTrue(page.evaluate("typeof window.__pendingGeolocationSuccess === 'function'"))
+        page.evaluate("document.getElementById('location-activation').hidden=false")
+        self.bind_page_session(page)
+        self.install_location_diagnostics(page)
+        location_post = {"submitted": False, "response_received": False}
+        location_response = threading.Event()
+
+        def record_location_request(request) -> None:
+            if request.url.split("?", 1)[0] == self.base_url + "/location":
+                location_post["submitted"] = True
+
+        def record_location_response(response) -> None:
+            if response.url.split("?", 1)[0] == self.base_url + "/location":
+                location_post["response_received"] = True
+                location_post["status"] = response.status
+                try:
+                    location_post["result"] = response.json()
+                except Exception as exc:
+                    location_post["result_error"] = type(exc).__name__
+                location_response.set()
+
+        page.on("request", record_location_request)
+        page.on("response", record_location_response)
+        page.locator("#location-manual").click()
+        self.wait_for_class(page, "#location-backdrop", "open")
+        self.wait_for_input_value(page, "#location-latitude", lambda value: value == "51.500000")
+        page.locator("#location-latitude").fill("10")
+        page.locator("#location-longitude").fill("20")
+        page.locator("#location-save").click()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and (
+            (self.settings.latitude, self.settings.longitude) != (10, 20)
+            or self.state.location_revision < 1
+        ):
+            time.sleep(0.025)
+        self.record_diagnostic(
+            "manual_save_assertion_state",
+            post=dict(location_post),
+            response_event_set=location_response.is_set(),
+            session_id_suffix=self.session_id_suffix_for(self.state),
+            server_location={"latitude": self.settings.latitude, "longitude": self.settings.longitude,
+                             "location_revision": self.state.location_revision},
+        )
+        self.assertEqual(
+            (self.settings.latitude, self.settings.longitude), (10, 20),
+            self.diagnostic_failure(
+                f"manual save failed: revision={self.state.location_revision}; "
+                f"server_location=({self.settings.latitude},{self.settings.longitude}); "
+                f"session_id_suffix={self.session_id_suffix_for(self.state)}; "
+                f"location_post={location_post!r}; response_event_set={location_response.is_set()}; "
+                f"page_errors={self.page_errors!r}; button_disabled={page.locator('#location-save').is_disabled()}"
+            ),
+        )
+        page.evaluate("window.__pendingGeolocationSuccess({coords:{latitude:35,longitude:-120,accuracy:5}})")
+        page.wait_for_timeout(100)
+        self.assertEqual((self.settings.latitude, self.settings.longitude), (10, 20))
+        self.assertEqual(page.evaluate("localStorage.getItem('overhead-location-mode-v1')"), "manual")
+        self.assertEqual(self.page_errors, [])
+
     def test_mobile_layout_location_updates_and_restart_persistence(self) -> None:
         page = self.new_page(390, 844, {"latitude": 34.0522, "longitude": -118.2437})
         dimensions = page.evaluate("""() => ({
@@ -918,22 +1358,36 @@ class BrowserAcceptanceTests(unittest.TestCase):
         screenshot = Path(self.temp.name) / "mobile.png"
         page.screenshot(path=str(screenshot))
         self.assertGreater(screenshot.stat().st_size, 1000)
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and (
+            self.state.location_revision < 1
+            or abs(self.state.payload.get("home_latitude", 0) - 34.0522) > 0.0001
+        ):
+            time.sleep(0.025)
         page.locator("#settings-toggle").click()
         page.locator("#settings-location").click()
-        self.wait_for_input_value(page, "#location-latitude", lambda value: value == "51.500000")
-        page.locator("#location-use-device").click()
         self.wait_for_input_value(page, "#location-latitude", lambda value: abs(float(value) - 34.0522) < 0.0001)
+        revision_before_location = self.state.location_revision
+        page.locator("#location-latitude").fill("34.0522")
+        page.locator("#location-longitude").fill("-118.2437")
         with self.sessions.lock:
             self.sessions.next_acquisition_at = 0
         page.locator("#location-save").click()
         deadline = time.monotonic() + 4
         while time.monotonic() < deadline and (
+            self.state.location_revision < revision_before_location + 1
+            or
             abs(self.settings.latitude - 34.0522) > 0.0001
             or abs(self.settings.longitude + 118.2437) > 0.0001
             or not str(self.state.payload.get("callsign") or "").startswith("NEW")
         ):
             time.sleep(0.025)
         self.assertEqual((self.settings.latitude, self.settings.longitude), (34.0522, -118.2437))
+        self.assertEqual(
+            self.state.location_revision, revision_before_location + 1,
+            f"manual mobile save did not advance revision: baseline={revision_before_location}; "
+            f"sessions={[(s.session_id, s.settings.latitude, s.settings.longitude, s.state.location_revision) for s in self.sessions.sessions.values()]!r}",
+        )
         self.assertEqual((self.state.payload["home_latitude"], self.state.payload["home_longitude"]), (34.0522, -118.2437))
         self.assertTrue(self.state.payload["callsign"].startswith("NEW"))
         reloaded = load_settings(self.config)
@@ -957,7 +1411,16 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.assertEqual(self.external_requests, [])
 
     def test_scanning_rate_limit_timeout_recovery_tracking_and_reopen(self) -> None:
+        self.diagnostic_enabled = True
+        stop_diagnostics = self.start_scheduler_diagnostics()
+        self.addCleanup(stop_diagnostics.set)
+        interval_patch = patch.object(monitor, "NORMAL_ACQUISITION_INTERVAL_SECONDS", 0.05)
+        interval_patch.start()
+        self.addCleanup(interval_patch.stop)
+        self.install_claim_due_diagnostics()
         page = self.new_page(1280, 800, {"latitude": 34.0522, "longitude": -118.2437})
+        self.install_status_diagnostics(page)
+        self.install_page_lifecycle_diagnostics(page, "initial")
         self.provider.set_mode("empty")
         self.update_now()
         self.wait_for_text(page, "#mode", lambda text: text == "Scanning")
@@ -980,6 +1443,9 @@ class BrowserAcceptanceTests(unittest.TestCase):
         page.locator("#track-button").click()
         self.wait_for_text(page, "#track-button", lambda text: text == "STOP")
         self.update_now()
+        if self.state.payload.get("tracking_resolved_callsign") != "TST703":
+            self.update_now()
+        self.assertEqual(self.state.payload["tracking_resolved_callsign"], "TST703")
         self.wait_for_text(page, "#radar-range", lambda text: text.startswith("AUTO "))
         self.assertTrue(self.state.payload["tracking_active"])
         self.assertGreaterEqual(self.state.payload["radar_radius_nm"], self.state.payload["distance_nm"] * 1.18)
@@ -992,18 +1458,33 @@ class BrowserAcceptanceTests(unittest.TestCase):
         page.locator("#location-use-device").click()
         self.wait_for_input_value(page, "#location-latitude", lambda value: abs(float(value) - 34.0522) < 0.0001)
         before_location = self.provider.count()
+        revision_before_location = self.state.location_revision
+        with self.sessions.lock:
+            self.sessions.next_acquisition_at = 0
+        self.state.payload.update({"tracking_active": True, "tracking_query": "TST703", "tracking_resolved_callsign": "TST703"})
         page.locator("#location-save").click()
-        self.wait_for_calls(before_location + 1)
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and self.state.location_revision == revision_before_location:
+            time.sleep(0.025)
+        self.assertGreaterEqual(self.state.location_revision, revision_before_location + 1)
+        # This is the same covered geographic area, so a fresh shared-cache hit
+        # is valid and should not require an additional provider request.
+        self.assertGreaterEqual(self.provider.count(), before_location)
+        self.assertEqual((self.settings.latitude, self.settings.longitude), (34.0522, -118.2437))
         deadline = time.monotonic() + 4
         while time.monotonic() < deadline and (
             self.tracker.snapshot()["last_plane"] is None
             or abs(self.tracker.snapshot()["last_plane"]["lat"] - 35.0522) > 0.0001
         ):
             time.sleep(0.025)
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and "tracking_active" not in self.state.payload:
+            time.sleep(0.025)
+        self.assertIn("tracking_active", self.state.payload, f"location update state did not refresh: {self.state.payload!r}")
         self.assertTrue(self.state.payload["tracking_active"])
         tracked_plane = self.tracker.snapshot()["last_plane"]
         self.assertIsNotNone(tracked_plane)
-        self.assertAlmostEqual(tracked_plane["lat"], 52.5)
+        self.assertAlmostEqual(tracked_plane["lat"], self.settings.latitude + 1.0)
         self.assertAlmostEqual(self.state.payload["home_latitude"], 34.0522)
         expected_distance = monitor.haversine_nm(
             self.settings.latitude, self.settings.longitude,
@@ -1012,17 +1493,39 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.assertAlmostEqual(self.state.payload["distance_nm"], expected_distance, delta=0.1)
         self.wait_for_text(page, "#radar-range", lambda text: text.startswith("AUTO "))
 
+        self.record_diagnostic(
+            "before_lease_expiry",
+            session_id_suffix=self.session_id_suffix_for(self.state),
+            tracker=self.tracker.snapshot(), scheduler=self.scheduler_diagnostic_snapshot(),
+            provider_events=list(self.provider.diagnostic_events),
+        )
+
         before_hidden = self.provider.count()
         self.force_inactive_status = True
         with self.lease.lock:
             self.lease.last_seen = time.monotonic() - 13
-        page.wait_for_timeout(2200)
+        deadline = time.monotonic() + 14
+        while time.monotonic() < deadline and self.lease.active():
+            time.sleep(0.05)
         self.assertFalse(self.lease.active())
+        self.record_diagnostic(
+            "lease_expired",
+            session_id_suffix=self.session_id_suffix_for(self.state),
+            tracker=self.tracker.snapshot(), scheduler=self.scheduler_diagnostic_snapshot(),
+            provider_events=list(self.provider.diagnostic_events),
+        )
         self.assertEqual(self.provider.count(), before_hidden)
         self.force_inactive_status = False
+        self.record_diagnostic("before_reactivation", scheduler=self.scheduler_diagnostic_snapshot())
         with self.sessions.lock:
             self.sessions.next_acquisition_at = 0
-        page.evaluate("fetch('/status?active=1')")
+        page.evaluate("fetch('/status?active=1').then(response=>response.json())")
+        self.record_diagnostic("after_reactivation_request", scheduler=self.scheduler_diagnostic_snapshot())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and self.sessions.initial_priority_streak == 0:
+            time.sleep(0.025)
+        with self.sessions.lock:
+            self.sessions.next_acquisition_at = 0
         self.wait_for_calls(before_hidden + 1)
 
         count_before_close = self.provider.count()
@@ -1033,14 +1536,39 @@ class BrowserAcceptanceTests(unittest.TestCase):
         with self.sessions.lock:
             self.sessions.next_acquisition_at = 0
         reopened = browser_context.new_page()
+        self.install_status_diagnostics(reopened)
+        self.install_page_lifecycle_diagnostics(reopened, "reopened")
         reopened.on("pageerror", lambda error: self.page_errors.append(str(error)))
         reopened.goto(self.base_url + "/", wait_until="domcontentloaded")
         self.wait_for_text(reopened, "#mode", lambda text: text.lower() == "live", timeout=10)
         self.bind_page_session(reopened)
+        self.record_diagnostic(
+            "reopened_session_bound",
+            session_id_suffix=self.session_id_suffix_for(self.state),
+            tracker=self.tracker.snapshot(),
+            scheduler=self.scheduler_diagnostic_snapshot(),
+            provider_events=list(self.provider.diagnostic_events),
+        )
         self.wait_for_calls(count_before_close + 1)
         reopened.locator("#track-button").wait_for()
-        self.assertEqual(reopened.locator("#mode").text_content(), "Live")
-        self.assertTrue(self.state.payload["tracking_active"])
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and "tracking_active" not in self.state.payload:
+            time.sleep(0.025)
+        self.record_diagnostic(
+            "reopen_tracking_assertion",
+            session_id_suffix=self.session_id_suffix_for(self.state),
+            state_payload={key: self.state.payload.get(key) for key in (
+                "mode", "tracking_active", "tracking_query", "tracking_resolved_callsign",
+                "acquisition_status", "acquisition_retry_in_seconds",
+            )},
+            tracker=self.tracker.snapshot(), scheduler=self.scheduler_diagnostic_snapshot(),
+            provider_events=list(self.provider.diagnostic_events),
+        )
+        stop_diagnostics.set()
+        self.assertTrue(
+            self.state.payload.get("tracking_active"),
+            self.diagnostic_failure("returning session tracking state missing"),
+        )
         self.assertEqual(self.page_errors, [])
         self.assertEqual(self.external_requests, [])
 

@@ -2143,6 +2143,11 @@ PAGE = b"""<!doctype html>
     .setting-select { min-width:clamp(142px,11vw,190px); cursor:pointer; border:1px solid var(--line); border-radius:999px; padding:.55em 2.2em .55em .9em; background:#061017; color:var(--cyan); font:750 clamp(10px,.9vw,15px)/1.1 "Segoe UI",sans-serif; letter-spacing:.07em; color-scheme:dark; }
     .setting-select:hover,.setting-select:focus-visible { border-color:var(--cyan); outline:none; background:#081820; }
     .settings-location-value { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--white); font-size:clamp(13px,1vw,18px); letter-spacing:.02em; }
+    .location-activation { position:fixed; z-index:1200; top:clamp(68px,8vh,96px); left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:10px; max-width:calc(100vw - 24px); padding:8px 12px; border:1px solid rgba(20,236,255,.38); border-radius:999px; background:rgba(2,5,10,.94); box-shadow:0 8px 28px rgba(0,0,0,.45); color:var(--white); font-size:12px; }
+    .location-activation[hidden] { display:none; }
+    .location-activation button { flex:0 0 auto; padding:7px 10px; border:1px solid rgba(20,236,255,.55); border-radius:999px; background:rgba(20,236,255,.1); color:var(--cyan); font:700 10px/1 "Segoe UI",sans-serif; letter-spacing:.08em; cursor:pointer; }
+    .location-activation button:focus-visible { outline:2px solid var(--white); outline-offset:2px; }
+    @media (max-width:420px) { .location-activation { top:58px; gap:6px; padding:6px 8px; font-size:10px; } .location-activation button { padding:6px 7px; font-size:9px; } }
     .snapshot-backdrop { display:none; position:fixed; inset:0; z-index:5400; align-items:center; justify-content:center; padding:clamp(10px,1.5vw,22px); overflow:hidden; background:rgba(0,2,7,.90); backdrop-filter:blur(8px); }
     .snapshot-backdrop.open { display:flex; }
     .snapshot-dialog { position:relative; width:min(1240px,96vw); height:min(92vh,900px); min-height:0; padding:clamp(16px,1.8vw,26px); display:grid; grid-template-rows:auto minmax(0,1fr); gap:clamp(12px,1.4vh,18px); border:1px solid var(--line); border-radius:clamp(18px,2vw,30px); background:#02050a; box-shadow:0 35px 120px rgba(0,0,0,.72),inset 0 0 70px rgba(20,236,255,.025); }
@@ -2668,6 +2673,7 @@ PAGE = b"""<!doctype html>
     <footer><span class="footer-credits"><span class="footer-credit-line footer-credit-line-1">For Sam <span class="api-heart" id="api-heart" aria-label="API heartbeat normal" title="API heartbeat: waiting for first response"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg></span>&nbsp;&nbsp;&nbsp;&nbsp;Data: <a class="footer-attribution" href="https://adsb.lol/" target="_blank" rel="noopener">ADSB.lol</a> + <a class="footer-attribution" href="https://opendata.adsb.fi/" target="_blank" rel="noopener">ADSB.fi</a><span id="flightaware-credit" hidden> + <a class="footer-attribution" href="https://www.flightaware.com/commercial/aeroapi/" target="_blank" rel="noopener">FlightAware</a></span> + <a class="footer-attribution" href="https://www.adsbdb.com/" target="_blank" rel="noopener">ADSBDB</a> + <a class="footer-attribution" href="https://ourairports.com/data/" target="_blank" rel="noopener">OurAirports</a></span><span class="footer-credit-line footer-credit-line-2">Map: <a class="footer-attribution" href="https://leafletjs.com/" target="_blank" rel="noopener">Leaflet</a> + &copy; <a class="footer-attribution" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>&nbsp;&nbsp;/&nbsp;&nbsp;Places: <a class="footer-attribution" href="https://nominatim.org/" target="_blank" rel="noopener">Nominatim</a>&nbsp;&nbsp;/&nbsp;&nbsp;Logos: <a class="footer-attribution" href="https://github.com/soaring-symbols/soaring-symbols" target="_blank" rel="noopener">Soaring Symbols</a>&nbsp;&nbsp;/&nbsp;&nbsp;Flags: <a class="footer-attribution" href="https://github.com/catamphetamine/country-flag-icons" target="_blank" rel="noopener">country-flag-icons</a></span><span class="footer-credit-line footer-credit-line-3">Sound: arunangshubanerjee via <a class="footer-attribution" href="https://pixabay.com/" target="_blank" rel="noopener">Pixabay</a></span></span></footer>
     <div id="footer-status" aria-live="polite">Connecting</div>
   </section>
+    <div class="location-activation" id="location-activation" role="status" aria-live="polite" hidden><span id="location-activation-message">Use your current location for nearby aircraft.</span><button id="location-activate" type="button">USE MY LOCATION</button><button id="location-manual" type="button">CHOOSE MANUALLY</button></div>
   <div class="snapshot-flash" id="snapshot-flash" aria-hidden="true"></div>
   <div class="snapshot-countdown" id="snapshot-countdown" aria-hidden="true"><div class="snapshot-countdown-panel"><span class="snapshot-countdown-label" id="snapshot-countdown-label">SNAPSHOT IN</span><strong class="snapshot-countdown-number" id="snapshot-countdown-number"></strong></div></div>
   <div class="snapshot-toast" id="snapshot-toast" role="status" aria-live="polite"></div>
@@ -2788,6 +2794,44 @@ PAGE = b"""<!doctype html>
     let routeFlowKey='',routeFlowStartedAt=Date.now();
     let currentHomeLatitude=null,currentHomeLongitude=null,currentLocationRevision=0;
     let locationMap=null,locationMarker=null,locationAccuracyCircle=null,locationDialogRevision=0;
+        const locationModeKey='overhead-location-mode-v1';
+        const locationDeniedKey='overhead-location-denied-v1';
+        let locationLookupInFlight=false,locationRequestRevision=0,pendingLocationMode='dynamic';
+        function dynamicLocationIsDefault(){
+            try{
+                const saved=localStorage.getItem(locationModeKey);
+                if(saved==='manual')return false;
+                if(saved==='dynamic')return true;
+                const legacyManual=localStorage.getItem('overhead-location-mode');
+                if(legacyManual==='manual')return false;
+                localStorage.setItem(locationModeKey,'dynamic');
+            }catch(_){}
+            return true;
+        }
+        function setLocationMode(mode){
+            pendingLocationMode=mode==='manual'?'manual':'dynamic';
+            try{ localStorage.setItem(locationModeKey,pendingLocationMode); }catch(_){}
+        }
+        function rememberLocationDenied(denied){
+            try{ if(denied)localStorage.setItem(locationDeniedKey,'1'); else localStorage.removeItem(locationDeniedKey); }catch(_){}
+        }
+        function locationWasDenied(){
+            try{return localStorage.getItem(locationDeniedKey)==='1';}catch(_){return false;}
+        }
+        function locationPermissionUnavailable(){
+            if(!navigator.geolocation||!window.isSecureContext)return true;
+            return false;
+        }
+        function showLocationActivation(message){
+            const panel=byId('location-activation');
+            if(!panel)return;
+            byId('location-activation-message').textContent=message;
+            panel.hidden=false;
+        }
+        function hideLocationActivation(){
+            const panel=byId('location-activation');
+            if(panel)panel.hidden=true;
+        }
     if(typeof L!=='undefined'){
       routeMap=L.map('route-map',{zoomControl:false,dragging:false,scrollWheelZoom:false,doubleClickZoom:false,boxZoom:false,keyboard:false,touchZoom:false,worldCopyJump:false,attributionControl:false,zoomSnap:.25,zoomDelta:.25,minZoom:0,maxZoom:8});
       L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{minZoom:0,maxZoom:8,attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>'}).addTo(routeMap);
@@ -3380,6 +3424,10 @@ PAGE = b"""<!doctype html>
       locationMap.on('click',event=>{ setLocationCandidate(event.latlng.lat,event.latlng.lng,null,false); locationStatus('Location selected from the map. Save when ready.'); });
     }
     async function openLocationSelector(){
+            locationRequestRevision++;
+            locationLookupInFlight=false;
+            setLocationButtonBusy(false);
+            pendingLocationMode='manual';
             const revision=++locationDialogRevision;
             modalReturnFocus=document.activeElement;
       byId('location-backdrop').classList.add('open');
@@ -3437,27 +3485,67 @@ PAGE = b"""<!doctype html>
             setLocationCandidate(latitude,longitude,null,true);
             locationStatus('Coordinates selected. Save when ready.');
         }
-    function useDeviceLocation(){
-      if(!navigator.geolocation){
+        function useDeviceLocation(applyImmediately=false,allowDeniedRetry=false){
+            if(locationWasDenied()&&!allowDeniedRetry)return;
+            if(locationLookupInFlight)return;
+            pendingLocationMode='dynamic';
+            if(allowDeniedRetry){ setLocationMode('dynamic'); rememberLocationDenied(false); }
+            if(!navigator.geolocation||!window.isSecureContext){
         setLocationButtonBusy(false);
-        locationStatus('This browser does not provide device geolocation. Select the position on the map instead.',true);
+                locationStatus(!window.isSecureContext?'Device location requires a secure connection. Select the position on the map instead.':'This browser does not provide device geolocation. Select the position on the map instead.',true);
+                showLocationActivation('Device location is unavailable. Choose a location manually.');
         return;
       }
+    const requestRevision=++locationRequestRevision;
+            locationLookupInFlight=true;
       setLocationButtonBusy(true);
       locationStatus('Getting a high-accuracy device location...');
+            try{
       navigator.geolocation.getCurrentPosition(
         position=>{
+                    if(requestRevision!==locationRequestRevision||pendingLocationMode!=='dynamic')return;
+                    locationLookupInFlight=false;
           setLocationButtonBusy(false);
           const accuracy=Number(position.coords.accuracy);
+                    if(!Number.isFinite(Number(position.coords.latitude))||!Number.isFinite(Number(position.coords.longitude))||Number(position.coords.latitude)<-90||Number(position.coords.latitude)>90||Number(position.coords.longitude)<-180||Number(position.coords.longitude)>180){
+                        locationStatus('Device returned unavailable coordinates. Select the position on the map instead.',true);
+                        showLocationActivation('Could not determine your location. Choose a location manually.');
+                        return;
+                    }
+                      setLocationMode('dynamic');
+                    rememberLocationDenied(false);
           setLocationCandidate(position.coords.latitude,position.coords.longitude,accuracy,true);
+                    hideLocationActivation();
+                    if(applyImmediately&&dynamicLocationIsDefault()){
+                        fetch('/location',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({latitude:Number(position.coords.latitude),longitude:Number(position.coords.longitude)})})
+                            .then(async response=>{ const data=await response.json(); if(requestRevision!==locationRequestRevision||pendingLocationMode!=='dynamic')return; if(!response.ok)throw new Error(data.error||'Could not apply device location'); if(!dynamicLocationIsDefault())return; currentHomeLatitude=Number(data.latitude); currentHomeLongitude=Number(data.longitude); currentLocationRevision=Math.max(currentLocationRevision,Number(data.location_revision)||0); byId('settings-location-value').textContent=formatCoordinate(currentHomeLatitude)+', '+formatCoordinate(currentHomeLongitude); update(); })
+                            .catch(()=>{ if(requestRevision===locationRequestRevision&&pendingLocationMode==='dynamic')showLocationActivation('Device location was found but could not be applied. Choose a location manually.'); });
+                    }
           locationStatus(Number.isFinite(accuracy)?'Device location found. Reported accuracy is approximately +/-'+Math.round(accuracy)+' metres.':'Device location found. Review the marker and save.');
         },
         error=>{
+                    if(requestRevision!==locationRequestRevision||pendingLocationMode!=='dynamic')return;
+                    locationLookupInFlight=false;
           setLocationButtonBusy(false);
-          locationStatus('Could not get your device location: '+error.message+'. You can still select the point on the map.',true);
+                    if(error&&error.code===1){
+                        locationStatus('Location permission was declined. You can still select the point on the map.',true);
+                        showLocationActivation('Location permission was declined. Choose a location manually.');
+            rememberLocationDenied(true);
+                    }else{
+                        const reason=error&&error.code===3?'Location request timed out.':error&&error.code===2?'Device location is unavailable.':'Could not get your device location.';
+                        locationStatus(reason+' You can still select the point on the map.',true);
+                        showLocationActivation('Could not determine your location. Choose a location manually.');
+                    }
         },
-        {enableHighAccuracy:true,timeout:15000,maximumAge:30000}
+                {enableHighAccuracy:true,timeout:12000,maximumAge:60000}
       );
+            }catch(error){
+                if(requestRevision!==locationRequestRevision||pendingLocationMode!=='dynamic')return;
+                locationLookupInFlight=false;
+                setLocationButtonBusy(false);
+                locationStatus('Could not start device location: '+String(error&&error.message||'request unavailable')+'. Select the point on the map instead.',true);
+                showLocationActivation('Could not start device location. Choose a location manually.');
+            }
     }
     async function saveSelectedLocation(){
             const latitude=Number(byId('location-latitude').value),longitude=Number(byId('location-longitude').value);
@@ -3466,6 +3554,7 @@ PAGE = b"""<!doctype html>
         return;
       }
       const button=byId('location-save');
+            setLocationMode(pendingLocationMode);
       button.disabled=true;
       locationStatus('Saving location and refreshing nearby aircraft...');
       try{
@@ -3893,12 +3982,14 @@ PAGE = b"""<!doctype html>
         if(rangeRevision===radarRangeRevision)drawRadar(d.radar_contacts,d.radar_radius_nm,d.tracking_active);
         byId('flightaware-credit').hidden=!Boolean(d.flightaware_configured);
         byId('footer-status').dataset.warning=String(['rate_limited','provider_unavailable','reconnecting','position_unavailable','last_known','cached','error'].includes(mode)||['stale','invalid_data','rate_limited','provider_unavailable'].includes(d.acquisition_outcome)||['stale','rate_limited','provider_unavailable'].includes(d.tracking_acquisition_outcome));
-        if(d.acquisition_status==='queued'&&d.position_state!=='reported'){
+                if((d.acquisition_status==='queued'||d.acquisition_status==='priority')&&d.position_state!=='reported'){
+                    const priority=d.acquisition_status==='priority';
           const position=Number(d.acquisition_queue_position),length=Number(d.acquisition_queue_length);
-          const queue=Number.isFinite(position)&&Number.isFinite(length)?' ('+position+' of '+length+')':'';
+                    const queue=!priority&&Number.isFinite(position)&&Number.isFinite(length)?' ('+position+' of '+length+')':'';
           const eta=Number.isFinite(Number(d.acquisition_retry_in_seconds))?' - earliest slot about '+formatObservationAge(d.acquisition_retry_in_seconds):'';
           const lastKnown=d.position_state==='last_known'?'Last known position '+formatObservationAge(d.position_age_seconds)+' ago; ':'Position unavailable; ';
-          byId('footer-status').textContent=lastKnown+'waiting in shared aircraft queue'+queue+eta;
+                    const waiting=priority?'priority access: awaiting your first aircraft data opportunity':'waiting in shared aircraft queue'+queue;
+                    byId('footer-status').textContent=lastKnown+waiting+eta;
         }
         else if(d.tracking_acquisition_outcome==='rate_limited')byId('footer-status').textContent='Aircraft updates delayed; retrying when permitted';
         else if(d.tracking_acquisition_outcome==='provider_unavailable')byId('footer-status').textContent='Aircraft updates temporarily unavailable';
@@ -3951,9 +4042,11 @@ PAGE = b"""<!doctype html>
     byId('radar-track-form').addEventListener('submit',submitFlightTracking);
     byId('zoom-in').addEventListener('click',()=>changeRadarRange(-1)); byId('zoom-out').addEventListener('click',()=>changeRadarRange(1));
     byId('settings-location').addEventListener('click',openLocationSelector);
+    byId('location-activate').addEventListener('click',()=>useDeviceLocation(true,true));
+    byId('location-manual').addEventListener('click',()=>{ locationRequestRevision++; locationLookupInFlight=false; setLocationButtonBusy(false); setLocationMode('manual'); pendingLocationMode='manual'; hideLocationActivation(); setSettings(true); openLocationSelector(); });
     byId('location-latitude').addEventListener('change',applyManualLocation);
     byId('location-longitude').addEventListener('change',applyManualLocation);
-    byId('location-use-device').addEventListener('click',useDeviceLocation);
+    byId('location-use-device').addEventListener('click',()=>useDeviceLocation(false,true));
     byId('location-save').addEventListener('click',saveSelectedLocation);
     byId('location-close').addEventListener('click',closeLocationSelector);
     byId('location-cancel').addEventListener('click',closeLocationSelector);
@@ -3974,7 +4067,32 @@ PAGE = b"""<!doctype html>
     }
     if(!snapshotId){ document.addEventListener('mousemove',resetCursorIdle,{passive:true}); resetCursorIdle(); }
     window.addEventListener('resize',()=>requestAnimationFrame(()=>{ fitSingleLine(byId('registration'),18); const logo=byId('operator-logo'); if(logo&&logo.complete&&logo.naturalWidth)fitLogoArtwork(logo); }));
-    if(snapshotId){ update(); }else{ setInterval(update,2000); setInterval(tickCommentaryCountdown,250); setInterval(rotateIdleMessage,4000); setInterval(advanceRotation,250); update(); loadSnapshotGallery(false); } document.addEventListener('dblclick',toggleFullscreen);
+        if(snapshotId){ update(); }else{
+            setInterval(update,2000); setInterval(tickCommentaryCountdown,250); setInterval(rotateIdleMessage,4000); setInterval(advanceRotation,250);
+            update(); loadSnapshotGallery(false);
+            if(dynamicLocationIsDefault()){
+                const previouslyDenied=locationWasDenied();
+                if(navigator.permissions&&navigator.permissions.query){
+                    navigator.permissions.query({name:'geolocation'}).then(permission=>{
+                        if(permission.state==='granted'){
+                            rememberLocationDenied(false);
+                            useDeviceLocation(true);
+                        }
+                        else if(permission.state==='prompt'){
+                            showLocationActivation('Use your location to find nearby aircraft.');
+                              // Attempt the prompt immediately; browsers requiring a gesture leave the visible activation control available.
+                            if(!previouslyDenied&&!locationPermissionUnavailable())useDeviceLocation(true);
+                        }else{ rememberLocationDenied(true); showLocationActivation('Location permission was previously declined. Choose a location manually.'); }
+                    }).catch(()=>{
+                        showLocationActivation('Use your location to find nearby aircraft.');
+                        if(!previouslyDenied&&!locationPermissionUnavailable())useDeviceLocation(true);
+                    });
+                }else if(!locationPermissionUnavailable()){
+                    showLocationActivation('Use your location to find nearby aircraft.');
+                    if(!previouslyDenied)useDeviceLocation(true);
+                }else showLocationActivation('Device location is unavailable here. Choose a location manually.');
+            }
+        } document.addEventListener('dblclick',toggleFullscreen);
   </script>
 </body>
 </html>
@@ -5730,6 +5848,7 @@ class VisitorSession:
         self.last_access_at = time.monotonic()
         self.cookie_issued_at = self.last_access_at
         self.last_fetch_at = 0.0
+        self.initial_acquisition_granted = False
         self.last_tracking_at = 0.0
         self.last_auto_tracking_at = 0.0
         self.auto_tracking_key: tuple[str, ...] | None = None
@@ -5786,6 +5905,7 @@ class VisitorSessionStore:
         self.shared_auto_tracking_results: dict[tuple[str, ...], dict[str, Any]] = {}
         self.sessions: dict[str, VisitorSession] = {}
         self.next_acquisition_at = 0.0
+        self.initial_priority_streak = 0
         self.next_tracking_at = 0.0
         self.tracking_next_due: dict[tuple[str, ...], float] = {}
         self.last_snapshot_reconcile_at = 0.0
@@ -5926,6 +6046,7 @@ class VisitorSessionStore:
                 lease_revision = session.lease.revision()
                 if lease_revision > session.active_lease_revision:
                     session.active_lease_revision = lease_revision
+                    session.initial_acquisition_granted = False
                     session.refresh_reasons.add("activation")
                     if session.refresh_requested_at is None:
                         session.refresh_requested_at = now
@@ -6215,6 +6336,7 @@ class VisitorSessionStore:
                 item.last_scheduled_at,
             ))
             tracking_due.sort(key=lambda item: (
+                item.initial_acquisition_granted,
                 item.last_tracking_success_at,
                 item.refresh_requested_at
                 if "tracking" in item.refresh_reasons and item.refresh_requested_at is not None
@@ -6233,7 +6355,136 @@ class VisitorSessionStore:
             if automatic_wait < 0.001:
                 automatic_wait = 0.0
             session = None
-            if tracking_due:
+            explicit_geo_due = [item for item in due if item.refresh_reasons.intersection({"location", "manual"})]
+            # A covered, fresh shared observation is useful immediately and
+            # does not spend an upstream slot. Prefer it even while the next
+            # provider-backed geographic slot is reserved or tracking is due.
+            for candidate in due:
+                cached_result = self._cached_aircraft_unlocked(candidate, current)
+                if cached_result is None:
+                    continue
+                session = candidate
+                session.cached_acquisition = cached_result
+                session.cached_tracking_result = None
+                session.acquisition_kind = "normal_cache"
+                session.initial_acquisition_granted = True
+                due.remove(candidate)
+                session.last_fetch_at = current
+                session.last_scheduled_at = current
+                session.refresh_requested_at = None
+                session.refresh_reasons.clear()
+                self.initial_priority_streak = 0
+                break
+            if session is None and not explicit_geo_due and not any("activation" in item.refresh_reasons for item in due):
+                for candidate in tracking_due:
+                    cached_result = self._cached_tracking_unlocked(candidate, current)
+                    if cached_result is None:
+                        continue
+                    session = candidate
+                    session.cached_tracking_result = cached_result
+                    session.acquisition_kind = "tracking_cache"
+                    session.initial_acquisition_granted = True
+                    session.last_tracking_at = float(cached_result.get("attempted_at", cached_result["received_at"]))
+                    session.refresh_reasons.discard("tracking")
+                    self.initial_priority_streak = 0
+                    break
+            # Initial visits get weighted priority in the shared geographic
+            # lane. This does not bypass the provider slot or request budget.
+            first_acquisition_due = [
+                item for item in due
+                if not item.initial_acquisition_granted
+            ]
+            initial_due = [item for item in first_acquisition_due if not item.tracker.snapshot()["active"]]
+            established_due = [item for item in due if item.initial_acquisition_granted]
+            established_due.extend(
+                item for item in due
+                if item not in established_due and (
+                    item.tracker.snapshot()["active"]
+                )
+            )
+            explicit_geo_due = [item for item in due if item.refresh_reasons.intersection({"location", "manual"})]
+            established_tracking_ready = any(
+                self.tracking_next_due.get(self.tracking_share_key(item), 0.0) <= current
+                for item in tracking_due
+            )
+            established_automatic_ready = any(
+                self.tracking_next_due.get(item.auto_tracking_key, 0.0) <= current
+                for item in automatic_due
+            )
+            established_work_due = bool(
+                established_due
+                or established_tracking_ready
+                or established_automatic_ready
+                or (initial_due and self.initial_priority_streak >= 2)
+            )
+            if session is None and explicit_geo_due and normal_wait <= 0.0:
+                session = explicit_geo_due[0]
+                due.remove(session)
+                cached_result = self._cached_aircraft_unlocked(session, current)
+                session.cached_acquisition = cached_result
+                session.acquisition_kind = "normal_cache" if cached_result is not None else "normal"
+                self.initial_priority_streak = 0
+                session.last_fetch_at = current
+                session.last_scheduled_at = current
+                session.refresh_requested_at = None
+                preserved = {reason for reason in session.refresh_reasons if reason == "tracking"}
+                session.refresh_reasons.clear()
+                session.refresh_reasons.update(preserved)
+                if cached_result is None:
+                    self.next_acquisition_at = current + normal_interval
+            if session is None and initial_due and normal_wait <= 0.0 and (
+                self.initial_priority_streak < 2 or not established_work_due
+            ):
+                priority_candidates = initial_due
+                for candidate in priority_candidates:
+                    cached_result = self._cached_aircraft_unlocked(candidate, current)
+                    if cached_result is not None:
+                        session = candidate
+                        session.cached_acquisition = cached_result
+                        session.acquisition_kind = "normal_cache"
+                        session.initial_acquisition_granted = True
+                        self.initial_priority_streak += 1
+                        due.remove(candidate)
+                        session.last_fetch_at = current
+                        session.last_scheduled_at = current
+                        session.refresh_requested_at = None
+                        session.refresh_reasons.clear()
+                        break
+                if session is None:
+                    session = priority_candidates[0]
+                    due.remove(session)
+                    session.cached_acquisition = None
+                    session.cached_tracking_result = None
+                    session.acquisition_kind = "normal"
+                    session.initial_acquisition_granted = True
+                    self.initial_priority_streak += 1
+                    session.last_fetch_at = current
+                    session.last_scheduled_at = current
+                    session.refresh_requested_at = None
+                    session.refresh_reasons.clear()
+                    self.next_acquisition_at = current + normal_interval
+            elif session is None and established_due and normal_wait <= 0.0 and (
+                (not tracking_due and not automatic_due)
+                or (initial_due and self.initial_priority_streak >= 2)
+                or any(item.refresh_reasons.intersection({"location", "manual"}) for item in established_due)
+            ):
+                session = next((
+                    item for item in established_due
+                    if item.refresh_reasons.intersection({"location", "manual"})
+                ), established_due[0])
+                due.remove(session)
+                cached_result = self._cached_aircraft_unlocked(session, current)
+                session.cached_acquisition = cached_result
+                session.acquisition_kind = "normal_cache" if cached_result is not None else "normal"
+                self.initial_priority_streak = 0
+                session.last_fetch_at = current
+                session.last_scheduled_at = current
+                session.refresh_requested_at = None
+                preserved = {reason for reason in session.refresh_reasons if reason == "tracking"}
+                session.refresh_reasons.clear()
+                session.refresh_reasons.update(preserved)
+                self.next_acquisition_at = current + normal_interval
+            if tracking_due and session is None and not explicit_geo_due:
                 for candidate in tracking_due:
                     cached_result = self._cached_tracking_unlocked(candidate, current)
                     if cached_result is not None:
@@ -6242,6 +6493,7 @@ class VisitorSessionStore:
                         session.acquisition_kind = "tracking_cache"
                         session.last_tracking_at = float(cached_result.get("attempted_at", cached_result["received_at"]))
                         session.refresh_reasons.discard("tracking")
+                        self.initial_priority_streak = 0
                         break
             if session is None and automatic_due and not (due and normal_wait <= 0.0):
                 for candidate in automatic_due:
@@ -6270,8 +6522,26 @@ class VisitorSessionStore:
                     key = session.auto_tracking_key
                     if key is not None:
                         self.tracking_next_due[key] = current + AUTOMATIC_ACQUISITION_INTERVAL_SECONDS
+            if session is None and any(item.refresh_reasons.intersection({"location", "manual"}) for item in due) and normal_wait <= 0.0:
+                session = next(
+                    item for item in due
+                    if item.refresh_reasons.intersection({"location", "manual"})
+                )
+                due.remove(session)
+                cached_result = self._cached_aircraft_unlocked(session, current)
+                session.cached_acquisition = cached_result
+                session.acquisition_kind = "normal_cache" if cached_result is not None else "normal"
+                session.last_fetch_at = current
+                session.last_scheduled_at = current
+                session.refresh_requested_at = None
+                preserved = {reason for reason in session.refresh_reasons if reason == "tracking"}
+                session.refresh_reasons.clear()
+                session.refresh_reasons.update(preserved)
+                self.initial_priority_streak = 0
+                if cached_result is None:
+                    self.next_acquisition_at = current + normal_interval
             eligible = [item for item in tracking_due if self.tracking_next_due.get(self.tracking_share_key(item), 0.0) <= current]
-            if session is None and eligible:
+            if session is None and eligible and not explicit_geo_due:
                 session = eligible[0]
                 tracking_due.remove(session)
                 combine_normal = False
@@ -6279,6 +6549,11 @@ class VisitorSessionStore:
                 session.cached_tracking_result = None
                 session.last_tracking_at = current
                 session.last_scheduled_at = current
+                if session.initial_acquisition_granted:
+                    self.initial_priority_streak = 0
+                else:
+                    session.initial_acquisition_granted = True
+                    self.initial_priority_streak += 1
                 session.refresh_reasons.discard("tracking")
                 if combine_normal:
                     due.remove(session)
@@ -6294,24 +6569,34 @@ class VisitorSessionStore:
                     due.remove(session)
                 if session in tracking_due:
                     tracking_due.remove(session)
-            if session is None and due:
+            if session is not None and session.acquisition_kind in {"normal", "combined", "tracking", "automatic_tracking"}:
+                wait_until_next = 0.0
+            if session is None and due and not tracking_due:
                 for candidate in due:
                     cached_result = self._cached_aircraft_unlocked(candidate, current)
                     if cached_result is not None:
                         session = candidate
                         session.cached_acquisition = cached_result
                         session.acquisition_kind = "normal_cache"
+                        session.initial_acquisition_granted = True
                         due.remove(candidate)
+                        self.initial_priority_streak = 0
                         session.last_fetch_at = current
                         session.last_scheduled_at = current
                         session.refresh_requested_at = None
                         session.refresh_reasons.clear()
                         break
                 if session is None and normal_wait <= 0.0:
-                    session = due.pop(0)
+                    if initial_due and established_due and self.initial_priority_streak >= 2:
+                        session = next((item for item in established_due if item in due), None)
+                    if session is None:
+                        session = due[0]
+                    due.remove(session)
                     session.cached_acquisition = None
                     session.cached_tracking_result = None
                     session.acquisition_kind = "normal"
+                    session.initial_acquisition_granted = True
+                    self.initial_priority_streak = 0
                     session.last_fetch_at = current
                     session.last_scheduled_at = current
                     session.refresh_requested_at = None
@@ -6364,9 +6649,14 @@ class VisitorSessionStore:
             for position, queued in enumerate(queue, start=1):
                 wait_seconds = queue_wait + (position - 1) * interval
                 with queued.state.lock:
-                    queued.state.payload["acquisition_status"] = "queued"
-                    queued.state.payload["acquisition_queue_position"] = position
-                    queued.state.payload["acquisition_queue_length"] = len(queue)
+                    first_opportunity = queued in due and not queued.initial_acquisition_granted
+                    queued.state.payload["acquisition_status"] = "priority" if first_opportunity else "queued"
+                    if first_opportunity:
+                        queued.state.payload.pop("acquisition_queue_position", None)
+                        queued.state.payload.pop("acquisition_queue_length", None)
+                    else:
+                        queued.state.payload["acquisition_queue_position"] = position
+                        queued.state.payload["acquisition_queue_length"] = len(queue)
                     queued.state.payload["acquisition_retry_in_seconds"] = int(wait_seconds + 0.999)
         self._remove_snapshot_folders(expired_paths)
         wait_until_next = min(
@@ -6375,7 +6665,11 @@ class VisitorSessionStore:
             normal_wait if due else float("inf"),
         )
         if session is not None:
-            return session, 0.0 if session.cached_acquisition is not None or session.cached_tracking_result is not None else wait_until_next
+            if session.cached_acquisition is not None or session.cached_tracking_result is not None or session.cached_auto_tracking_result is not None:
+                return session, 0.0
+            if session.acquisition_kind in {"normal", "combined", "tracking", "automatic_tracking"}:
+                return session, 0.0
+            return session, wait_until_next
         return None, wait_until_next if math.isfinite(wait_until_next) else None
 
 
@@ -6821,8 +7115,19 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                     last_succeeded_at = state.last_acquisition_succeeded_at
                     metric_observations = [dict(sample) for sample in state.metric_observations]
                     metric_observation_aircraft_id = state.metric_observation_aircraft_id
+                if tracker is not None:
+                    tracking_state = tracker.snapshot()
+                    snapshot["tracking_active"] = bool(tracking_state["active"])
+                    snapshot["tracking_query"] = str(tracking_state["query"] or "")
+                    snapshot["tracking_resolved_callsign"] = str(tracking_state["resolved_callsign"] or "")
+                    if tracking_state["active"] and tracking_state["last_plane"] is None:
+                        snapshot["tracking_found"] = False
+                        snapshot["tracking_acquisition_outcome"] = "waiting"
                 if sessions is not None and session is not None and session.refresh_requested_at is not None:
-                    snapshot["acquisition_status"] = "queued"
+                    if session.state.payload.get("acquisition_status") == "priority":
+                        snapshot["acquisition_status"] = "priority"
+                    elif session.state.payload.get("acquisition_status") == "queued":
+                        snapshot["acquisition_status"] = "queued"
                 now_monotonic = time.monotonic()
                 position_age = (
                     max(0.0, now_monotonic - position_observed_at)
