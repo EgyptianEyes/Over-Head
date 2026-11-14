@@ -90,6 +90,7 @@ EMPTY_PRIMARY_VERIFY_EVERY = 3
 _active_aircraft_provider = ""
 _last_aircraft_observation: float | None = None
 _provider_empty_counts: dict[str, int] = {}
+_provider_last_counts: dict[str, dict[str, int]] = {}
 
 
 def normalise_aircraft(record: dict[str, Any], source: str, received_at: float, payload_time: Any = None) -> dict[str, Any]:
@@ -157,6 +158,7 @@ def aircraft_provider_status() -> dict[str, dict[str, object]]:
     providers = {
         name: {
             "requests": _provider_request_counts.get(name, 0),
+            "last_response_counts": dict(_provider_last_counts.get(name, {})),
             "retry_in_seconds": round(max(0.0, _provider_retry_until.get(name, 0) - now)),
             "last_status": _provider_last_status.get(name, "not-tested"),
             "last_attempt_at": _provider_last_attempt_at.get(name),
@@ -235,6 +237,10 @@ def fetch_provider_aircraft(path: str) -> list[dict[str, Any]]:
                          and record.get("seen_pos", 999) <= (60 if targeted else 20)]
                 stale = [record for record in records if record.get("observed_at") is not None
                          and record.get("seen_pos", 999) > (60 if targeted else 20)]
+                _provider_last_counts[name] = {
+                    "returned": len(records), "valid_positions": len(records) - len(invalid_positions),
+                    "invalid_positions": len(invalid_positions), "stale": len(stale), "accepted": len(fresh),
+                }
                 if records and not fresh and (invalid_positions or stale):
                     invalid_response = bool(invalid_positions)
                     stale_response = bool(stale) and not invalid_positions

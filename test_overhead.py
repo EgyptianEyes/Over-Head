@@ -1955,15 +1955,11 @@ class OverHeadTests(unittest.TestCase):
 
     def test_mobile_footer_uses_three_explicit_credit_lines_without_truncation(self):
         self.assertEqual(PAGE.count(b'class="footer-credit-line footer-credit-line-'), 3)
-        self.assertIn(b"grid-template-rows:34px minmax(0,1fr) 34px;", PAGE)
+        self.assertIn(b"grid-template-rows:34px minmax(270px,1fr) auto auto;", PAGE)
         mobile = PAGE.split(b"/* Mobile is a single-view application", 1)[1]
-        self.assertIn(b"grid-template-rows:auto auto auto;", mobile)
-        self.assertIn(b"font-size:clamp(6.2px,1.85vw,7.5px);", mobile)
-        self.assertIn(b".footer-credit-line-1 { grid-column:1 / -1; grid-row:1; }", mobile)
-        self.assertIn(b".footer-credit-line-2 { grid-column:1 / -1; grid-row:2; }", mobile)
-        self.assertIn(b".footer-credit-line-3 { grid-column:1; grid-row:3; }", mobile)
+        self.assertIn(b"font-size:10px;", mobile)
+        self.assertIn(b".footer-attribution { white-space:normal; }", mobile)
         self.assertIn(b"overflow:visible;", mobile)
-        self.assertNotIn(b"text-overflow:ellipsis;", mobile.split(b".location-backdrop", 1)[0])
 
     def test_footer_heart_has_health_states_and_pulse_animation(self):
         self.assertIn(b'id="api-heart"', PAGE)
@@ -2079,11 +2075,13 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn(b'>Nominatim<', footer)
         self.assertNotIn(b'Inspired by: ', footer)
 
-    def test_mobile_update_timestamp_shares_third_footer_row(self):
+    def test_mobile_status_has_dedicated_wrapping_row(self):
         mobile = PAGE.split(b"/* Mobile is a single-view application", 1)[1]
         self.assertIn(b"#footer-status {", mobile)
         self.assertIn(b"position:absolute;", mobile)
-        self.assertIn(b"max-width:58vw;", mobile)
+        self.assertIn(b"grid-row:3;", mobile)
+        self.assertIn(b"font-size:13px;", mobile)
+        self.assertIn(b"overflow-wrap:anywhere;", mobile)
 
     def test_readme_documents_three_line_mobile_footer(self):
         readme = Path(__file__).with_name("README.md").read_text(encoding="utf-8")
@@ -2823,7 +2821,7 @@ class VisitorSessionTests(unittest.TestCase):
         self.assertNotIn(second.session_id, self.sessions.sessions)
         self.assertFalse(old_snapshot_root.exists())
 
-    def test_normal_and_automatic_acquisition_deadlines_are_60_and_30_seconds(self):
+    def test_normal_and_automatic_acquisition_deadlines_are_60_and_15_seconds(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = monitor.VisitorSessionStore(
                 Settings(refresh_seconds=300), Path(temporary), global_min_interval_seconds=0,
@@ -2844,11 +2842,32 @@ class VisitorSessionTests(unittest.TestCase):
                 session.state.position_observed_at_monotonic = now
             session.last_fetch_at = now
             self.assertIsNone(store.claim_due(now=now + 0.02)[0])
-            self.assertIsNone(store.claim_due(now=now + 29.99)[0])
-            selected, _ = store.claim_due(now=now + 30.02)
+            self.assertIsNone(store.claim_due(now=now + 14.99)[0])
+            selected, _ = store.claim_due(now=now + 15.02)
             self.assertIs(selected, session)
             self.assertEqual(selected.acquisition_kind, "automatic_tracking")
             self.assertEqual(store.next_acquisition_at, now + 60.0)
+
+    def test_automatic_refresh_target_survives_display_freshness_expiry(self):
+        with patch("monitor.time.monotonic", return_value=1000.0) as clock:
+            session, _ = self.sessions.get_or_create()
+            self.sessions.touch(session, active=True)
+            session.last_fetch_at = 1000.0
+            plane = {"hex": "abc123", "lat": session.settings.latitude + .01,
+                     "lon": session.settings.longitude, "seen_pos": 0.1}
+            session.state.last_live_aircraft = [plane]
+            session.state.last_live_aircraft_received_at = 1000.0
+            session.state.position_observed_at_monotonic = 1000.0
+            session.state.payload["aircraft_id"] = "ABC123"
+            self.sessions.claim_due()
+            clock.return_value = 1031.0
+            self.sessions.touch(session, active=True)
+            selected, _ = self.sessions.claim_due()
+            self.assertIs(selected, session)
+            self.assertEqual(session.acquisition_kind, "automatic_tracking")
+            # Keeping a lookup target must not make the expired position eligible.
+            aged = monitor.age_aircraft_positions([plane], 31)
+            self.assertIsNone(monitor.select_nearest_within_radius(aged, session.settings, 60)[0])
 
     def test_automatic_tracking_result_is_shared_by_aircraft_identity(self):
         source, _ = self.sessions.get_or_create()
@@ -2943,12 +2962,14 @@ class VisitorSessionTests(unittest.TestCase):
         self.sessions.remember_shared_result(source)
         monitor.apply_visitor_location_change(visitor, 52.0, -0.1)
         visitor.settings.query_radius_nm = 25
+        self.sessions.next_acquisition_at = time.monotonic() + 60
         store_next_acquisition = self.sessions.next_acquisition_at
         self.sessions.touch(visitor, active=True)
         selected, _ = self.sessions.claim_due(now=time.monotonic())
         self.assertIs(selected, visitor)
         self.assertIsNotNone(visitor.cached_acquisition)
         self.assertEqual(visitor.cached_acquisition["aircraft"][0]["hex"], "abc123")
+        self.assertIsNone(self.sessions._cached_aircraft_unlocked(visitor, time.monotonic() + 21))
         self.assertEqual(self.sessions.next_acquisition_at, store_next_acquisition)
         class EmptyStore:
             def get(self, *args):
@@ -2978,6 +2999,7 @@ class VisitorSessionTests(unittest.TestCase):
             identical.append(other)
         self.sessions.touch(source, active=True)
         now = time.monotonic() + 0.01
+        self.sessions.next_acquisition_at = now
         cache_hits = 0
         provider_cycles = 0
         for _ in range(5):

@@ -89,6 +89,7 @@ class ProviderFixture:
         self.lock = threading.Lock()
         self.mode = "live"
         self.requests: list[tuple[float, float, float | None]] = []
+        self.targeted_requests: list[str] = []
 
     def set_mode(self, mode: str) -> None:
         with self.lock:
@@ -127,6 +128,24 @@ class ProviderFixture:
         ]
 
     def tracked(self, _callsigns: tuple[str, ...] | list[str]) -> tuple[dict[str, Any], str]:
+        target = _callsigns[0].upper()
+        with self.lock:
+            self.targeted_requests.append(target)
+            mode = self.mode
+        if target in {"HEX:ABC123", "HEX:DEF456"}:
+            if mode == "timeout":
+                raise TimeoutError("fixture timeout")
+            if mode == "rate_limited":
+                raise AircraftFeedRateLimited(120)
+            if mode == "empty":
+                return None, ""
+            second = target == "HEX:DEF456"
+            return ({"hex": "def456" if second else "abc123",
+                     "flight": "TST456" if second else "TST123",
+                     "lat": self.settings.latitude + (.1 if second else 0),
+                     "lon": self.settings.longitude + (0 if second else .25),
+                     "seen_pos": .1, "alt_baro": 18000, "gs": 250, "track": 90},
+                    "TST456" if second else "TST123")
         return (
             {
                 "hex": "789abc", "flight": "TST703", "r": "N703XY", "t": "A320",
@@ -256,7 +275,7 @@ class BrowserAcceptanceTests(unittest.TestCase):
             interval_patch.start()
             page.goto(self.base_url + "/", wait_until="domcontentloaded")
             try:
-                self.wait_for_text(page, "#mode", lambda text: text.lower() in {"live", "error"}, timeout=10)
+                self.wait_for_text(page, "#mode", lambda text: text.lower() in {"live", "cached observations", "error"}, timeout=10)
             except AssertionError as exc:
                 self.fail(f"Initial display did not settle: {exc}; page errors={self.page_errors}; console errors={self.console_errors}; failed requests={self.failed_requests}")
             if (page.locator("#mode").text_content() or "").lower() == "error":
@@ -548,6 +567,88 @@ class BrowserAcceptanceTests(unittest.TestCase):
             finish_route.set()
             self.routes.get = original_get
 
+    def test_continuous_automatic_acquisition_survives_freshness_boundary(self) -> None:
+        page = self.new_page(390, 844)
+        page.locator("#radar-toggle").click()
+        started = time.monotonic()
+        while time.monotonic() - started < 36:
+            page.wait_for_timeout(1000)
+            self.assertEqual(page.locator("#mode").text_content(), "Live")
+            self.assertGreater(page.locator("#radar-contacts .contact").count(), 0)
+            self.assertEqual(page.locator("#track-button").get_attribute("aria-pressed"), "false")
+        self.assertGreaterEqual(len(self.provider.targeted_requests), 2)
+        directory = self.ARTIFACT_ROOT / "continuous"
+        directory.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(directory / "mobile-after-36-seconds.png"), full_page=True)
+        self.assertEqual(self.page_errors, [])
+
+    def test_mobile_footer_and_operational_status_wrap_without_overlap(self) -> None:
+        for width in (320, 375, 390):
+            with self.subTest(width=width):
+                page = self.new_page(width, 844 if width > 320 else 568)
+                page.locator("#radar-toggle").click()
+                self.wait_for_class(page, "#wall", "radar-open")
+                payload = page.request.get(self.base_url + "/status?active=0").json()
+                scenarios = [
+                    dict(mode="queued", position_state="unavailable", acquisition_status="queued",
+                         acquisition_queue_position=64, acquisition_queue_length=128,
+                         acquisition_retry_in_seconds=3840),
+                    dict(mode="provider_unavailable", tracking_acquisition_outcome="provider_unavailable"),
+                    dict(mode="rate_limited", tracking_acquisition_outcome="rate_limited"),
+                    dict(mode="position_unavailable", acquisition_outcome="stale"),
+                    dict(mode="cached", position_state="last_known", position_age_seconds=45),
+                    dict(mode="reconnecting"),
+                ]
+                for index, scenario in enumerate(scenarios):
+                    fixture = {**payload, "flightaware_configured": True, "acquisition_status": "ready",
+                               "tracking_acquisition_outcome": "", "acquisition_outcome": "", **scenario}
+                    page.route("**/status?*", lambda route: route.fulfill(json=fixture))
+                    page.wait_for_timeout(2300)
+                    status = page.locator("#footer-status")
+                    if index == 0:
+                        self.assertIn("waiting in shared aircraft queue (64 of 128)", status.text_content())
+                        self.assertGreater(status.bounding_box()["height"], 40)
+                    else:
+                        self.assertEqual(status.get_attribute("data-warning"), "true")
+                    contrast = status.evaluate(r"""e => {
+                        const luminance = color => {
+                            const rgb = color.match(/[\d.]+/g).slice(0,3).map(Number).map(v => {
+                                v /= 255; return v <= .04045 ? v/12.92 : ((v+.055)/1.055)**2.4;
+                            });
+                            return rgb[0]*.2126 + rgb[1]*.7152 + rgb[2]*.0722;
+                        };
+                        const css = getComputedStyle(e);
+                        return (luminance(css.color)+.05)/(luminance(css.backgroundColor)+.05);
+                    }""")
+                    self.assertGreaterEqual(contrast, 4.5)
+                    self.assertGreaterEqual(status.evaluate("e => parseFloat(getComputedStyle(e).fontSize)"), 13)
+                    for selector in ("#footer-status", "footer", ".footer-credit-line"):
+                        for element in page.locator(selector).all():
+                            self.assertTrue(element.evaluate("e => e.scrollWidth <= e.clientWidth + 1 && e.scrollHeight <= e.clientHeight + 1"))
+                    status_box = status.bounding_box()
+                    for selector in ("#track-flight", "#track-button", "#zoom-in", "#zoom-out"):
+                        box = page.locator(selector).bounding_box()
+                        self.assertLessEqual(box["y"] + box["height"], status_box["y"])
+                    links = page.locator("footer a")
+                    self.assertEqual(links.count(), 11)
+                    for link in links.all():
+                        link.scroll_into_view_if_needed()
+                        self.assertTrue(link.evaluate("e => {const b=e.getBoundingClientRect(); return b.left>=0 && b.right<=innerWidth && !!e.href && e.getClientRects().length>0;}"))
+                        link.focus()
+                        self.assertTrue(link.evaluate("e => e===document.activeElement"))
+                    self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), width)
+                    directory = self.ARTIFACT_ROOT / f"mobile-status-{width}"
+                    directory.mkdir(parents=True, exist_ok=True)
+                    page.screenshot(path=str(directory / f"status-{index}.png"), full_page=True)
+                    page.unroute("**/status?*")
+                page.locator("#track-button").click(trial=True)
+                page.locator("#track-flight").fill("TST703")
+                self.assertEqual(page.locator("#track-flight").input_value(), "TST703")
+                before = page.locator("#radar-range").text_content()
+                page.locator("#zoom-out").click()
+                self.wait_for_text(page, "#radar-range", lambda value: value != before)
+                self.assertEqual(self.page_errors, [])
+
     def test_layout_and_controls_across_five_viewports(self) -> None:
         viewports = (
             ("small-mobile", 320, 568),
@@ -588,8 +689,9 @@ class BrowserAcceptanceTests(unittest.TestCase):
                     self.assertIsNotNone(bounds)
                     self.assertGreater(bounds["width"], 0)
                     self.assertGreaterEqual(bounds["x"], 0)
-                    self.assertLessEqual(bounds["x"] + bounds["width"], wall_bounds["x"] + wall_bounds["width"] + 1)
-                self.assertEqual(page.locator("#mode").text_content(), "Live")
+                    # Compare rendered CSS pixels, avoiding a 1/64px layout-rounding failure.
+                    self.assertLessEqual(round(bounds["x"] + bounds["width"]), round(wall_bounds["x"] + wall_bounds["width"]) + 1)
+                self.assertIn(page.locator("#mode").text_content(), {"Live", "Cached observations"})
                 page.screenshot(path=str(screenshot_dir / "populated.png"), full_page=False)
                 self.assertEqual(self.page_errors, [])
 

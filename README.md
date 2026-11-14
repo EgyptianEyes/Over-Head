@@ -61,7 +61,8 @@ returns to the Flight pane so the newly locked aircraft is visible immediately;
 the tracking lock itself remains active.
 
 The mobile footer is intentionally rendered as three compact acknowledgement
-lines so the complete credit set remains readable without making the page scroll.
+groups with naturally wrapping links. Operational status has its own readable row
+above the credits; short screens scroll vertically instead of clipping either row.
 
 ## Persistent flight tracking
 
@@ -712,7 +713,8 @@ Open `https://demodomain.name/` in an active browser tab to begin monitoring.
 When no active display is connected, the status may remain `starting`, with API
 request counts at zero; that alone does not indicate a provider failure. The
 existing `config.json` is preserved across Git updates. Geographic discovery is
-now fixed at 60 seconds and selected-aircraft updates at 30 seconds; older
+now fixed at 60 seconds, automatic updates at 15 seconds and explicit TRACK
+updates at 30 seconds; older
 `refresh_seconds` values no longer slow these monitor schedules.
 
 For later application updates, run `git pull --ff-only` from `/root/Over-Head`,
@@ -767,8 +769,11 @@ only when Over-Head is explicitly started with `--demo`.
 
 Normal geographic discovery uses one shared provider-backed slot every **60
 seconds**, regardless of the number of visitors: at most 1,440 scans/day before
-cooldowns and coverage sharing. Automatically selected and explicitly tracked
-aircraft use 30-second identity-targeted observations. The first automatic
+cooldowns and coverage sharing. Automatically selected aircraft use 15-second
+identity-targeted observations, leaving five seconds before the unchanged 20-second
+live-position cutoff. Explicit TRACK uses 30-second observations. Lookup identities
+remain eligible for refresh for one 60-second discovery cycle, independently of
+live display eligibility; this does not keep expired coordinates on the radar. The first automatic
 targeted update uses the genuine geographic discovery observation; subsequent
 lookups are shared by identity. Inactive sessions are excluded, and distinct
 uncovered locations share a fair queue. The service caps concurrent in-memory
@@ -910,16 +915,22 @@ Session `/status` also includes the acquisition interval, observation source and
 timestamp, and tracking acquisition outcome.
 
 Validation: `python -m unittest discover` runs the deterministic regression and
-workload checks. `python acceptance_playwright.py` is the offline desktop/mobile
-acceptance gate; in the current container it cannot launch Chromium because
-`libatk-1.0.so.0` is absent. No dependencies were installed. Live API behavior,
-usage policies and browser acceptance remain outstanding verification requirements.
+workload checks, including two ten-minute clock simulations in
+`test_acquisition_continuous.py`. `python acceptance_playwright.py` is the offline
+Chromium gate, including 320px, 375px and 390px warning/footer screenshots and
+continuous automatic refresh across the freshness boundary. Live API behavior
+and provider usage policies require separate production evidence.
+
+Session `/status` exposes bounded `acquisition_diagnostics`: scheduling deadlines,
+queue delay, active visitor count, acquisition kind, filtering counts and selected
+identity. Provider diagnostics include counts from the latest response. These are
+in-memory snapshots, not persistent location logs, and make no additional requests.
 
 Existing installations keep the `refresh_seconds` value in their local
 `config.json`: updating code does not overwrite it. The value is retained for
 configuration compatibility, while monitor acquisition uses the fixed 60-second
-geographic and 30-second selected-target schedules. ADSB.lol/ADSB.fi endpoint
-availability and provider permission for automatic 30-second hex lookups remain
+geographic, 15-second automatic and 30-second explicit TRACK schedules. ADSB.lol/ADSB.fi endpoint
+availability and provider permission for automatic hex lookups remain
 unverified; cooldowns, Retry-After handling and local request ceilings remain
 active and may delay these targets.
 

@@ -287,6 +287,29 @@ def select_nearest_within_radius(
     )
 
 
+def acquisition_filter_counts(aircraft: list[dict[str, Any]], settings) -> dict[str, int]:
+    """Bounded per-cycle counts only; never persist visitor coordinates."""
+    counts = dict(returned=len(aircraft), valid_positions=0, invalid_positions=0,
+                  stale=0, outside_radius=0, eligible=0)
+    for record in aircraft:
+        try:
+            latitude, longitude = validate_location(record.get("lat"), record.get("lon"))
+            age = float(record.get("seen_pos", 999))
+            if not math.isfinite(age) or age < 0:
+                raise ValueError("Invalid age")
+        except (AttributeError, TypeError, ValueError):
+            counts["invalid_positions"] += 1
+            continue
+        counts["valid_positions"] += 1
+        if age > POSITION_FRESHNESS_SECONDS:
+            counts["stale"] += 1
+        elif haversine_nm(settings.latitude, settings.longitude, latitude, longitude) >= settings.radius_nm:
+            counts["outside_radius"] += 1
+        else:
+            counts["eligible"] += 1
+    return counts
+
+
 def remove_position_data(plane: dict[str, Any]) -> dict[str, Any]:
     result = dict(plane)
     for field in (
@@ -2291,14 +2314,15 @@ PAGE = b"""<!doctype html>
        one another instead of being squeezed side-by-side. Desktop rules above
        remain untouched. */
     @media (max-width:700px), (max-width:950px) and (max-height:500px) {
-      html,body { width:100%; height:100%; min-height:100%; overflow:hidden; }
+      html,body { width:100%; height:100%; min-height:100%; overflow-x:hidden; overflow-y:auto; }
       body { cursor:auto; }
       .wall {
         width:100vw;
         height:100vh;
-        height:100dvh;
+        height:auto;
+        min-height:100dvh;
         padding:max(8px,env(safe-area-inset-top)) max(8px,env(safe-area-inset-right)) max(7px,env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left));
-        grid-template-rows:34px minmax(0,1fr) 34px;
+        grid-template-rows:34px minmax(270px,1fr) auto auto;
         gap:7px;
       }
       header { min-width:0; gap:6px; }
@@ -2523,42 +2547,34 @@ PAGE = b"""<!doctype html>
       .settings-foot { font-size:8px; }
 
       footer {
-        position:relative;
         min-width:0;
-        min-height:0;
-        display:grid;
-        grid-template-columns:minmax(0,1fr) auto;
-        grid-template-rows:auto auto auto;
-        column-gap:7px;
-        row-gap:2px;
-        overflow:hidden;
-        align-items:center;
-        font-size:clamp(6.2px,1.85vw,7.5px);
-        line-height:1.08;
+        display:block;
+        color:#91aab5;
+        font-size:10px;
+        line-height:1.45;
         letter-spacing:.015em;
       }
-      .footer-credits {
-        display:contents;
-        min-width:0;
+      .footer-credits { display:block; min-width:0; white-space:normal; }
+      .footer-credit-line { display:block; margin-top:4px; overflow-wrap:anywhere; }
+      .footer-credit-line-2::before,.footer-credit-line-3::before { content:none; }
+      .footer-attribution { white-space:normal; }
+      #footer-status {
+        position:static;
+        grid-row:3;
+        width:100%;
+        max-width:none;
+        padding:7px 9px;
+        border-left:2px solid var(--muted);
+        background:#0b1820;
+        color:#b8cdd7;
+        font-size:13px;
+        line-height:1.4;
+        text-align:left;
         white-space:normal;
-      }
-      .footer-credit-line {
-        display:block;
-        min-width:0;
-        white-space:normal;
+        overflow-wrap:anywhere;
         overflow:visible;
       }
-      .footer-credit-line-2::before,.footer-credit-line-3::before { content:none; }
-      .footer-credit-line-1 { grid-column:1 / -1; grid-row:1; }
-      .footer-credit-line-2 { grid-column:1 / -1; grid-row:2; }
-      .footer-credit-line-3 { grid-column:1; grid-row:3; }
-      #footer-status {
-        right:10px;
-        bottom:calc(8px + 8em);
-        max-width:58vw;
-        font-size:clamp(5.8px,1.65vw,6.8px);
-        line-height:1;
-      }
+      #footer-status[data-warning="true"] { color:#ffd18a; border-color:var(--amber); }
 
       .snapshot-backdrop { padding:6px; }
       .snapshot-dialog { width:calc(100vw - 12px); height:calc(100dvh - 12px); padding:9px 10px; gap:7px; border-radius:14px; }
@@ -3876,6 +3892,7 @@ PAGE = b"""<!doctype html>
         syncApiHeartbeat(d);
         if(rangeRevision===radarRangeRevision)drawRadar(d.radar_contacts,d.radar_radius_nm,d.tracking_active);
         byId('flightaware-credit').hidden=!Boolean(d.flightaware_configured);
+        byId('footer-status').dataset.warning=String(['rate_limited','provider_unavailable','reconnecting','position_unavailable','last_known','cached','error'].includes(mode)||['stale','invalid_data','rate_limited','provider_unavailable'].includes(d.acquisition_outcome)||['stale','rate_limited','provider_unavailable'].includes(d.tracking_acquisition_outcome));
         if(d.acquisition_status==='queued'&&d.position_state!=='reported'){
           const position=Number(d.acquisition_queue_position),length=Number(d.acquisition_queue_length);
           const queue=Number.isFinite(position)&&Number.isFinite(length)?' ('+position+' of '+length+')':'';
@@ -3888,6 +3905,9 @@ PAGE = b"""<!doctype html>
         else if(d.tracking_acquisition_outcome==='stale')byId('footer-status').textContent='Only older aircraft positions are available';
         else if(d.acquisition_outcome==='stale')byId('footer-status').textContent='Only older aircraft positions are available';
         else if(d.acquisition_outcome==='invalid_data')byId('footer-status').textContent='Aircraft position data could not be validated';
+        else if(mode==='provider_unavailable')byId('footer-status').textContent='Aircraft updates temporarily unavailable';
+        else if(mode==='rate_limited')byId('footer-status').textContent='Aircraft updates delayed; retrying when permitted';
+        else if(mode==='reconnecting')byId('footer-status').textContent='Reconnecting; waiting for aircraft data';
         else if(d.position_state==='reported')byId('footer-status').textContent='Position reported '+formatObservationAge(d.position_age_seconds)+' ago';
         else if(d.position_state==='last_known')byId('footer-status').textContent='Last known position '+formatObservationAge(d.position_age_seconds)+' ago';
         else if(d.aircraft_id)byId('footer-status').textContent='Aircraft position unavailable';
@@ -3898,7 +3918,7 @@ PAGE = b"""<!doctype html>
       }catch(error){
                 if(requestRevision!==statusRequestRevision)return;
         statusFailureCount+=1;
-        if(snapshotId||statusFailureCount>=2){ byId('live').className='live reconnecting'; byId('mode').textContent='RECONNECTING'; }
+        if(snapshotId||statusFailureCount>=2){ byId('live').className='live reconnecting'; byId('mode').textContent='RECONNECTING'; byId('footer-status').textContent='Reconnecting; waiting for aircraft data'; byId('footer-status').dataset.warning='true'; }
         if(snapshotId)window.__overheadSnapshotError=String(error&&error.message||'snapshot render failed');
       }
     }
@@ -4729,7 +4749,7 @@ class FrameState:
             "tracking_found": bool(tracking.get("found")),
             "tracking_acquisition_outcome": tracking.get("acquisition_outcome", "waiting"),
             "acquisition_outcome": mode if mode in {"stale", "invalid_data"} else tracking.get("acquisition_outcome", mode),
-            "acquisition_interval_seconds": TRACKING_ACQUISITION_INTERVAL_SECONDS if tracking.get("active") or plane else NORMAL_ACQUISITION_INTERVAL_SECONDS,
+            "acquisition_interval_seconds": (TRACKING_ACQUISITION_INTERVAL_SECONDS if tracking.get("active") else AUTOMATIC_ACQUISITION_INTERVAL_SECONDS if plane else NORMAL_ACQUISITION_INTERVAL_SECONDS),
             "observation_source": plane.get("source"),
             "observation_timestamp": plane.get("observed_at"),
             "origin": route.get("origin", ""), "destination": route.get("destination", ""),
@@ -4800,6 +4820,12 @@ class FrameState:
                     payload["radar_contacts"] = radar_contacts(aircraft, display_settings, plane)
             payload["location_revision"] = self.location_revision
             payload["acquisition_status"] = self.payload.get("acquisition_status", "ready")
+            payload["acquisition_diagnostics"] = {
+                **self.payload.get("acquisition_diagnostics", {}),
+                "filter_counts": acquisition_filter_counts(aircraft, settings),
+                "selected_aircraft": current_aircraft_id or None,
+                "result": payload["acquisition_outcome"],
+            }
             current_observation = reported_position_observed_at
             if current_observation is None and current_aircraft_id == self.position_aircraft_id:
                 current_observation = self.position_observed_at_monotonic
@@ -5424,6 +5450,10 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
                     automatic_result["outcome"] = "rate_limited"
                 except (AircraftFeedUnavailable, OSError, ValueError, json.JSONDecodeError, urllib.error.URLError, TimeoutError):
                     automatic_result["outcome"] = "provider_unavailable"
+            automatic_outcome = automatic_result.get("outcome", "not_observed") if automatic_result else "not_observed"
+            tracking = {**tracking, "acquisition_outcome": automatic_outcome}
+            if automatic_outcome in {"rate_limited", "provider_unavailable", "stale"}:
+                mode = automatic_outcome
             tracked_plane = automatic_result.get("plane") if automatic_result else None
             observed_at = automatic_result.get("observed_at") if automatic_result else None
             received_at = automatic_result.get("received_at") if automatic_result else None
@@ -5675,6 +5705,9 @@ SNAPSHOT_RECONCILE_INTERVAL_SECONDS = 60.0
 MAX_VISITOR_SESSIONS = 64
 GLOBAL_ACQUISITION_MIN_INTERVAL_SECONDS = NORMAL_ACQUISITION_INTERVAL_SECONDS
 TRACKING_ACQUISITION_INTERVAL_SECONDS = 30.0
+# Automatic selection expires at 20 seconds: reserve five seconds for polling
+# and acquisition latency without relaxing live-position validation.
+AUTOMATIC_ACQUISITION_INTERVAL_SECONDS = 15.0
 MAX_VISITOR_SNAPSHOTS = 50
 MAX_ENRICHMENT_WORKERS = 4
 MAX_QUEUED_ENRICHMENTS = 64
@@ -5949,10 +5982,13 @@ class VisitorSessionStore:
                 required_radius = min(250.0, max(1.0, float(session.settings.query_radius_nm)))
             except (TypeError, ValueError):
                 return None
-        cache_ttl = max(NORMAL_ACQUISITION_INTERVAL_SECONDS, self.global_min_interval_seconds)
+        cache_ttl = POSITION_FRESHNESS_SECONDS
         for result in sorted(self.shared_aircraft_results, key=lambda item: item["fetched_at"], reverse=True):
             age = now - result["fetched_at"]
             if age < 0 or age >= cache_ttl:
+                continue
+            aged = age_aircraft_positions(result["aircraft"], age)
+            if aged and not any(float(record.get("seen_pos", 999)) <= POSITION_FRESHNESS_SECONDS for record in aged):
                 continue
             if result["source_session_id"] == session.session_id:
                 continue
@@ -6030,20 +6066,23 @@ class VisitorSessionStore:
             selected_id = str(session.state.payload.get("aircraft_id") or "")
             aircraft = list(session.state.last_live_aircraft)
             received_at = session.state.last_live_aircraft_received_at
-            position_observed_at = session.state.position_observed_at_monotonic
+            latest_target = copy.deepcopy(session.state.last_automatic_tracking_result)
             settings = copy.copy(session.settings)
-        if (
-            not selected_id or received_at is None or position_observed_at is None
-            or time.monotonic() - position_observed_at > POSITION_FRESHNESS_SECONDS
-        ):
+        if not selected_id or received_at is None:
             return None
-        aged_aircraft = age_aircraft_positions(
-            aircraft, max(0.0, time.monotonic() - received_at),
-        )
-        plane, _ = select_nearest_within_radius(
-            aged_aircraft, settings, POSITION_FRESHNESS_SECONDS,
-        )
-        if not plane or aircraft_identity(plane) != selected_id:
+        now = time.monotonic()
+        aged_aircraft = age_aircraft_positions(aircraft, max(0.0, now - received_at))
+        if latest_target and latest_target.get("plane") and latest_target.get("received_at") is not None:
+            aged_aircraft = merge_tracked_aircraft(aged_aircraft, age_aircraft_positions(
+                [latest_target["plane"]], max(0.0, now - latest_target["received_at"]),
+            )[0])
+        # A lookup identity is not a live position. Keep it for one discovery
+        # cycle so the 20-second display cutoff cannot cancel a delayed
+        # refresh. Selection and radar freshness remain independently enforced.
+        candidates = [plane for plane in aircraft_within_radius(aged_aircraft, settings, settings.radius_nm)
+                      if aircraft_identity(plane) == selected_id]
+        plane, _ = select_nearest(candidates, settings, NORMAL_ACQUISITION_INTERVAL_SECONDS)
+        if not plane:
             return None
         hex_code = normalise_adsb_hex(plane.get("hex"))
         candidate = "hex:" + hex_code if hex_code else normalise_flight_query(plane.get("flight"))
@@ -6063,7 +6102,7 @@ class VisitorSessionStore:
             )
             or result.get("received_at") is None
             or now < float(result["received_at"])
-            or now - float(result.get("attempted_at", result["received_at"])) >= TRACKING_ACQUISITION_INTERVAL_SECONDS
+            or now - float(result.get("attempted_at", result["received_at"])) >= AUTOMATIC_ACQUISITION_INTERVAL_SECONDS
         ):
             return None
         return dict(result)
@@ -6079,7 +6118,7 @@ class VisitorSessionStore:
         with self.lock:
             self.shared_auto_tracking_results[target[1]] = result
             self.shared_tracking_results[target[1]] = result
-            self.tracking_next_due[target[1]] = float(result.get("attempted_at", result["received_at"])) + TRACKING_ACQUISITION_INTERVAL_SECONDS
+            self.tracking_next_due[target[1]] = float(result.get("attempted_at", result["received_at"])) + AUTOMATIC_ACQUISITION_INTERVAL_SECONDS
             while len(self.shared_auto_tracking_results) > 128:
                 del self.shared_auto_tracking_results[next(iter(self.shared_auto_tracking_results))]
             self.wake.set()
@@ -6142,6 +6181,11 @@ class VisitorSessionStore:
                 if session.lease.active()
             ]
             normal_interval = max(NORMAL_ACQUISITION_INTERVAL_SECONDS, self.global_min_interval_seconds)
+            deadlines = {item.session_id: {
+                "normal": item.refresh_requested_at if item.refresh_requested_at is not None else item.last_fetch_at + normal_interval,
+                "tracking": item.last_tracking_at + TRACKING_ACQUISITION_INTERVAL_SECONDS,
+                "automatic_tracking": item.last_auto_tracking_at + AUTOMATIC_ACQUISITION_INTERVAL_SECONDS,
+            } for item in active}
             due = [
                 session for session in active
                 if bool(session.refresh_reasons - {"tracking"})
@@ -6162,7 +6206,7 @@ class VisitorSessionStore:
                 if target_key != session.auto_tracking_key:
                     session.auto_tracking_key = target_key
                     session.last_auto_tracking_at = current
-                if target and current - session.last_auto_tracking_at >= TRACKING_ACQUISITION_INTERVAL_SECONDS:
+                if target and current - session.last_auto_tracking_at >= AUTOMATIC_ACQUISITION_INTERVAL_SECONDS:
                     automatic_due.append(session)
             due.sort(key=lambda item: (
                 item.refresh_requested_at
@@ -6199,7 +6243,7 @@ class VisitorSessionStore:
                         session.last_tracking_at = float(cached_result.get("attempted_at", cached_result["received_at"]))
                         session.refresh_reasons.discard("tracking")
                         break
-            if session is None and automatic_due:
+            if session is None and automatic_due and not (due and normal_wait <= 0.0):
                 for candidate in automatic_due:
                     target = self.automatic_tracking_target(candidate)
                     if target is None:
@@ -6225,7 +6269,7 @@ class VisitorSessionStore:
                     session.last_scheduled_at = current
                     key = session.auto_tracking_key
                     if key is not None:
-                        self.tracking_next_due[key] = current + TRACKING_ACQUISITION_INTERVAL_SECONDS
+                        self.tracking_next_due[key] = current + AUTOMATIC_ACQUISITION_INTERVAL_SECONDS
             eligible = [item for item in tracking_due if self.tracking_next_due.get(self.tracking_share_key(item), 0.0) <= current]
             if session is None and eligible:
                 session = eligible[0]
@@ -6250,7 +6294,7 @@ class VisitorSessionStore:
                     due.remove(session)
                 if session in tracking_due:
                     tracking_due.remove(session)
-            if session is None and due and normal_wait <= 0.0:
+            if session is None and due:
                 for candidate in due:
                     cached_result = self._cached_aircraft_unlocked(candidate, current)
                     if cached_result is not None:
@@ -6263,7 +6307,7 @@ class VisitorSessionStore:
                         session.refresh_requested_at = None
                         session.refresh_reasons.clear()
                         break
-                if session is None:
+                if session is None and normal_wait <= 0.0:
                     session = due.pop(0)
                     session.cached_acquisition = None
                     session.cached_tracking_result = None
@@ -6274,7 +6318,18 @@ class VisitorSessionStore:
                     session.refresh_reasons.clear()
                     self.next_acquisition_at = current + normal_interval
             if session is not None:
+                kind = session.acquisition_kind.removesuffix("_cache")
+                deadline = deadlines[session.session_id].get(kind, current)
                 with session.state.lock:
+                    session.state.payload["acquisition_diagnostics"] = {
+                        "active_visitors": len(active),
+                        "kind": session.acquisition_kind,
+                        "scheduled_at_monotonic": current,
+                        "next_geographic_due_monotonic": session.last_fetch_at + normal_interval,
+                        "next_automatic_due_monotonic": session.last_auto_tracking_at + AUTOMATIC_ACQUISITION_INTERVAL_SECONDS,
+                        "due_at_monotonic": deadline,
+                        "queue_wait_seconds": max(0.0, current - deadline),
+                    }
                     session.state.payload["acquisition_status"] = "acquiring"
                     for field in ("acquisition_queue_position", "acquisition_queue_length", "acquisition_retry_in_seconds"):
                         session.state.payload.pop(field, None)
@@ -6285,7 +6340,7 @@ class VisitorSessionStore:
             elif session is not None and session.acquisition_kind in {"automatic_tracking", "automatic_tracking_cache"}:
                 queue = automatic_due
                 queue_wait = automatic_wait
-                interval = TRACKING_ACQUISITION_INTERVAL_SECONDS
+                interval = AUTOMATIC_ACQUISITION_INTERVAL_SECONDS
             elif session is not None:
                 queue = due
                 queue_wait = max(0.0, self.next_acquisition_at - current)
@@ -6297,7 +6352,7 @@ class VisitorSessionStore:
             elif automatic_due and automatic_wait > 0.0:
                 queue = automatic_due
                 queue_wait = automatic_wait
-                interval = TRACKING_ACQUISITION_INTERVAL_SECONDS
+                interval = AUTOMATIC_ACQUISITION_INTERVAL_SECONDS
             elif due and session is None:
                 queue = due
                 queue_wait = normal_wait
