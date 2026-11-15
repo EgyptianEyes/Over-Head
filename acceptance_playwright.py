@@ -930,17 +930,29 @@ class BrowserAcceptanceTests(unittest.TestCase):
             photo_layout = page.locator("#aircraft-photo").evaluate("""image => {
               const imageBox=image.getBoundingClientRect();
               const mapBox=document.querySelector('#route-map').getBoundingClientRect();
-              return {imageX:imageBox.x,imageRight:imageBox.right,mapX:mapBox.x,mapRight:mapBox.right,
-                mapWidth:mapBox.width,mask:getComputedStyle(image).maskImage,
-                objectFit:getComputedStyle(image).objectFit};
+              const panelBox=image.parentElement.getBoundingClientRect();
+              const scale=Math.min(imageBox.width/image.naturalWidth,imageBox.height/image.naturalHeight);
+              return {imageX:imageBox.x,imageY:imageBox.y,imageWidth:imageBox.width,imageHeight:imageBox.height,
+                mapX:mapBox.x,mapY:mapBox.y,mapWidth:mapBox.width,mapHeight:mapBox.height,
+                panelX:panelBox.x,panelY:panelBox.y,panelWidth:panelBox.width,panelHeight:panelBox.height,
+                renderedWidth:image.naturalWidth*scale,mask:getComputedStyle(image).maskImage,
+                objectFit:getComputedStyle(image).objectFit,background:getComputedStyle(image.parentElement).backgroundColor};
             }""")
-            self.assertGreaterEqual(photo_layout["imageX"], photo_layout["mapX"] + photo_layout["mapWidth"] * 0.2)
-            self.assertLessEqual(photo_layout["imageRight"], photo_layout["mapRight"] + 1)
+            for image_key, frame_key in (("imageX", "mapX"), ("imageY", "mapY"),
+                                         ("imageWidth", "mapWidth"), ("imageHeight", "mapHeight"),
+                                         ("panelX", "mapX"), ("panelY", "mapY"),
+                                         ("panelWidth", "mapWidth"), ("panelHeight", "mapHeight")):
+                self.assertAlmostEqual(photo_layout[image_key], photo_layout[frame_key], delta=1)
+            expected_width = min(photo_layout["mapWidth"], photo_layout["mapHeight"] * 2)
+            self.assertAlmostEqual(photo_layout["renderedWidth"], expected_width, delta=1)
             self.assertNotEqual(photo_layout["mask"], "none")
             self.assertEqual(photo_layout["objectFit"], "contain")
+            self.assertEqual(photo_layout["background"], "rgb(5, 8, 13)")
             self.assertTrue(page.locator(".aircraft-photo-credit").is_visible())
 
-        for label, width, height in (("desktop", 1366, 768), ("tablet", 768, 1024), ("mobile", 390, 844)):
+        viewports = (("desktop", 1366, 768), ("tablet", 768, 1024),
+                     ("mobile-320", 320, 568), ("mobile-375", 375, 812), ("mobile-390", 390, 844))
+        for label, width, height in viewports:
             with self.subTest(viewport=label):
                 screenshot_dir = self.ARTIFACT_ROOT / label
                 screenshot_dir.mkdir(parents=True, exist_ok=True)
@@ -955,6 +967,7 @@ class BrowserAcceptanceTests(unittest.TestCase):
                 self.assertGreater(page.evaluate("window.__overheadMaps[0].layers.size"), 1)
                 map_width = page.locator("#route-map").evaluate("element => element.getBoundingClientRect().width")
                 map_instances = page.evaluate("window.__overheadMaps.length")
+                information_box = page.locator(".information").evaluate("element => {const r=element.getBoundingClientRect();return [r.x,r.y,r.width,r.height]}")
 
                 if label == "desktop":
                     page.clock.fast_forward(9999)
@@ -962,10 +975,11 @@ class BrowserAcceptanceTests(unittest.TestCase):
                     page.clock.fast_forward(1)
                     self.assertFalse(page.locator("#route-photo-panel").is_hidden())
                     photo_size = page.locator("#aircraft-photo").evaluate("image => ({width:image.getBoundingClientRect().width,height:image.getBoundingClientRect().height,naturalWidth:image.naturalWidth,naturalHeight:image.naturalHeight,objectFit:getComputedStyle(image).objectFit})")
-                    self.assertLess(photo_size["width"], map_width)
+                    self.assertAlmostEqual(photo_size["width"], map_width, delta=1)
                     self.assertEqual(photo_size["objectFit"], "contain")
                     self.assertEqual(photo_size["naturalWidth"] / photo_size["naturalHeight"], 2)
                     assert_photo_layout(page)
+                    self.assertEqual(page.locator(".information").evaluate("element => {const r=element.getBoundingClientRect();return [r.x,r.y,r.width,r.height]}"), information_box)
                     page.screenshot(path=str(screenshot_dir / "route-photo.png"), full_page=False)
                     page.clock.fast_forward(10000)
                     self.assertTrue(page.locator("#route-photo-panel").is_hidden())
@@ -986,11 +1000,16 @@ class BrowserAcceptanceTests(unittest.TestCase):
                     page.clock.fast_forward(10000)
                     self.assertFalse(page.locator("#route-photo-panel").is_hidden())
                     assert_photo_layout(page)
+                    self.assertEqual(page.locator(".information").evaluate("element => {const r=element.getBoundingClientRect();return [r.x,r.y,r.width,r.height]}"), information_box)
                     page.screenshot(path=str(screenshot_dir / "route-photo.png"), full_page=False)
+                    page.clock.fast_forward(10000)
+                    self.assertTrue(page.locator("#route-photo-panel").is_hidden())
+                    self.assertTrue(page.locator("#route-map").evaluate("element => element.classList.contains('visible')"))
+                    page.screenshot(path=str(screenshot_dir / "route-map-after-photo.png"), full_page=False)
 
                 self.assertEqual(page.evaluate("window.__overheadMaps.length"), map_instances)
                 self.assertEqual(page.locator("#route-map").evaluate("element => element.getBoundingClientRect().width"), map_width)
-                if label == "mobile":
+                if label.startswith("mobile-"):
                     publish_photo("", available=False)
                     page.clock.fast_forward(2000)
                     wait_until(page, lambda: page.locator("#route-photo-panel").is_hidden())

@@ -78,11 +78,14 @@ MAX_TRACKING_CALLSIGN_CANDIDATES = 3
 FLIGHTAWARE_AEROAPI_URL = "https://aeroapi.flightaware.com/aeroapi"
 ADSLOL_ROUTESET_URL = "https://api.adsb.lol/api/0/routeset"
 ADSLOL_ROUTE_URL = "https://api.adsb.lol/api/0/route/{callsign}/{latitude}/{longitude}"
+ADSLOL_STANDING_ROUTE_URL = "https://vrs-standing-data.adsb.lol/routes/{prefix}/{callsign}.json"
+ADSLOL_STANDING_CALLSIGN_RE = re.compile(r"[A-Z0-9]{3,12}\Z")
 ADSLOL_CALLSIGN_URL = "https://api.adsb.lol/v2/callsign/{callsign}"
 ADSLOL_HEX_URL = "https://api.adsb.lol/v2/hex/{hex_code}"
 OURAIRPORTS_URL = "https://davidmegginson.github.io/ourairports-data/airports.csv"
 ROUTE_CACHE_TTL_SECONDS = 900
 ROUTE_FAILURE_RETRY_SECONDS = 300
+ROUTE_IDENTITY_LOCK_STRIPES = 64
 OURAIRPORTS_TTL_SECONDS = 7 * 24 * 60 * 60
 API_HEALTH_INTERVAL_SECONDS = 30
 METRIC_HISTORY_AGES_SECONDS = (30, 60, 90)
@@ -1221,15 +1224,22 @@ class FlightRouteStore:
         self.airports = airports or AirportStore()
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._save_lock = threading.Lock()
+        self._debug_lock = threading.Lock()
+        self._identity_locks = tuple(threading.Lock() for _ in range(ROUTE_IDENTITY_LOCK_STRIPES))
         self._failures: dict[str, float] = {}
         self._flightaware_disabled_until = 0.0
-        self._adsblol_disabled_until = 0.0
+        # The standing-data host and api.adsb.lol are separate services. Keep
+        # their cooldowns isolated while sharing one pause across the two API
+        # endpoints on api.adsb.lol.
+        self._adsblol_disabled_until = {"standing": 0.0, "api": 0.0}
         self._lookup_local = threading.local()
         self._debug: dict[str, Any] = {
             "decision": "No route lookup has run yet",
             "flightaware_configured": bool(self.api_key),
             "attempts": [],
         }
+        self._debug_by_identity: dict[str, dict[str, Any]] = {}
         try:
             loaded = json.loads(cache_path.read_text(encoding="utf-8"))
             self._records = loaded if isinstance(loaded, dict) else {}
@@ -1251,6 +1261,17 @@ class FlightRouteStore:
     @classmethod
     def registration(cls, plane: dict[str, Any] | None) -> str:
         return cls._clean(plane.get("r")) if plane else ""
+
+    def can_lookup(self, plane: dict[str, Any] | None) -> bool:
+        """Whether a configured provider can be queried for this aircraft."""
+        with self._lock:
+            key = self._cache_key(plane)
+            registration = self.registration(plane)
+            if key in self._records or registration and any(
+                record_key.endswith("|" + registration) for record_key in self._records
+            ):
+                return True
+        return bool(self.callsign(plane) or (self.api_key and self.registration(plane)))
 
     @staticmethod
     def _alternative_callsign(callsign: str) -> str:
@@ -1482,7 +1503,17 @@ class FlightRouteStore:
             identifiers.append(callsign)
         candidates: list[dict[str, Any]] = []
         for ident in identifiers:
-            candidates.extend(self._aeroapi(ident))
+            try:
+                candidates.extend(self._aeroapi(ident))
+            except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+                requests = getattr(self._lookup_local, "aeroapi_requests", [])
+                if requests and requests[-1].get("callsign") == ident:
+                    requests[-1]["error"] = type(exc).__name__
+                    if isinstance(exc, urllib.error.HTTPError):
+                        requests[-1]["http_status"] = exc.code
+                # Registration lookup failure should not suppress a separate
+                # callsign lookup that may identify the active flight.
+                continue
             if any(
                 self._candidate_score(flight, plane, callsign, registration) >= 230
                 for flight in candidates
@@ -1576,6 +1607,23 @@ class FlightRouteStore:
     def _adsblol_routeset(self, callsign: str, plane: dict[str, Any] | None) -> dict[str, Any]:
         return self._routeset(ADSLOL_ROUTESET_URL, callsign, plane)
 
+    def _adsblol_standing(self, callsign: str, plane: dict[str, Any] | None) -> dict[str, Any]:
+        if not ADSLOL_STANDING_CALLSIGN_RE.fullmatch(callsign):
+            return {}
+        url = ADSLOL_STANDING_ROUTE_URL.format(
+            prefix=quote(callsign[:2], safe=""),
+            callsign=quote(callsign, safe=""),
+        )
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+        self._lookup_local.request_count = getattr(self._lookup_local, "request_count", 0) + 1
+        with urllib.request.urlopen(request, timeout=6) as response:
+            self._lookup_local.http_status = getattr(response, "status", None)
+            body = response.read()
+        if not body.strip():
+            return {}
+        payload = json.loads(body)
+        return payload if isinstance(payload, dict) else {}
+
     def _adsblol(self, callsign: str, plane: dict[str, Any] | None) -> dict[str, Any]:
         position = self._plane_position(plane)
         if position is None:
@@ -1597,14 +1645,25 @@ class FlightRouteStore:
     def _vrs_airport_code(airport: dict[str, Any]) -> str:
         return str(airport.get("iata") or airport.get("icao") or "").strip().upper()
 
+    @staticmethod
+    def _airport_pair(value: Any) -> tuple[str, str]:
+        match = re.fullmatch(r"\s*([A-Z0-9]{3,4})\s*[-/]\s*([A-Z0-9]{3,4})\s*", str(value or "").upper())
+        return (match.group(1), match.group(2)) if match else ("", "")
+
     def _normalise_routeset(self, payload: dict[str, Any], source: str) -> dict[str, Any]:
         airports = payload.get("_airports")
-        if not isinstance(airports, list) or len(airports) < 2:
-            return {}
-        origin = airports[0] if isinstance(airports[0], dict) else {}
-        destination = airports[-1] if isinstance(airports[-1], dict) else {}
-        origin_code = self._vrs_airport_code(origin)
-        destination_code = self._vrs_airport_code(destination)
+        if isinstance(airports, list) and len(airports) >= 2:
+            origin = airports[0] if isinstance(airports[0], dict) else {}
+            destination = airports[-1] if isinstance(airports[-1], dict) else {}
+            origin_code = self._vrs_airport_code(origin)
+            destination_code = self._vrs_airport_code(destination)
+        else:
+            origin = destination = {}
+            origin_code = destination_code = ""
+        if not origin_code or not destination_code:
+            origin_code, destination_code = self._airport_pair(payload.get("_airport_codes_iata"))
+        if not origin_code or not destination_code:
+            origin_code, destination_code = self._airport_pair(payload.get("airport_codes"))
         if not origin_code or not destination_code:
             return {}
         number = str(payload.get("number") or "").strip()
@@ -1645,9 +1704,58 @@ class FlightRouteStore:
         return self._normalise_routeset(payload, "ADSB.lol route")
 
     def _save(self) -> None:
-        temporary = self.cache_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(self._records, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        temporary.replace(self.cache_path)
+        with self._save_lock:
+            with self._lock:
+                snapshot = dict(self._records)
+            temporary = self.cache_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            temporary.replace(self.cache_path)
+
+    def _identity_lock(self, key: str) -> threading.Lock:
+        return self._identity_locks[hash(key) % len(self._identity_locks)]
+
+    def _lookup_lock_key(self, plane: dict[str, Any] | None) -> str:
+        registration = self.registration(plane)
+        return f"registration:{registration}" if registration else self._cache_key(plane)
+
+    def _cached_route(self, key: str, registration: str = "") -> tuple[str, dict[str, Any]] | None:
+        with self._lock:
+            cached = self._records.get(key)
+            cached_key = key
+            if not isinstance(cached, dict) and registration:
+                matches = [
+                    (record_key, record) for record_key, record in self._records.items()
+                    if record_key.endswith("|" + registration) and isinstance(record, dict)
+                ]
+                try:
+                    cached_key, cached = max(
+                        matches, key=lambda entry: float(entry[1].get("cached_at", 0)),
+                        default=("", None),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    cached_key, cached = "", None
+            return (cached_key, dict(cached)) if isinstance(cached, dict) else None
+
+    def _failed_at(self, key: str, now: float) -> float:
+        with self._lock:
+            self._prune_failures(now)
+            return self._failures.get(key, 0.0)
+
+    def _remember_route(self, key: str, route: dict[str, Any]) -> None:
+        with self._lock:
+            self._records[key] = dict(route)
+            self._failures.pop(key, None)
+        try:
+            self._save()
+        except OSError:
+            # A valid route is useful for this session even if disk persistence fails.
+            pass
+
+    def _prune_failures(self, now: float) -> None:
+        expired_before = now - ROUTE_FAILURE_RETRY_SECONDS
+        for key, failed_at in list(self._failures.items()):
+            if failed_at <= expired_before:
+                self._failures.pop(key, None)
 
     def _set_debug(self, debug: dict[str, Any]) -> None:
         started_at = debug.pop("_started_at", None)
@@ -1655,38 +1763,54 @@ class FlightRouteStore:
             debug["elapsed_seconds"] = round(max(0.0, time.monotonic() - started_at), 3)
         for attempt in debug.get("attempts", []):
             if attempt.get("source") == "FlightAware AeroAPI" and attempt.get("requested"):
-                attempt["requests"] = getattr(self._lookup_local, "aeroapi_requests", [])
+                attempt["requests"] = json.loads(json.dumps(
+                    getattr(self._lookup_local, "aeroapi_requests", []), default=str,
+                ))
         if any(attempt.get("requested") for attempt in debug.get("attempts", [])):
             debug["lookup_id"] = secrets.token_hex(16)
-        self._debug = json.loads(json.dumps(debug, default=str))
-        self._lookup_local.debug = self._debug
+        with self._debug_lock:
+            self._debug = json.loads(json.dumps(debug, default=str))
+            snapshot = self._debug
+            identity_key = f"{debug.get('callsign', '')}|{debug.get('registration', '')}"
+            self._debug_by_identity[identity_key] = snapshot
+            while len(self._debug_by_identity) > 256:
+                self._debug_by_identity.pop(next(iter(self._debug_by_identity)))
+        self._lookup_local.debug = snapshot
 
     def _current_lookup_debug(self) -> dict[str, Any]:
         return getattr(self._lookup_local, "debug", {})
 
-    def debug_snapshot(self) -> dict[str, Any]:
-        with self._lock:
-            return json.loads(json.dumps(self._debug, default=str))
+    def debug_snapshot(self, plane: dict[str, Any] | None = None) -> dict[str, Any]:
+        with self._debug_lock:
+            debug = self._debug
+            if plane is not None:
+                identity_key = f"{self.callsign(plane)}|{self.registration(plane)}"
+                debug = self._debug_by_identity.get(identity_key, debug)
+            return json.loads(json.dumps(debug, default=str))
 
     def cached_route(self, plane: dict[str, Any] | None) -> dict[str, Any]:
         callsign = self.callsign(plane)
+        registration = self.registration(plane)
         debug: dict[str, Any] = {
             "callsign": callsign,
             "original_callsign": callsign,
             "alternative_callsign": self._alternative_callsign(callsign),
-            "registration": self.registration(plane),
+            "registration": registration,
             "attempts": [],
             "_started_at": time.monotonic(),
         }
-        if not callsign:
-            debug["decision"] = "No usable ATC callsign"
+        if not callsign and not registration:
+            debug["decision"] = "No usable callsign or registration"
             self._set_debug(debug)
             return {}
         key = self._cache_key(plane)
+        cached_entry = self._cached_route(key, registration)
+        if not cached_entry:
+            return {}
+        _, cached = cached_entry
+        if not cached.get("origin") or not cached.get("destination"):
+            return {}
         with self._lock:
-            cached = self._records.get(key)
-            if not isinstance(cached, dict) or not cached.get("origin") or not cached.get("destination"):
-                return {}
             plausible, detail = self._plausibility(cached, plane)
             age = time.time() - float(cached.get("cached_at", 0))
             debug["attempts"].append({
@@ -1731,41 +1855,49 @@ class FlightRouteStore:
             "attempts": [],
             "_started_at": time.monotonic(),
         }
-        if not callsign:
+        if not callsign and not (self.api_key and registration) and not self.can_lookup(plane):
             debug["decision"] = "No usable ATC callsign"
             self._set_debug(debug)
             return {}
 
         key = self._cache_key(plane)
-        with self._lock:
-            cached = self._records.get(key)
-            if isinstance(cached, dict) and cached.get("origin") and cached.get("destination"):
+        with self._identity_lock(self._lookup_lock_key(plane)):
+            cached_entry = self._cached_route(key, registration)
+            if cached_entry:
+                cached_key, cached = cached_entry
+            else:
+                cached_key, cached = "", {}
+            if cached and cached.get("origin") and cached.get("destination"):
                 plausible, detail = self._plausibility(cached, plane)
                 age = time.time() - float(cached.get("cached_at", 0))
-                debug["attempts"].append({
-                    "source": "cache",
-                    "callsign": callsign,
+                cache_attempt = {
+                    "source": "cache", "callsign": callsign,
                     "airport_information_returned": True,
                     "geographical_validation_passed": plausible,
-                    "route": cached.get("route"),
-                    "route_source": cached.get("route_source"),
+                    "route": cached.get("route"), "route_source": cached.get("route_source"),
                     "age_seconds": round(age, 1),
                     "accepted": age < self.ttl_seconds and plausible,
                     "validation": detail,
-                })
+                }
+                debug["attempts"].append(cache_attempt)
                 if age < self.ttl_seconds and plausible:
                     cached["route"] = f"{cached['origin']} to {cached['destination']}"
                     if not cached.get("origin_name"):
                         cached["origin_name"] = str(self.airports.get(cached["origin"]).get("name") or "").strip()
                     if not cached.get("destination_name"):
                         cached["destination_name"] = str(self.airports.get(cached["destination"]).get("name") or "").strip()
+                    if cached_key != key:
+                        self._remember_route(key, cached)
                     debug["decision"] = f"Accepted cached {cached.get('route_source', 'route')}"
                     self._set_debug(debug)
                     return cached
-
-            failed_at = self._failures.get(key, 0.0)
+                self._set_debug(debug)
+            failed_at = self._failed_at(key, time.time())
             if failed_at and time.time() - failed_at < ROUTE_FAILURE_RETRY_SECONDS:
-                debug["decision"] = "Recent route lookup failed; waiting before retry"
+                debug["retry_in_seconds"] = max(0, int(math.ceil(
+                    ROUTE_FAILURE_RETRY_SECONDS - (time.time() - failed_at)
+                )))
+                debug["decision"] = f"Recent route lookup failed; cooldown {debug['retry_in_seconds']}s, waiting before retry"
                 self._set_debug(debug)
                 return {}
 
@@ -1801,8 +1933,7 @@ class FlightRouteStore:
                         "http_status": self._lookup_local.http_status,
                     })
                     if plausible:
-                        self._records[key] = route
-                        self._save()
+                        self._remember_route(key, route)
                         debug["decision"] = "Accepted FlightAware AeroAPI route"
                         self._set_debug(debug)
                         return route
@@ -1828,6 +1959,7 @@ class FlightRouteStore:
                 debug["attempts"].append({"source": "FlightAware AeroAPI", "skipped": True, "reason": "no API key configured"})
 
             free_route_attempts = (
+                ("ADSB.lol standing route", self._adsblol_standing),
                 ("ADSB.lol routeset", self._adsblol_routeset),
                 ("ADSB.lol route", self._adsblol),
             )
@@ -1843,8 +1975,13 @@ class FlightRouteStore:
                         "geographical_validation_passed": None,
                         "accepted": False,
                     }
+                    if not lookup_callsign:
+                        attempt.update(skipped=True, reason="no usable ATC callsign")
+                        debug["attempts"].append(attempt)
+                        continue
                     debug["attempts"].append(attempt)
-                    if time.time() < self._adsblol_disabled_until:
+                    cooldown_key = "standing" if source_name == "ADSB.lol standing route" else "api"
+                    if time.time() < self._adsblol_disabled_until[cooldown_key]:
                         attempt.update(skipped=True, reason="ADSB.lol provider cooldown")
                         continue
                     try:
@@ -1858,7 +1995,7 @@ class FlightRouteStore:
                             retry = _retry_after_seconds(exc.headers.get("Retry-After") if exc.headers else None)
                             if exc.code in (403, 429) or retry is not None:
                                 minimum = 300 if exc.code == 403 else ROUTE_FAILURE_RETRY_SECONDS
-                                self._adsblol_disabled_until = time.time() + max(minimum, retry or 0)
+                                self._adsblol_disabled_until[cooldown_key] = time.time() + max(minimum, retry or 0)
                         continue
                     finally:
                         attempt["requested"] = bool(self._lookup_local.request_count)
@@ -1900,13 +2037,14 @@ class FlightRouteStore:
                         reason=detail["reason"],
                     )
                     if plausible:
-                        self._records[key] = route
-                        self._save()
+                        self._remember_route(key, route)
                         debug["decision"] = f"Accepted {source_name} after independent live-position validation"
                         self._set_debug(debug)
                         return route
 
-            self._failures[key] = time.time()
+            with self._lock:
+                self._prune_failures(time.time())
+                self._failures[key] = time.time()
             debug["decision"] = "No trustworthy route. Display N/A to N/A."
             self._set_debug(debug)
             return {}
@@ -2104,9 +2242,9 @@ PAGE = b"""<!doctype html>
     .route-map .leaflet-tooltip.route-label::before { display:none; }
     .route-map.photo-active { background:#02050a; }
     .route-map.photo-active > :not(.route-photo-panel),.route-map.photo-active::before,.route-map.photo-active::after { visibility:hidden; }
-    .route-photo-panel { position:absolute; inset:0; z-index:900; overflow:hidden; background:transparent; pointer-events:none; }
+    .route-photo-panel { position:absolute; inset:0; z-index:900; overflow:hidden; background:#05080d; pointer-events:none; }
     .route-photo-panel[hidden] { display:none; }
-    .route-photo-panel img { position:absolute; top:38%; right:0; display:block; width:44%; height:62%; object-fit:contain; object-position:right center; filter:saturate(1.06) brightness(1.03) contrast(1.03); mask-image:linear-gradient(to right,transparent 0%,#000 24%,#000 82%,transparent 100%),linear-gradient(to bottom,transparent 0%,#000 24%,#000 76%,transparent 100%); mask-composite:intersect; }
+    .route-photo-panel img { position:absolute; inset:0; display:block; width:100%; height:100%; object-fit:contain; object-position:center; filter:saturate(1.06) brightness(1.03) contrast(1.03); mask-image:linear-gradient(to right,transparent 0%,#000 12%,#000 88%,transparent 100%),linear-gradient(to bottom,transparent 0%,#000 12%,#000 88%,transparent 100%); mask-composite:intersect; }
     .aircraft-photo-credit { position:absolute; right:8px; bottom:8px; z-index:2; padding:.36em .55em; border-radius:5px; background:rgba(2,5,10,.62); color:rgba(232,246,255,.90); font:700 clamp(6px,.48vw,8px)/1.1 "Segoe UI",sans-serif; letter-spacing:.07em; }
     .route-direction-flow { pointer-events:none; animation:route-flow 10s linear infinite; filter:drop-shadow(0 0 4px rgba(232,246,255,.95)) drop-shadow(0 0 8px rgba(20,236,255,.7)); }
     .snapshot-render .route-direction-flow { animation:none; }
@@ -5642,8 +5780,8 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
                 routes is not None
                 and plane is not None
                 and (
-                    not hasattr(routes, "callsign")
-                    or routes.callsign(plane)
+                    routes.can_lookup(plane) if hasattr(routes, "can_lookup")
+                    else not hasattr(routes, "callsign") or routes.callsign(plane)
                 )
             )
             state.payload["route_resolution_status"] = (
@@ -5652,7 +5790,20 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
         if automatic_result_to_remember is not None:
             with state.lock:
                 state.last_automatic_tracking_result = automatic_result_to_remember
-    if demo or plane is None or not _enrichment_slots.acquire(blocking=False):
+    if demo or plane is None:
+        return
+
+    def mark_route_enrichment_unavailable() -> None:
+        with state.lock:
+            if (
+                state.location_revision == location_revision
+                and str(state.payload.get("aircraft_id") or "") == aircraft_identity(plane)
+                and (not tracker or int(tracker.snapshot().get("revision") or 0) == tracking_revision)
+            ):
+                state.payload["route_resolution_status"] = "unavailable"
+
+    if not _enrichment_slots.acquire(blocking=False):
+        mark_route_enrichment_unavailable()
         return
 
     def enrich_and_publish() -> None:
@@ -5660,6 +5811,11 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
             route_started_at = time.monotonic()
             route = cached_route or ((routes.get(plane) or {}) if routes is not None else {})
             route_elapsed = max(0.0, time.monotonic() - route_started_at)
+            route_debug = routes._current_lookup_debug() if isinstance(routes, FlightRouteStore) else {}
+            route_debug.setdefault("elapsed_seconds", round(route_elapsed, 3))
+            route_failure_log = state.route_failure_log
+            if route_failure_log is not None:
+                route_failure_log.observe(plane, route, route_debug)
             identity = identities.get(plane) or {} if identities is not None else {}
             aircraft_photo = identities.photo_asset(identity, plane) if identities is not None and hasattr(identities, "photo_asset") else None
             aircraft_photo_debug = identities.photo_debug(identity, plane) if identities is not None and hasattr(identities, "photo_debug") else {}
@@ -5706,10 +5862,6 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
                 )
                 with state.lock:
                     state.payload["route_resolution_status"] = "resolved" if route else "unresolved"
-                if state.route_failure_log is not None:
-                    debug = routes._current_lookup_debug() if isinstance(routes, FlightRouteStore) else {}
-                    debug.setdefault("elapsed_seconds", round(route_elapsed, 3))
-                    state.route_failure_log.observe(plane, route, debug)
         except Exception:
             with state.lock:
                 if state.location_revision == location_revision and state.payload.get("aircraft_id") == aircraft_identity(plane):
@@ -5720,6 +5872,7 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
         future = _enrichment_executor.submit(enrich_and_publish)
     except RuntimeError:
         _enrichment_slots.release()
+        mark_route_enrichment_unavailable()
         return
     with state.lock:
         state.last_enrichment_future = future
@@ -7258,11 +7411,27 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                         key: state.payload.get(key)
                         for key in (
                             "callsign", "registration", "route", "route_source",
-                            "commercial_flight", "aircraft_latitude", "aircraft_longitude",
+                            "commercial_flight", "route_resolution_status",
+                            "aircraft_latitude", "aircraft_longitude",
                             "updated",
                         )
                     }
-                body = json.dumps({"current": current}, indent=2).encode()
+                    failure_log = state.route_failure_log
+                flight = current.get("callsign") or current.get("registration")
+                records = failure_log.records() if failure_log is not None else []
+                history = [
+                    record for record in records
+                    if (record.get("callsign") or record.get("registration")) == flight
+                ][-5:]
+                route_debug = getattr(routes, "debug_snapshot", None)
+                body = json.dumps({
+                    "current": current,
+                    "provider_lookup": route_debug({
+                        "flight": current.get("callsign"),
+                        "r": current.get("registration"),
+                    }) if callable(route_debug) else {},
+                    "failure_history": history,
+                }, indent=2).encode()
                 self.send(HTTPStatus.OK, "application/json", body, cache=False)
             elif path == "/photo-debug":
                 with state.lock:

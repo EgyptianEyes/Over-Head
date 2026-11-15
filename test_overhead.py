@@ -1473,14 +1473,16 @@ class OverHeadTests(unittest.TestCase):
                 "_airports": [{"iata": "LHR"}, {"iata": "HND"}],
                 "airline_code": "BAW", "number": "5", "callsign": "BAW5",
             }
-            with patch.object(store, "_adsblol_routeset", return_value=response) as lookup, patch.object(
+            with patch.object(store, "_adsblol_standing", return_value={}), patch.object(
+                store, "_adsblol_routeset", return_value=response
+            ) as lookup, patch.object(
                 store, "_adsblol", side_effect=AssertionError("fallback should not run")
             ):
                 route = store.get(aircraft)
                 self.assertEqual(route["route"], "LHR to HND")
                 self.assertEqual(route["commercial_flight"], "BAW5")
-                self.assertEqual(route["origin_latitude"], 51.47)
-                self.assertEqual(route["destination_longitude"], 139.7798)
+                self.assertAlmostEqual(route["origin_latitude"], 51.47, places=2)
+                self.assertAlmostEqual(route["destination_longitude"], 139.7798, places=2)
                 self.assertEqual(store.cached_route(aircraft)["route"], "LHR to HND")
                 cached = store.get(aircraft)
                 self.assertEqual(cached["route"], "LHR to HND")
@@ -1570,11 +1572,68 @@ class OverHeadTests(unittest.TestCase):
             finally:
                 finish_identity.set()
 
+    def test_route_enrichment_capacity_rejection_is_not_left_pending_and_retries(self):
+        class EmptyStore:
+            def get(self, *_args):
+                return None
+
+        class Routes:
+            api_key = ""
+
+            def cached_route(self, _plane):
+                return {}
+
+            def get(self, _plane):
+                return {
+                    "route": "EWR to LHR", "origin": "EWR", "destination": "LHR",
+                    "route_source": "ADSB.lol route + live validation",
+                }
+
+        plane = {
+            "hex": "406B82", "flight": "BAW49N", "r": "G-STBM",
+            "lat": 51.6, "lon": -0.2, "seen_pos": 0.1, "alt_baro": 28000,
+        }
+        state = FrameState()
+        tracker = monitor.FlightTrackingState()
+        tracker.start("BAW49N", ("hex:406B82",))
+        routes = Routes()
+
+        with patch("monitor.fetch_tracked_aircraft", return_value=(plane, "BAW49N")), patch.object(
+            monitor._enrichment_slots, "acquire", return_value=False,
+        ):
+            update_state(
+                state, Settings(), False, EmptyStore(), EmptyStore(), routes=routes,
+                tracker=tracker, tracking_only=True, persist_frame=False,
+            )
+
+        self.assertIsNone(state.last_enrichment_future)
+        self.assertEqual(state.payload["route_resolution_status"], "unavailable")
+        self.assertTrue(tracker.snapshot()["active"])
+        self.assertEqual(tracker.snapshot()["query"], "BAW49N")
+
+        with patch("monitor.fetch_tracked_aircraft", return_value=(plane, "BAW49N")):
+            update_state(
+                state, Settings(), False, EmptyStore(), EmptyStore(), routes=routes,
+                tracker=tracker, tracking_only=True, persist_frame=False,
+            )
+            future = state.last_enrichment_future
+            self.assertIsNotNone(future)
+            future.result(timeout=5)
+
+        self.assertEqual(state.payload["route"], "EWR to LHR")
+        self.assertEqual(state.payload["route_resolution_status"], "resolved")
+        self.assertTrue(tracker.snapshot()["active"])
+        self.assertEqual(tracker.snapshot()["query"], "BAW49N")
+
     def test_failed_free_route_lookup_retries_after_failure_cooldown(self):
         class Routes(FlightRouteStore):
             calls = 0
 
             def _adsblol_routeset(self, callsign, plane):
+                self.calls += 1
+                return {}
+
+            def _adsblol_standing(self, callsign, plane):
                 self.calls += 1
                 return {}
 
@@ -1592,7 +1651,7 @@ class OverHeadTests(unittest.TestCase):
             self.assertEqual(store.calls, 0)
             with patch("monitor.time.time", return_value=1000 + monitor.ROUTE_FAILURE_RETRY_SECONDS + 1):
                 self.assertEqual(store.get(plane), {})
-            self.assertEqual(store.calls, 2)
+            self.assertEqual(store.calls, 3)
 
     def test_radar_replaces_home_centre_with_flight_tracking_controls(self):
         self.assertNotIn(b"HOME CENTRE", PAGE)
@@ -2025,7 +2084,7 @@ class OverHeadTests(unittest.TestCase):
     def test_readme_documents_mobile_single_view_and_api_heartbeat(self):
         readme = Path(__file__).with_name("README.md").read_text(encoding="utf-8")
         self.assertIn("## Mobile view", readme)
-        self.assertIn("single non-scrolling screen", readme)
+        self.assertIn("dedicated narrow-viewport layout", readme)
         self.assertIn("Radar", readme)
         self.assertIn("local request counters and cooldown state", readme)
         self.assertIn("no independent health-probe", " ".join(readme.split()))

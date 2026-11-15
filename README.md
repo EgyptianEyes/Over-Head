@@ -48,12 +48,12 @@ If an aircraft is present but its route is unknown, the title uses
 Over-Head has a dedicated narrow-viewport layout rather than shrinking the
 desktop two-panel composition.
 
-On phone-sized portrait and landscape viewports, the display is constrained to
-a single non-scrolling screen. The normal **Flight** view uses the full panel
-width for the route, airline branding and a compact 2×2 metric grid. **Radar**
-and **Settings** are alternate full-screen panes: opening Radar replaces the
-Flight panel instead of placing it beside it, and the Radar button changes to
-**FLIGHT** so the user can switch directly back.
+On phone-sized portrait and landscape viewports, the normal **Flight** view
+uses the full panel width for the route, airline branding and a compact 2×2
+metric grid. **Radar** and **Settings** are alternate panes: opening Radar replaces the Flight panel
+instead of placing it beside it, and the Radar button changes to **FLIGHT** so
+the user can switch directly back. Short viewports can scroll vertically rather
+than clipping the footer.
 
 Mobile keeps its own Radar-open preference and does not change the desktop
 Radar preference. Starting a persistent TRACK request from the mobile Radar
@@ -102,6 +102,17 @@ Normal aircraft monitoring remains restricted to the configured location and
 radius. Long-distance tracking uses direct aircraft lookups rather than
 expanding the normal geographical query.
 
+## Monitoring cadence
+
+Normal geographic discovery runs no more often than every 60 seconds.
+Automatically selected aircraft are refreshed on a 15-second cadence, while an
+explicit **TRACK** target uses a 30-second cadence. Aircraft positions are
+considered fresh for at most 20 seconds when validating route candidates. The
+browser refreshes display status every 2 seconds; this is not an upstream
+aircraft request. Cadences are minimum intervals, not guaranteed observation
+deadlines: scheduler load, request duration, provider limits and polling budgets
+can delay the next update.
+
 ## Route resolution
 
 Route data is deliberately separated from aircraft identity data.
@@ -109,12 +120,47 @@ Route data is deliberately separated from aircraft identity data.
 When a route is required, Over-Head tries these sources in order:
 
 1. **FlightAware AeroAPI**, when an API key is configured
-2. **ADSB.lol routeset**, using the live callsign and aircraft position
-3. **ADSB.lol route lookup** as the final free fallback
+2. **ADSB.lol static standing route**, using the callsign's two-character
+   prefix and exact callsign
+3. **ADSB.lol routeset**, using the live callsign and aircraft position
+4. **ADSB.lol route lookup**, using the callsign and current aircraft position
+
+When FlightAware is enabled, Over-Head tries the aircraft registration first
+and then its callsign if needed; an AeroAPI error for one identifier does not
+prevent the other identifier from being tried. Without a configured key, the
+FlightAware provider is skipped.
 
 adsb.im requires prior access approval and is not queried automatically, including
 by the service heartbeat. An empty ADSB.lol routeset response (including HTTP 201)
-is treated as no route data, not as a JSON error; individual lookups continue.
+is treated as no route data, not as a JSON error. The free providers are tried
+in that order for the original callsign; when eligible, the same sequence is
+then tried for its leading-zero alternative. A network error, ordinary HTTP
+error, empty response, malformed response, or response without a usable
+airport pair does not end the sequence. A candidate with a usable airport pair
+but missing coordinates or failed geographic validation is also rejected and
+the next provider is tried. ADSB.lol HTTP 403/429, or an HTTP error carrying
+`Retry-After`, starts a cooldown for the affected ADSB.lol service group. The
+static standing-data host has its own cooldown, independent of the `api.adsb.lol`
+routeset and route endpoints; a cooldown on either host does not suppress the
+other host's lookups.
+
+The static standing-data URL is
+`https://vrs-standing-data.adsb.lol/routes/<prefix>/<callsign>.json`. The
+callsign is normalized to uppercase alphanumeric characters; the prefix is its
+first two characters (for example, `EAG21C` becomes `EA`), and only callsigns
+of 3–12 alphanumeric characters are requested. This is a static, callsign-keyed
+route candidate; unlike the routeset and final route API, its request does not
+include the aircraft position. All three ADSB.lol results are normalized by
+Over-Head: airport objects or airport-code pairs are accepted, and airport
+coordinates are taken from the response or resolved through the local
+OurAirports data. The candidate must then pass the same independent check
+against the aircraft's current live position before it can be displayed.
+
+`/route-debug` attempt `source` names are `FlightAware AeroAPI`,
+`ADSB.lol routeset`, `ADSB.lol standing route`, and `ADSB.lol route`; cache
+reuse is reported as `cache`. For accepted free-provider results,
+`route_source` appends `+ live validation` to the provider name. FlightAware's
+accepted `route_source` is `FlightAware AeroAPI`.
 
 The original callsign is tried first. If no trustworthy route is found, callsigns
 consisting only of an alphabetic prefix and a numeric flight number with redundant
@@ -122,16 +168,22 @@ leading zeros are retried without those zeros (for example, `AMX008` -> `AMX8`).
 Suffix-bearing identifiers are left unchanged. The alternative must pass the same
 live-position validation and is cached under the original callsign + registration;
 the aircraft's displayed/transmitted callsign is never changed. Concurrent lookups
-for the same identity share the existing serialized cache. ADSB.lol HTTP 403/429
-and explicit Retry-After responses pause both route endpoints before further requests.
+for the same identity share the existing serialized cache. Cooldowns are
+host-scoped, so a restriction on one ADSB.lol host does not suppress lookups to
+the other host.
 
 ADSBDB is **not** used as route authority.
 
 Every candidate route must pass Over-Head's own geographic validation against the
 aircraft's current ADS-B position before it is displayed. A provider's own
 `plausible` flag is retained for diagnostics but does not override the local
-validator. For aircraft below 10,000 ft, an otherwise plausible route is also
-rejected when the aircraft is more than 120 NM from both endpoints.
+validator. Both airport coordinates and a valid current aircraft position are
+required. Validation checks that the aircraft is within a route corridor whose
+allowed great-circle triangle excess is clamped between 60 and 180 NM (10% of
+route length where that lies in the range); for routes shorter than 5 NM it
+instead requires the aircraft to be within 80 NM of an endpoint. Below 10,000
+ft, an otherwise plausible route is additionally rejected when the aircraft
+is more than 120 NM from both endpoints.
 
 Routes are cached in:
 
@@ -139,13 +191,36 @@ Routes are cached in:
 cache/flight-routes-v6.json
 ```
 
-The cache key is callsign + registration. Positive route entries expire after
-15 minutes and are revalidated against the aircraft's current position before
-reuse. Failed lookups are retried after 30 seconds.
+The cache identity is normalized callsign + registration. When the exact key is
+not present, a cached route for the same registration may be reused (the newest
+matching entry is selected) and copied under the current identity after it
+passes validation. Positive routes expire after 15 minutes and are revalidated
+against the current aircraft position every time they are reused. Successful
+entries are persisted to the JSON cache using a temporary file and replacement;
+the cache is loaded at startup. If the cache is missing or unreadable, the
+store starts empty. A disk-write failure does not discard a successful route
+from the running process's memory.
+
+Failed identity lookups are suppressed in memory for 300 seconds (five
+minutes), then may be retried. This negative-cache interval is separate from
+the upstream ADSB.lol provider cooldown: HTTP 403/429 or an HTTP error carrying
+`Retry-After`
+pauses ADSB.lol requests across route endpoints, while the negative cache
+suppresses repeat resolution for the same callsign/registration identity. The
+provider cooldowns are in-memory and reset on process restart. Each cooldown is
+host-scoped: standing-data restrictions pause only the static endpoint, while
+`api.adsb.lol` restrictions pause its routeset and route endpoints together. For
+403, the affected service-group pause is at least five minutes; 429 uses at least
+five minutes when no `Retry-After` is supplied. A supplied delay is not shortened. When
+FlightAware returns HTTP 401, 402 or 403, its requests are disabled for one
+hour; that cooldown is also separate and in-memory. Concurrent lookups for the
+same registration (or, without one, the same cache identity) are serialized;
+unrelated identities can resolve concurrently.
 
 When no trustworthy route is available, the heading remains a regular-weight,
 muted `N/A to N/A`. Over-Head does not invent departure, arrival or remaining
-flight times.
+flight times. These are Over-Head's own caches and cooldowns; they are not
+provider HTTP caching headers or a claim about upstream cache policy.
 
 For route-resolution diagnostics while the monitor is running:
 
@@ -173,9 +248,10 @@ actual failed-lookup counts. Successful recovery retains prior failures and reco
 the route/provider. Leading-zero statistics cover actual attempts for logged flights,
 not all flights detected by radar.
 
-The optional `route_failure_logging` object in `config.json` configures `path`
-(default `cache/route-failures.sqlite3`), `retention_days` (30), `max_records`
-(10000) and `history_limit` (50 snapshots per flight). All limits must be positive.
+Route-failure history is enabled by default. The optional
+`route_failure_logging` object in `config.json` configures `path` (default
+`cache/route-failures.sqlite3`), `retention_days` (30), `max_records` (10000)
+and `history_limit` (50 snapshots per flight). All limits must be positive.
 Old records and excess history are pruned; cumulative attempt counters are retained
 until the flight record expires. SQLite storage is private to the server and is not
 exposed by a browser endpoint. Storage errors are reported at most once per minute
@@ -213,7 +289,7 @@ live aircraft-provider fields and its built-in ICAO type-name table.
 
 ## Airport and flag data
 
-FlightAware airport codes are enriched with airport coordinates and country
+Provider airport codes are enriched with airport coordinates and country
 metadata from the public OurAirports dataset. The dataset is cached locally in:
 
 ```text
@@ -306,9 +382,14 @@ Double-clicking the display also toggles browser full screen.
 ## Automatic radar, commentary and photograph rotation
 
 When available, radar and aircraft commentary keep their existing presentation
-rotation. The route map and the selected aircraft's photograph share the same
-map panel and alternate every 10 seconds. A missing or invalid photograph leaves
-the route map visible. Image loading and presentation rotation do not request
+rotation. The route map and selected aircraft photograph use the same map frame.
+When displayed, the photograph replaces the map rather than appearing as an
+overlay. It is scaled proportionally with `contain`; a dark matte fills any
+unused area, and feathered edges blend it into the panel. The on-image credit
+identifies Airport-data.com via ADSBDB. After a valid photograph loads, the map
+and photo alternate every 10 seconds. A missing, rejected or failed-to-load
+photograph leaves the map visible, and changing the selected aircraft resets
+the alternation. Image loading and presentation rotation do not request
 additional aircraft-position observations.
 
 ## Flight snapshots
@@ -379,6 +460,8 @@ The Settings cog temporarily occupies the same right-hand slot as the radar.
 Settings currently provide:
 
 - sound alerts
+- ground-speed units
+- distance units
 - current location
 - full-screen mode
 
@@ -438,6 +521,7 @@ The footer keeps linked credits for the services and artwork used in the display
 
 - ADSB.lol
 - ADSB.fi
+- Nominatim for nearby-place labels
 - FlightAware, only when AeroAPI is configured
 - ADSBDB
 - OurAirports
@@ -445,7 +529,8 @@ The footer keeps linked credits for the services and artwork used in the display
 - OpenStreetMap
 - Soaring Symbols
 - country-flag-icons
-- arunangshubanerjee / Pixabay
+- arunangshubanerjee / Pixabay for the sound effect
+- Airport-data.com via ADSBDB for aircraft photographs
 
 The footer no longer displays an Inspired-by credit, and also reports the most
 recent display update time. On mobile, credits are arranged across three lines.
@@ -761,6 +846,12 @@ change the provider query area. Explicit TRACK mode scales the radar and its
 bounded local query automatically while resolving the selected aircraft
 directly.
 
+The optional `route_failure_logging` configuration and FlightAware AeroAPI key
+are documented in the Route Resolution section and `FLIGHTAWARE_SETUP.txt`.
+The example configuration is in `config.example.json`; the `refresh_seconds`
+field remains for compatibility and does not override the monitor's fixed
+acquisition schedules described below.
+
 `demo_on_failure` is retained for configuration compatibility, but live operation
 does not silently substitute demo traffic. Demonstration aircraft are displayed
 only when Over-Head is explicitly started with `--demo`.
@@ -811,10 +902,9 @@ coverage, the deterministic scheduler model is:
 | 64 | 31 minutes 30 seconds | 63 minutes | 64 minutes | 63 |
 
 Explicit tracking and automatic selected-aircraft updates have independent
-**30-second per-target deadlines**. Explicit TRACK lookup is scheduled promptly
-without waiting for the global geographic slot.
-Deadlines and shared-cache expiry start at the request attempt, not its response,
-so response latency does not silently turn a 30-second interval into 60 seconds.
+**30-second and 15-second per-target cadences**, respectively. Explicit TRACK
+lookup is scheduled promptly without waiting for the global geographic slot.
+Cadences and shared-cache expiry start at the request attempt, not its response.
 One acquisition worker serializes requests; network latency, cooldowns and budgets
 can still delay updates. Tracking selection survives ordinary updates. Cancellation,
 an inactive browser lease (12 seconds), or session expiry stops future targeted
@@ -881,8 +971,9 @@ Unavailable, forbidden, rate-limited, malformed, missing-target, conflicting or
 stale responses can trigger eligible fallback. A satisfactory response stops
 additional provider requests. HTTP 403 starts at a five-minute cooldown; network,
 timeout, invalid-response and other HTTP failures start at 30 seconds, with
-exponential backoff capped at one hour. An explicit `Retry-After`, including an
-HTTP date, is never shortened by that cap. Provider cooldowns and budgets are
+exponential backoff capped at one hour. An explicit `Retry-After` value on an
+HTTP error response, including an HTTP date, is never shortened by that cap.
+Provider cooldowns and budgets are
 shared across acquisition modes, and the primary is eligible again after recovery.
 The legacy `x-ratelimit-reset` interpretation remains unverified against provider
 documentation; a valid `Retry-After` takes precedence.
@@ -915,11 +1006,15 @@ Session `/status` also includes the acquisition interval, observation source and
 timestamp, and tracking acquisition outcome.
 
 Validation: `python -m unittest discover` runs the deterministic regression and
-workload checks, including two ten-minute clock simulations in
+workload checks, including route-source selection, static standing-route
+fallbacks, normalization, cache/cooldown behavior, geographic validation,
+route-failure reporting and two ten-minute clock simulations in
 `test_acquisition_continuous.py`. `python acceptance_playwright.py` is the offline
-Chromium gate, including 320px, 375px and 390px warning/footer screenshots and
-continuous automatic refresh across the freshness boundary. Live API behavior
-and provider usage policies require separate production evidence.
+Chromium gate, including photo/map presentation, responsive layout, 320px,
+375px and 390px warning/footer checks, and continuous automatic refresh across
+the freshness boundary. Tests use local fixtures and mocks; they do not verify
+live provider availability, response behavior or usage permissions. Those
+require separate evidence.
 
 Session `/status` exposes bounded `acquisition_diagnostics`: scheduling deadlines,
 queue delay, active visitor count, acquisition kind, filtering counts and selected
@@ -982,19 +1077,27 @@ TRACK mode.
 
 ## Test
 
+Install the dependencies from `requirements.txt` and install Playwright's
+Chromium build for browser acceptance tests. From the repository root, run:
+
 ```bash
-python3 -m unittest -v
+python3 -m unittest discover -v
 ```
 
 The regression suite covers route-source selection and plausibility,
-persistent flight tracking, route-map layout and animation, branding, flags,
+persistent flight tracking, route-map layout and animation, static standing-route
+fallbacks, cache/cooldown behavior, route-failure history, branding, flags,
 location handling, radar behaviour, browser title state, paired flight snapshots,
-footer credits, live/demo failure behaviour and the RGB output path.
+footer credits, live/demo failure behaviour, acquisition scheduling and the RGB
+output path.
 
-Run the offline desktop/mobile browser acceptance checks with
+Run just the offline desktop/mobile browser acceptance checks with
 `python3 acceptance_playwright.py`. They use fixture aircraft data and a local
 Leaflet shim; they do not contact aircraft or map services. Playwright Chromium
 and its Linux system libraries must be installed for these checks to run.
+Provider integrations are exercised with local fixtures and mocks; the test
+suite does not verify live-provider availability, current responses or usage
+permissions.
 
 ## Connecting RGB hardware later
 
@@ -1023,6 +1126,9 @@ configured.
 
 Aircraft identity and registered-owner enrichment is provided by
 [ADSBDB](https://www.adsbdb.com/). ADSBDB is not used as route authority.
+Aircraft photographs are sourced from Airport-data.com using photo URLs
+provided through ADSBDB; photographs are cached locally and credited in the
+display.
 
 Airport coordinate and country metadata is obtained from the public
 [OurAirports](https://ourairports.com/data/) dataset.

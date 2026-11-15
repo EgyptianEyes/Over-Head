@@ -38,6 +38,7 @@ class RouteFailureLogTests(unittest.TestCase):
                  "reason": "outside route corridor"},
                 {"source": "ADSB.lol route", "callsign": "AMX8", "requested": True,
                  "request_count": 1, "http_status": 200, "accepted": False,
+                 "retry_delay_seconds": 0.25,
                  "airport_information_returned": True,
                  "geographical_validation_passed": False,
                  "raw": {"airport_codes": "unknown", "airports": [
@@ -65,6 +66,7 @@ class RouteFailureLogTests(unittest.TestCase):
         self.assertEqual(record["fallback_attempts"], 1)
         self.assertEqual(record["fallback_successes"], 0)
         self.assertEqual(record["history"][0]["attempts"][1]["http_status"], 200)
+        self.assertEqual(record["history"][0]["attempts"][1]["retry_delay_seconds"], 0.25)
         self.assertEqual(record["history"][0]["resolution_elapsed_seconds"], 0.842)
         self.assertEqual(record["history"][0]["attempts"][1]["airports"]["returned"][0],
                          {"iata": "LHR", "icao": "EGLL"})
@@ -139,6 +141,49 @@ class RouteFailureLogTests(unittest.TestCase):
         self.assertEqual(record["provider_requests"], 0)
         self.assertEqual(record["fallback_attempts"], 0)
 
+    def test_lookup_failure_is_logged_even_if_identity_enrichment_later_fails(self):
+        class EmptyStore:
+            def get(self, *_args):
+                return None
+
+        class BrokenIdentities:
+            def get(self, _plane):
+                raise OSError("offline identity service")
+
+        plane = {
+            "hex": "0d0001", "flight": "EAG21C", "r": "G-CMJL",
+            "lat": 53.2, "lon": -4.4, "seen_pos": 0.1, "alt_baro": 18000,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            sessions = VisitorSessionStore(
+                Settings(latitude=53.2, longitude=-4.4, radius_nm=30),
+                Path(temporary) / "snapshots", global_min_interval_seconds=0,
+                route_failure_log=self.log,
+            )
+            session, _ = sessions.get_or_create()
+            routes = FlightRouteStore(Path(temporary) / "routes.json")
+            debug = self.debug("lookup-observed", [
+                {"source": "ADSB.lol routeset", "callsign": "EAG21C", "requested": True,
+                 "request_count": 1, "http_status": 200, "accepted": False,
+                 "airport_information_returned": False,
+                 "reason": "provider returned no route data"},
+            ], alternative="")
+
+            with patch("monitor.fetch_aircraft", return_value=[plane]), \
+                 patch.object(routes, "get", return_value={}), \
+                 patch.object(routes, "_current_lookup_debug", return_value=debug):
+                update_state(
+                    session.state, session.settings, False, EmptyStore(), BrokenIdentities(),
+                    routes=routes, persist_frame=False,
+                )
+                session.state.last_enrichment_future.result(timeout=5)
+
+            records = self.log.records()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["callsign"], "EAG21C")
+            self.assertEqual(records[0]["failed_attempts"], 1)
+            self.assertEqual(records[0]["history"][0]["attempts"][0]["http_status"], 200)
+
     def test_storage_errors_do_not_escape_observation(self):
         with self.assertLogs("route_failures", level="ERROR"):
             with patch.object(self.log, "_connect", side_effect=OSError("disk unavailable")):
@@ -193,7 +238,8 @@ class RouteFailureLogTests(unittest.TestCase):
             session, _ = sessions.get_or_create()
             self.assertIs(session.state.route_failure_log, log)
             store = FlightRouteStore(Path(temporary) / "routes.json")
-            with patch("monitor.fetch_aircraft", return_value=[selected, radar_only]), \
+            with patch.object(store, "_adsblol_standing", return_value={}), \
+                 patch("monitor.fetch_aircraft", return_value=[selected, radar_only]), \
                  patch("monitor.urllib.request.urlopen", side_effect=[
                      Response({"airport_codes": "unknown", "_airports": []}),
                      Response({"airport_codes": "unknown", "_airports": []}),
@@ -247,7 +293,8 @@ class RouteFailureLogTests(unittest.TestCase):
             session, _ = sessions.get_or_create()
             session.tracker.start("AMX008", ("AMX008",))
             store = FlightRouteStore(Path(temporary) / "routes.json")
-            with patch("monitor.fetch_aircraft", return_value=[nearest]), \
+            with patch.object(store, "_adsblol_standing", return_value={}), \
+                 patch("monitor.fetch_aircraft", return_value=[nearest]), \
                  patch("monitor.fetch_tracked_aircraft", return_value=(tracked, "AMX008")), \
                  patch("monitor.urllib.request.urlopen", side_effect=[
                      Response({"airport_codes": "unknown", "_airports": []}),

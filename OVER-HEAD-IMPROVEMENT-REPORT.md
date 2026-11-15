@@ -4,6 +4,11 @@
 **Scope:** Repository working tree, committed history, public homepage response, deterministic tests, and source-level architecture review.<br>
 **Method:** Read-only inspection. No application files, configuration, caches, services, production data, or upstream aircraft providers were modified or queried.
 
+> **Historical snapshot:** Findings and implementation descriptions below are
+> specific to the repository state reviewed on 31 October 2026. They are not a
+> description of the current worktree or current route-provider order. For the
+> current implementation, see the Route Resolution section in `README.md`.
+
 ## A. Executive Summary
 
 Over-Head is a single-location aircraft display, not a continuously refreshed flight-tracking service. A Python process obtains aircraft positions from ADS-B feeds, enriches a selected aircraft with route and identity information, and serves a custom HTML/CSS/JavaScript display. It has a deliberate five-minute polling default, a visible status vocabulary, a manual location workflow, route validation, local caches, and substantial deterministic tests. Those are sensible foundations for a wall display.

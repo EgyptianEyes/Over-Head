@@ -88,6 +88,10 @@ class RouteFailureLog:
             for key in ("source", "reason", "error", "route"):
                 if key in candidate:
                     attempt[key] = cls._text(candidate[key])
+            for key in ("retry_in_seconds", "retry_delay_seconds", "cooldown_seconds"):
+                value = candidate.get(key)
+                if isinstance(value, (int, float)) and math.isfinite(float(value)) and value >= 0:
+                    attempt[key] = float(value) if isinstance(value, float) else int(value)
             attempt["callsign"] = cls._identifier(candidate.get("callsign"))
             status = candidate.get("http_status")
             if isinstance(status, int):
@@ -97,7 +101,8 @@ class RouteFailureLog:
                 attempt["request_count"] = count
             attempt["requests"] = [
                 {"callsign": cls._identifier(request.get("callsign")),
-                 "http_status": request.get("http_status") if isinstance(request.get("http_status"), int) else None}
+                 "http_status": request.get("http_status") if isinstance(request.get("http_status"), int) else None,
+                 **({"error": cls._text(request["error"])} if request.get("error") else {})}
                 for request in candidate.get("requests", [])[:16] if isinstance(request, dict)
             ] if isinstance(candidate.get("requests"), list) else []
             raw = candidate.get("raw")
@@ -203,6 +208,11 @@ class RouteFailureLog:
                         ),
                         "origin": origin, "destination": destination,
                         "classification": classification, "decision": self._text(debug.get("decision")),
+                        "retry_in_seconds": (
+                            max(0, int(debug["retry_in_seconds"]))
+                            if isinstance(debug.get("retry_in_seconds"), (int, float))
+                            and math.isfinite(float(debug["retry_in_seconds"])) else None
+                        ),
                         "attempts": attempts,
                     })))
                     if cursor.rowcount:
@@ -268,6 +278,7 @@ def report(records: list[dict[str, Any]]) -> str:
         f"Recovered flights: {len(recovered)}",
         f"Missing origin: {sum(not record['origin'] for record in unresolved)}",
         f"Missing destination: {sum(not record['destination'] for record in unresolved)}",
+        f"Unresolved with provider attempts: {sum(record['failed_attempts'] > 0 for record in unresolved)}",
         f"Leading-zero fallback successes: {successes}/{fallback_attempts}"
         + (f" ({successes / fallback_attempts:.1%})" if fallback_attempts else " (no attempts)"),
     ]

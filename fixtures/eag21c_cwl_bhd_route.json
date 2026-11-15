@@ -1,0 +1,21 @@
+{
+  "aircraft": {
+    "hex": "407A12",
+    "flight": "EAG21C",
+    "r": "G-CMJL",
+    "t": "AT76",
+    "lat": 53.2,
+    "lon": -4.4,
+    "alt_baro": 18000
+  },
+  "provider_route": {
+    "callsign": "EAG21C",
+    "airport_codes": "EGFF-EGAC",
+    "_airport_codes_iata": "CWL-BHD",
+    "plausible": true
+  },
+  "airports": {
+    "CWL": {"name": "Cardiff International Airport", "country_iso_name": "GB", "latitude": 51.396702, "longitude": -3.343330},
+    "BHD": {"name": "George Best Belfast City Airport", "country_iso_name": "GB", "latitude": 54.618099, "longitude": -5.872500}
+  }
+}

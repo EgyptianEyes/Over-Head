@@ -5,13 +5,29 @@ FlightAware AeroAPI is optional.
 
 When configured, Over-Head uses FlightAware as the first route resolver for the
 currently displayed aircraft. Without a FlightAware key, Over-Head still runs
-and uses the free live-position-aware route fallbacks.
+and uses the free route providers, validating each usable candidate against the
+aircraft's current live position before display.
 
 Route resolution order
 ----------------------
 1. FlightAware AeroAPI, when configured
-2. ADSB.lol routeset using callsign + live latitude/longitude
-3. ADSB.lol route GET using callsign + live latitude/longitude
+2. ADSB.lol static standing route at
+    https://vrs-standing-data.adsb.lol/routes/<prefix>/<callsign>.json
+3. ADSB.lol routeset using callsign + live latitude/longitude
+4. ADSB.lol route GET using callsign + live latitude/longitude
+
+For the static route URL, <prefix> is the first two characters of the
+normalized uppercase alphanumeric callsign (for example, EAG21C uses EA).
+Only 3–12 character alphanumeric callsigns are requested. This lookup is
+callsign-keyed and does not send the aircraft position; the routeset and route
+GET are the live-position-aware endpoints. Results from every provider are
+normalized locally and must pass the same airport-coordinate and current
+aircraft-position validation before display. An unavailable endpoint, empty or
+malformed response, or unusable airport pair falls through to the next
+provider. ADSB.lol HTTP 403/429 or Retry-After starts a cooldown for the affected
+service group. The standing-data host has an independent cooldown from the
+routeset and route endpoints on api.adsb.lol; a restriction on one host does not
+suppress lookups to the other.
 
 adsb.im requires prior access approval and is not automatically queried or probed.
 
@@ -42,9 +58,10 @@ What happens without a FlightAware key?
 ---------------------------------------
 Over-Head continues normally.
 
-It tries ADSB.lol's routeset endpoint, then the ADSB.lol
-route GET endpoint. Each free-provider result is independently validated against
-the aircraft's current ADS-B position before it is displayed.
+It tries the ADSB.lol static standing-route endpoint, then the routeset endpoint,
+then the ADSB.lol route GET endpoint. Each
+free-provider result is independently validated against the aircraft's current
+ADS-B position before it is displayed.
 
 A provider's own "plausible" value is retained for diagnostics but is not the
 final authority.
@@ -72,17 +89,35 @@ The route cache is keyed by callsign + registration.
 Successful routes expire after 15 minutes and are revalidated against the
 aircraft's current position before reuse.
 
-A failed route lookup is retried after 30 seconds.
+A failed callsign + registration identity is suppressed in memory for 300
+seconds (five minutes) before another lookup may run. This negative-cache
+interval is separate from the ADSB.lol HTTP cooldowns. Provider cooldowns are in
+memory and reset on process restart. A 403 pauses the affected service group for
+at least five minutes; a 429 pauses it for at least five minutes unless a longer
+Retry-After applies. The static standing-data service is separate from the shared
+api.adsb.lol routeset/route cooldown. Retry-After is not shortened. FlightAware 401, 402
+or 403 responses disable further AeroAPI requests for one hour.
 
-After the original callsign fails, alphabetic-prefix/numeric-only identifiers with
+The cache is loaded from JSON at startup and successful routes are saved by
+temporary-file replacement. A missing or unreadable cache starts empty. A
+successful route remains usable in memory if persistence fails. Concurrent
+lookups for the same registration (or the same callsign + registration when
+there is no registration) are serialized; unrelated identities can resolve
+concurrently. Positive cache entries expire after 15 minutes and are checked
+against the current aircraft position before reuse. These are application
+cache rules, not HTTP caching headers from a route provider.
+
+After the original callsign fails across the provider sequence, alphabetic-prefix/numeric-only identifiers with
 redundant leading zeros are retried without those zeros (AMX008 -> AMX8).
 Suffix-bearing identifiers are unchanged. Successful alternatives are independently
 validated and cached under the original callsign + registration without changing
 the displayed or transmitted callsign.
 
 An empty routeset response, including HTTP 201, supplies no route data and does
-not block individual route lookups. ADSB.lol HTTP 403/429 and explicit Retry-After
-responses pause both route endpoints; normal failed-lookup retry delays still apply.
+not block later route lookups. The route-debug endpoint reports attempts using
+the source names `FlightAware AeroAPI`, `ADSB.lol routeset`,
+`ADSB.lol standing route`, `ADSB.lol route`, and `cache`. Accepted free-provider
+routes have `+ live validation` appended to their `route_source`.
 
 If FlightAware returns HTTP 401, 402 or 403, AeroAPI lookups are temporarily
 disabled for one hour so an invalid, unauthorised or unsuitable key is not
@@ -92,9 +127,10 @@ Data roles
 ----------
 - ADSB.lol: live ADS-B position/state and direct callsign lookup for TRACK mode
 - FlightAware AeroAPI: optional primary commercial-flight identity and route
-- ADSB.lol routeset: first free route fallback
-- ADSB.lol route GET: final free route fallback
-- OurAirports: airport coordinates and country metadata used by FlightAware routes
+- ADSB.lol static standing route: first free route fallback
+- ADSB.lol routeset: live-position-aware fallback
+- ADSB.lol route GET: final free, live-position-aware route fallback
+- OurAirports: local airport coordinates and country metadata used to normalize routes
 - ADSBDB: aircraft identity/registered-owner metadata only, never route authority
 
 Persistent TRACK mode
@@ -109,6 +145,16 @@ TRACK mode is separate from route resolution: it locks which aircraft is
 displayed. The route resolver then determines that aircraft's trustworthy
 origin/destination using the provider stack above.
 
+Monitoring cadence
+------------------
+Normal geographic discovery runs no more often than every 60 seconds.
+Automatically selected aircraft are refreshed on a 15-second cadence, while
+an explicit TRACK target uses a 30-second cadence. Route validation requires a
+position no older than 20 seconds. The browser polls display status every
+2 seconds; those status polls do not themselves fetch upstream aircraft data.
+These intervals are cadences, not guaranteed observation deadlines; scheduler,
+request, provider-limit and polling-budget delays can defer updates.
+
 Diagnostics
 -----------
 Keep Over-Head running in one PowerShell window, then use a second PowerShell
@@ -119,9 +165,12 @@ Current route decision:
     Invoke-RestMethod "http://127.0.0.1:8765/route-debug" |
         ConvertTo-Json -Depth 8
 
-The response includes the original and alternative callsigns, registration, route, route source,
-aircraft position, configured FlightAware state, provider attempts, raw route
-summaries, geographic-validation values and the final resolver decision.
+The response includes the original and alternative callsigns, registration,
+route and route source, aircraft position, configured FlightAware state,
+provider attempts (including `FlightAware AeroAPI`, `ADSB.lol routeset`,
+`ADSB.lol standing route`, `ADSB.lol route` and `cache` source labels),
+bounded raw route summaries, geographic-validation values and the final
+resolver decision.
 
 Example raw ADSB.lol routeset request:
 
