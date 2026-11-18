@@ -217,6 +217,12 @@ def aircraft_position_observed_at(plane: dict[str, Any] | None, received_at: flo
     if not plane:
         return None
     try:
+        stamped = float(plane.get("_position_observed_at_monotonic"))
+    except (TypeError, ValueError):
+        stamped = None
+    if stamped is not None and math.isfinite(stamped) and stamped <= time.monotonic() + 1.0:
+        return stamped
+    try:
         age = float(plane.get("seen_pos"))
         if plane.get("observed_at") is not None:
             age = max(age, time.time() - float(plane["observed_at"]))
@@ -251,6 +257,7 @@ def metric_history_retention_seconds(refresh_seconds: float) -> float:
 
 def age_aircraft_positions(aircraft: list[dict[str, Any]], elapsed_seconds: float) -> list[dict[str, Any]]:
     elapsed = max(0.0, float(elapsed_seconds))
+    now = time.monotonic()
     aged: list[dict[str, Any]] = []
     for plane in aircraft:
         if not isinstance(plane, dict):
@@ -260,9 +267,66 @@ def age_aircraft_positions(aircraft: list[dict[str, Any]], elapsed_seconds: floa
             age = float(record.get("seen_pos", 999))
         except (TypeError, ValueError):
             age = 999.0
-        record["seen_pos"] = age + elapsed if math.isfinite(age) and age >= 0 else 999.0
+        observed_at = record.get("_position_observed_at_monotonic")
+        try:
+            observed_at = float(observed_at)
+        except (TypeError, ValueError):
+            observed_at = None
+        if observed_at is not None and math.isfinite(observed_at) and observed_at <= now + 1.0:
+            record["seen_pos"] = max(0.0, now - observed_at)
+        else:
+            record["seen_pos"] = age + elapsed if math.isfinite(age) and age >= 0 else 999.0
         aged.append(record)
     return aged
+
+
+def merge_recent_aircraft_observations(
+    previous: list[dict[str, Any]], previous_received_at: float | None,
+    incoming: list[dict[str, Any]], incoming_received_at: float,
+    retention_seconds: float, now: float | None = None,
+) -> list[dict[str, Any]]:
+    """Merge real provider observations without letting omissions or old replies erase newer data."""
+    current = time.monotonic() if now is None else float(now)
+    retention = max(POSITION_FRESHNESS_SECONDS, float(retention_seconds))
+    merged: dict[str, tuple[float, dict[str, Any]]] = {}
+    unkeyed: list[tuple[float, dict[str, Any]]] = []
+
+    def add(records: list[dict[str, Any]], received_at: float | None) -> None:
+        if received_at is None:
+            return
+        for candidate in records:
+            if not isinstance(candidate, dict):
+                continue
+            record = dict(candidate)
+            try:
+                validate_location(record.get("lat"), record.get("lon"))
+            except ValueError:
+                continue
+            try:
+                observed_at = float(record.get("_position_observed_at_monotonic"))
+            except (TypeError, ValueError):
+                observed_at = aircraft_position_observed_at(record, float(received_at))
+            if observed_at is None or not math.isfinite(observed_at) or observed_at > current + 1.0:
+                continue
+            age = max(0.0, current - observed_at)
+            if age > retention:
+                continue
+            record["_position_observed_at_monotonic"] = observed_at
+            record["seen_pos"] = age
+            record["_position_state"] = "reported" if age <= POSITION_FRESHNESS_SECONDS else "last_known"
+            identity = aircraft_identity(record)
+            if not identity:
+                unkeyed.append((observed_at, record))
+                continue
+            existing = merged.get(identity)
+            if existing is None or observed_at > existing[0]:
+                merged[identity] = (observed_at, record)
+
+    add(previous, previous_received_at)
+    add(incoming, incoming_received_at)
+    ordered = [item[1] for item in merged.values()]
+    ordered.extend(record for _, record in unkeyed)
+    return ordered
 
 
 def aircraft_within_radius(aircraft: list[dict[str, Any]], settings, radius_nm: float) -> list[dict[str, Any]]:
@@ -288,6 +352,14 @@ def select_nearest_within_radius(
     return select_nearest(
         eligible, settings, min(float(max_position_age_seconds), POSITION_FRESHNESS_SECONDS),
     )
+
+
+def select_nearest_retained_within_radius(
+    aircraft: list[dict[str, Any]], settings, max_position_age_seconds: float,
+) -> tuple[dict[str, Any] | None, float | None]:
+    """Select a bounded last-known position without classifying it as current."""
+    eligible = aircraft_within_radius(aircraft, settings, settings.radius_nm)
+    return select_nearest(eligible, settings, float(max_position_age_seconds))
 
 
 def acquisition_filter_counts(aircraft: list[dict[str, Any]], settings) -> dict[str, int]:
@@ -497,8 +569,11 @@ def safe_svg(data: bytes) -> bytes | None:
     return data
 
 
-def radar_contacts(aircraft: list[dict[str, Any]], settings, selected: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Project current aircraft positions onto a north-up circular radar."""
+def radar_contacts(
+    aircraft: list[dict[str, Any]], settings, selected: dict[str, Any] | None,
+    max_position_age_seconds: float = POSITION_FRESHNESS_SECONDS,
+) -> list[dict[str, Any]]:
+    """Project reported and explicitly labelled retained positions onto the radar."""
     selected_hex = str((selected or {}).get("hex") or "")
     latitude_scale = 60.0405
     longitude_scale = latitude_scale * math.cos(math.radians(settings.latitude))
@@ -513,7 +588,7 @@ def radar_contacts(aircraft: list[dict[str, Any]], settings, selected: dict[str,
             continue
         try:
             position_age = float(plane.get("seen_pos", 999))
-            if not math.isfinite(position_age) or position_age < 0 or position_age > POSITION_FRESHNESS_SECONDS:
+            if not math.isfinite(position_age) or position_age < 0 or position_age > max_position_age_seconds:
                 continue
         except (TypeError, ValueError):
             continue
@@ -532,6 +607,7 @@ def radar_contacts(aircraft: list[dict[str, Any]], settings, selected: dict[str,
             "track": plane.get("track") or 0,
             "altitude": plane.get("alt_baro"),
             "position_age_seconds": position_age,
+            "position_state": "reported" if position_age <= POSITION_FRESHNESS_SECONDS else "last_known",
             "selected": bool(selected_hex and str(plane.get("hex") or "") == selected_hex),
             "emergency": str(plane.get("squawk") or "") in {"7500", "7600", "7700"},
         })
@@ -2227,7 +2303,8 @@ PAGE = b"""<!doctype html>
     .aircraft-name { color:var(--white); font-size:clamp(17px,1.55vw,28px); font-weight:650; letter-spacing:.065em; }
     .route-visual { position:absolute; top:clamp(-126px,-13.5vh,-112px); right:0; width:clamp(530px,29.7vw,575px); height:clamp(430px,51vh,460px); overflow:visible; z-index:0; pointer-events:none; }
     .route-brand { position:absolute; top:0; left:50%; transform:translateX(-50%); width:100%; height:clamp(92px,10.5vh,108px); display:flex; align-items:center; justify-content:center; overflow:hidden; pointer-events:none; z-index:20; background:linear-gradient(90deg,rgba(2,5,10,0) 0%,#02050a 5%,#02050a 95%,rgba(2,5,10,0) 100%); }
-    .route-brand-name { display:none; max-width:92%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); font-size:clamp(34px,3.4vw,58px); font-weight:750; letter-spacing:.015em; line-height:1; text-align:center; }
+    .route-brand-name { display:none; max-width:92%; overflow:hidden; text-overflow:clip; white-space:nowrap; color:var(--muted); font-size:clamp(34px,3.4vw,58px); font-weight:750; letter-spacing:.015em; line-height:1; text-align:center; }
+    .route-brand-name.measuring { visibility:hidden; }
     .route-brand-logo { display:none; width:100%; height:100%; object-fit:contain; transform-origin:center; filter:brightness(1.35) saturate(1.22) contrast(1.06) drop-shadow(0 0 14px rgba(108,154,172,.20)); }
     .route-map { display:none; position:absolute; top:clamp(90.882px,10.3275vh,99.144px); left:calc(50% + clamp(18px,1.2vw,24px)); transform:translateX(-60%); width:clamp(567.6px,38.28vw,739.2px); height:clamp(277.2px,33vh,376.2px); overflow:hidden; border:0; border-radius:clamp(14px,1.5vw,22px); background:transparent; box-shadow:none; pointer-events:auto; z-index:0; }
     .route-map.visible { display:block; }
@@ -2244,7 +2321,8 @@ PAGE = b"""<!doctype html>
     .route-map.photo-active > :not(.route-photo-panel),.route-map.photo-active::before,.route-map.photo-active::after { visibility:hidden; }
     .route-photo-panel { position:absolute; inset:0; z-index:900; overflow:hidden; background:#05080d; pointer-events:none; }
     .route-photo-panel[hidden] { display:none; }
-    .route-photo-panel img { position:absolute; inset:0; display:block; width:100%; height:100%; object-fit:contain; object-position:center; filter:saturate(1.06) brightness(1.03) contrast(1.03); mask-image:linear-gradient(to right,transparent 0%,#000 12%,#000 88%,transparent 100%),linear-gradient(to bottom,transparent 0%,#000 12%,#000 88%,transparent 100%); mask-composite:intersect; }
+    .route-photo-panel img { position:absolute; inset:0; display:block; width:100%; height:100%; object-fit:contain; object-position:center; filter:saturate(1.06) brightness(1.03) contrast(1.03); -webkit-mask-image:linear-gradient(to right,transparent 0%,rgba(0,0,0,.35) 8%,#000 21%,#000 79%,rgba(0,0,0,.35) 92%,transparent 100%),linear-gradient(to bottom,transparent 0%,rgba(0,0,0,.35) 8%,#000 21%,#000 79%,rgba(0,0,0,.35) 92%,transparent 100%); -webkit-mask-composite:source-in; mask-image:linear-gradient(to right,transparent 0%,rgba(0,0,0,.35) 8%,#000 21%,#000 79%,rgba(0,0,0,.35) 92%,transparent 100%),linear-gradient(to bottom,transparent 0%,rgba(0,0,0,.35) 8%,#000 21%,#000 79%,rgba(0,0,0,.35) 92%,transparent 100%); mask-composite:intersect; }
+    @media (min-width:769px) { .route-photo-panel img { object-position:68% center; } }
     .aircraft-photo-credit { position:absolute; right:8px; bottom:8px; z-index:2; padding:.36em .55em; border-radius:5px; background:rgba(2,5,10,.62); color:rgba(232,246,255,.90); font:700 clamp(6px,.48vw,8px)/1.1 "Segoe UI",sans-serif; letter-spacing:.07em; }
     .route-direction-flow { pointer-events:none; animation:route-flow 10s linear infinite; filter:drop-shadow(0 0 4px rgba(232,246,255,.95)) drop-shadow(0 0 8px rgba(20,236,255,.7)); }
     .snapshot-render .route-direction-flow { animation:none; }
@@ -2319,15 +2397,17 @@ PAGE = b"""<!doctype html>
     .snapshot-viewer-title { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); font-size:11px; font-weight:700; letter-spacing:.08em; }
     .snapshot-viewer-stage { min-height:0; display:grid; place-items:center; overflow:auto; }
     .snapshot-viewer-stage img { display:block; max-width:100%; max-height:100%; width:auto; height:auto; object-fit:contain; box-shadow:0 14px 50px rgba(0,0,0,.42); }
-    .location-backdrop { display:none; position:fixed; inset:0; z-index:5000; align-items:center; justify-content:center; padding:clamp(10px,1.5vw,22px); overflow:hidden; background:rgba(0,2,7,.84); backdrop-filter:blur(8px); }
+    .location-backdrop { display:none; position:fixed; inset:0; z-index:5000; align-items:center; justify-content:center; padding:max(10px,env(safe-area-inset-top)) max(10px,env(safe-area-inset-right)) max(10px,env(safe-area-inset-bottom)) max(10px,env(safe-area-inset-left)); overflow:hidden; background:rgba(0,2,7,.84); backdrop-filter:blur(8px); }
     .location-backdrop.open { display:flex; }
-    .location-dialog { width:min(1060px,96vw); height:min(94vh,820px); min-height:0; overflow:hidden; padding:clamp(16px,1.8vw,26px); display:grid; grid-template-rows:auto minmax(220px,1fr) auto auto auto; gap:clamp(8px,1.2vh,14px); border:1px solid var(--line); border-radius:clamp(18px,2vw,30px); background:#02050a; box-shadow:0 35px 120px rgba(0,0,0,.65),inset 0 0 70px rgba(20,236,255,.025); }
+    .location-dialog { width:min(1040px,calc(100vw - 20px)); height:min(720px,calc(var(--location-viewport-height,100dvh) - 20px)); min-height:0; overflow:hidden; padding:clamp(16px,1.8vw,26px); display:grid; grid-template-rows:auto minmax(0,1fr); gap:clamp(12px,1.5vh,18px); border:1px solid var(--line); border-radius:clamp(18px,2vw,30px); background:#02050a; box-shadow:0 35px 120px rgba(0,0,0,.65),inset 0 0 70px rgba(20,236,255,.025); }
     .location-dialog-head { display:flex; align-items:flex-start; justify-content:space-between; gap:18px; min-height:0; }
     .location-dialog-head strong { color:var(--white); font-size:clamp(22px,2vw,34px); letter-spacing:.07em; }
     .location-dialog-head p { margin:.35em 0 0; max-width:58em; color:var(--muted); font-size:clamp(11px,.9vw,15px); line-height:1.4; }
     .location-close { flex:0 0 auto; width:2.5em; height:2.5em; padding:0; display:grid; place-items:center; cursor:pointer; border:1px solid var(--line); border-radius:50%; background:rgba(20,236,255,.055); color:var(--cyan); font:700 20px/1 "Segoe UI",sans-serif; }
     .location-close:hover,.location-close:focus-visible { border-color:var(--cyan); background:rgba(20,236,255,.12); outline:none; }
-    #location-map { width:100%; height:100%; min-height:0; border:1px solid var(--line); border-radius:18px; overflow:hidden; background:#02050a; }
+    .location-picker-main { min-width:0; min-height:0; display:grid; grid-template-columns:minmax(0,1.55fr) minmax(260px,.75fr); gap:clamp(12px,1.5vw,18px); }
+    .location-picker-controls { min-width:0; min-height:0; display:flex; flex-direction:column; gap:12px; }
+    #location-map { width:100%; height:100%; min-height:220px; border:1px solid var(--line); border-radius:18px; overflow:hidden; background:#02050a; }
     #location-map .leaflet-tile-pane { filter:grayscale(.15) brightness(.82) contrast(1.08); }
     .location-details { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; min-height:0; }
     .location-coordinate { padding:clamp(9px,1.2vh,12px) 14px; border:1px solid var(--line); border-radius:12px; background:rgba(20,236,255,.025); }
@@ -2336,7 +2416,8 @@ PAGE = b"""<!doctype html>
     .location-coordinate input:focus-visible { outline:1px solid var(--cyan); outline-offset:3px; }
     .location-status { min-height:1.35em; color:var(--muted); font-size:clamp(11px,.9vw,14px); }
     .location-status.error { color:var(--amber); }
-    .location-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:10px; min-height:0; }
+    .location-actions { margin-top:auto; display:grid; grid-template-columns:1fr 1fr; gap:10px; min-height:0; }
+    #location-use-device { grid-column:1/-1; }
     .location-primary { border-color:rgba(20,236,255,.55); background:rgba(20,236,255,.10); }
     #location-use-device.locating { color:var(--white); border-color:rgba(20,236,255,.58); background:rgba(20,236,255,.07); animation:location-button-pulse 1.6s ease-in-out infinite; cursor:wait; }
     #location-use-device.locating:disabled { opacity:1; }
@@ -2347,7 +2428,7 @@ PAGE = b"""<!doctype html>
 
     @media (max-height:700px) {
       .location-backdrop { padding:8px; }
-      .location-dialog { width:min(1060px,98vw); height:calc(100vh - 16px); padding:12px 16px; grid-template-rows:auto minmax(170px,1fr) auto auto auto; gap:7px; }
+      .location-dialog { width:min(1060px,calc(100vw - 16px)); height:calc(var(--location-viewport-height,100dvh) - 16px); padding:12px 16px; gap:9px; }
       .location-dialog-head strong { font-size:clamp(19px,1.8vw,28px); }
       .location-dialog-head p { margin-top:.2em; font-size:11px; line-height:1.25; }
       .location-coordinate { padding:7px 12px; }
@@ -2380,6 +2461,8 @@ PAGE = b"""<!doctype html>
     .contact.trackable:hover path,.contact.trackable:focus path,.contact.trackable:focus-visible path { fill:var(--green); filter:drop-shadow(0 0 1.8px var(--green)); }
     .contact.trackable:focus,.contact.trackable:focus-visible { outline:none; }
     .contact.selected { color:var(--cyan); filter:drop-shadow(0 0 1.6px var(--cyan)); }
+    .contact.last-known { opacity:.46; }
+    .contact.last-known path { stroke:currentColor; stroke-width:.22; stroke-dasharray:.55 .45; }
     .contact.emergency { color:var(--red); }
     .contact path { fill:currentColor; }
     .contact text { fill:currentColor; font:700 3.2px "Segoe UI",sans-serif; letter-spacing:.02em; }
@@ -2737,27 +2820,50 @@ PAGE = b"""<!doctype html>
       .snapshot-toast { bottom:42px; font-size:9px; }
 
       /* Keep the location picker inside the mobile viewport too. */
-      .location-backdrop { padding:6px; }
+      .location-backdrop { padding:max(6px,env(safe-area-inset-top)) max(6px,env(safe-area-inset-right)) max(6px,env(safe-area-inset-bottom)) max(6px,env(safe-area-inset-left)); }
       .location-dialog {
         width:calc(100vw - 12px);
-        height:calc(100dvh - 12px);
-        padding:9px 10px;
-        grid-template-rows:auto minmax(120px,1fr) auto auto auto;
-        gap:6px;
+        height:calc(var(--location-viewport-height,100dvh) - 12px);
+        padding:10px;
+        grid-template-rows:auto minmax(0,1fr);
+        gap:8px;
         border-radius:14px;
       }
       .location-dialog-head { gap:8px; }
       .location-dialog-head strong { font-size:16px; }
       .location-dialog-head p { display:none; }
       .location-close { width:30px; height:30px; font-size:16px; }
+      .location-picker-main { display:grid; grid-template-columns:1fr; grid-template-rows:minmax(128px,1fr) auto; gap:8px; overflow:auto; overscroll-behavior:contain; }
+      .location-picker-controls { gap:7px; }
       #location-map { border-radius:10px; }
       .location-details { gap:6px; }
       .location-coordinate { padding:6px 8px; }
       .location-coordinate span { font-size:7px; }
     .location-coordinate input { font-size:12px; }
       .location-status { min-height:1.2em; font-size:9px; }
-      .location-actions { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:5px; }
-      .location-actions .setting-action { min-width:0; padding:.55em .35em; font-size:8px; letter-spacing:.06em; }
+      .location-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; margin-top:0; }
+      #location-use-device { grid-column:1/-1; }
+      .location-actions .setting-action { min-width:0; min-height:34px; padding:.62em .4em; font-size:9px; letter-spacing:.06em; }
+    }
+    @media (max-width:950px) and (max-height:500px) {
+      .flight-heading { grid-template-rows:minmax(86px,1fr) 26px; gap:2px; }
+      .route-visual,
+      .wall.radar-open .route-visual,
+      .wall.settings-open .route-visual,
+      .wall:not(.radar-open) .route-visual { height:26px; min-height:26px; }
+      .route-brand { height:26px; }
+      .route-brand-name { font-size:clamp(13px,2.3vw,18px); }
+      .route-brand-logo { max-height:26px; }
+      .route-map,
+      .wall.radar-open .route-map,
+      .wall.settings-open .route-map,
+      .wall:not(.radar-open):not(.settings-open) .route-map { display:none !important; }
+    }
+    @media (max-width:768px) and (orientation:landscape) {
+      .location-dialog-head p { display:none; }
+      .location-picker-main { grid-template-columns:minmax(0,1.35fr) minmax(220px,.8fr); grid-template-rows:1fr; overflow:hidden; }
+      #location-map { min-height:0; }
+      .location-picker-controls { overflow:auto; padding-right:2px; }
     }
     @media (max-width:360px) {
       .brand { width:clamp(78px,24vw,96px); }
@@ -2825,10 +2931,11 @@ PAGE = b"""<!doctype html>
   <div class="location-backdrop" id="location-backdrop" role="dialog" aria-modal="true" aria-labelledby="location-title">
     <div class="location-dialog">
       <div class="location-dialog-head"><div><strong id="location-title">SELECT CURRENT LOCATION</strong><p>Use your device's high-accuracy browser location, or click and drag the marker to set the exact home centre used for aircraft tracking.</p></div><button class="location-close" id="location-close" type="button" aria-label="Close location selector">&times;</button></div>
-      <div id="location-map" aria-label="Map for selecting the Over-Head home location"></div>
-    <div class="location-details"><label class="location-coordinate"><span>LATITUDE</span><input id="location-latitude" type="number" min="-90" max="90" step="any" inputmode="decimal" aria-label="Home latitude" placeholder="-90 to 90"></label><label class="location-coordinate"><span>LONGITUDE</span><input id="location-longitude" type="number" min="-180" max="180" step="any" inputmode="decimal" aria-label="Home longitude" placeholder="-180 to 180"></label></div>
-      <div class="location-status" id="location-status">Choose a point on the map or use your device location.</div>
-      <div class="location-actions"><button class="setting-action" id="location-use-device" type="button">USE MY LOCATION</button><button class="setting-action" id="location-cancel" type="button">CANCEL</button><button class="setting-action location-primary" id="location-save" type="button">SAVE LOCATION</button></div>
+      <div class="location-picker-main"><div id="location-map" aria-label="Map for selecting the Over-Head home location"></div><div class="location-picker-controls">
+        <div class="location-details"><label class="location-coordinate"><span>LATITUDE</span><input id="location-latitude" type="number" min="-90" max="90" step="any" inputmode="decimal" aria-label="Home latitude" placeholder="-90 to 90"></label><label class="location-coordinate"><span>LONGITUDE</span><input id="location-longitude" type="number" min="-180" max="180" step="any" inputmode="decimal" aria-label="Home longitude" placeholder="-180 to 180"></label></div>
+        <div class="location-status" id="location-status">Confirm the suggested location, choose the map, or use your device location.</div>
+        <div class="location-actions"><button class="setting-action" id="location-use-device" type="button">USE MY CURRENT LOCATION</button><button class="setting-action" id="location-cancel" type="button">CANCEL</button><button class="setting-action location-primary" id="location-save" type="button">CONFIRM LOCATION</button></div>
+      </div></div>
     </div>
   </div>
   <audio id="alert-tone" preload="auto" src="/beep-tone.mp3"></audio>
@@ -2931,10 +3038,11 @@ PAGE = b"""<!doctype html>
     let routePhotoAircraftId='',routePhotoRevision='',routePhotoTimer=null,routePhotoRequest=0,routePhotoInPhotoView=false;
     let routeFlowKey='',routeFlowStartedAt=Date.now();
     let currentHomeLatitude=null,currentHomeLongitude=null,currentLocationRevision=0;
+    let pageLocationConfirmed=Boolean(snapshotId),lastLifecycleUpdateAt=0,lifecycleUpdateTimer=null;
     let locationMap=null,locationMarker=null,locationAccuracyCircle=null,locationDialogRevision=0;
         const locationModeKey='overhead-location-mode-v1';
         const locationDeniedKey='overhead-location-denied-v1';
-        let locationLookupInFlight=false,locationRequestRevision=0,pendingLocationMode='dynamic';
+        let locationLookupInFlight=false,locationRequestRevision=0,locationInputRevision=0,pendingLocationMode='dynamic';
         function dynamicLocationIsDefault(){
             try{
                 const saved=localStorage.getItem(locationModeKey);
@@ -3323,6 +3431,40 @@ PAGE = b"""<!doctype html>
         element.style.fontSize=size+'px';
       }
     }
+    let operatorFitFrame=0;
+    function fitOperatorName(){
+      const element=byId('route-brand-name'),container=byId('route-brand');
+      if(!element||!container||!element.textContent||getComputedStyle(element).display==='none')return;
+      element.classList.add('measuring');
+      element.style.fontSize=''; element.style.textOverflow='clip'; element.removeAttribute('title');
+      const maximum=parseFloat(getComputedStyle(element).fontSize)||58;
+      const minimum=Math.min(maximum,window.matchMedia('(max-width:768px), (max-height:500px)').matches?11:18);
+      const availableWidth=Math.max(1,container.clientWidth*.92);
+      const availableHeight=Math.max(1,container.clientHeight*.82);
+      const range=document.createRange(); range.selectNodeContents(element);
+      const fits=size=>{
+        element.style.fontSize=size+'px';
+        const bounds=range.getBoundingClientRect();
+        return bounds.width<=availableWidth+.5&&bounds.height<=availableHeight+.5;
+      };
+      let low=minimum,high=maximum,best=minimum;
+      if(fits(minimum)){
+        for(let index=0;index<8;index++){
+          const candidate=(low+high)/2;
+          if(fits(candidate)){ best=candidate; low=candidate; }else high=candidate;
+        }
+        element.style.fontSize=Math.floor(best*10)/10+'px';
+      }else{
+        element.style.fontSize=minimum+'px';
+        element.style.textOverflow='ellipsis';
+        element.title=element.textContent;
+      }
+      element.classList.remove('measuring');
+    }
+    function scheduleOperatorNameFit(){
+      cancelAnimationFrame(operatorFitFrame);
+      operatorFitFrame=requestAnimationFrame(()=>{ operatorFitFrame=requestAnimationFrame(fitOperatorName); });
+    }
     function normaliseAirportHeights(heading){
       const airports=[...heading.querySelectorAll('.route-airport')];
       if(airports.length!==2)return;
@@ -3567,13 +3709,14 @@ PAGE = b"""<!doctype html>
             setLocationButtonBusy(false);
             pendingLocationMode='manual';
             const revision=++locationDialogRevision;
+            const inputRevision=locationInputRevision;
             modalReturnFocus=document.activeElement;
       byId('location-backdrop').classList.add('open');
             focusModalControl('location-close');
       let lat=Number(currentHomeLatitude),lon=Number(currentHomeLongitude);
       if(!Number.isFinite(lat)||!Number.isFinite(lon)){
         try{
-          const response=await fetch('/status?active='+(document.visibilityState==='visible'?'1':'0')+'&t='+Date.now(),{cache:'no-store'});
+          const response=await fetch('/status?active=0&bootstrap=1&t='+Date.now(),{cache:'no-store'});
           if(response.ok){
             const status=await response.json();
             lat=Number(status.home_latitude); lon=Number(status.home_longitude);
@@ -3593,15 +3736,14 @@ PAGE = b"""<!doctype html>
       requestAnimationFrame(()=>{
                 if(revision!==locationDialogRevision||!byId('location-backdrop').classList.contains('open'))return;
         locationMap.invalidateSize(false);
-        setLocationCandidate(lat,lon,null,true);
+                if(inputRevision===locationInputRevision)setLocationCandidate(lat,lon,null,true);
       });
-      locationStatus('Choose a point on the map or use your device location.');
+      locationStatus('Confirm the suggested location, choose the map, or use your device location.');
     }
     function closeLocationSelector(){
             locationDialogRevision++;
       setLocationButtonBusy(false);
       byId('location-backdrop').classList.remove('open');
-      setRadar(true);
             const returnTarget=modalReturnFocus&&modalReturnFocus.isConnected&&modalReturnFocus.getClientRects().length
                 ?modalReturnFocus:byId('settings-toggle');
             if(returnTarget)returnTarget.focus();
@@ -3611,7 +3753,7 @@ PAGE = b"""<!doctype html>
       const button=byId('location-use-device');
       button.classList.toggle('locating',busy);
       button.disabled=busy;
-      button.textContent=busy?'LOCATING...':'USE MY LOCATION';
+      button.textContent=busy?'LOCATING...':'USE MY CURRENT LOCATION';
       button.setAttribute('aria-busy',String(busy));
     }
         function applyManualLocation(){
@@ -3700,13 +3842,14 @@ PAGE = b"""<!doctype html>
         const data=await response.json();
         if(!response.ok)throw new Error(data.error||'Could not save location');
                 const responseRevision=Number(data.location_revision)||0;
-                if(responseRevision>=currentLocationRevision){
+        if(responseRevision>=currentLocationRevision){
                     currentLocationRevision=responseRevision;
                     currentHomeLatitude=Number(data.latitude); currentHomeLongitude=Number(data.longitude);
                     byId('settings-location-value').textContent=formatCoordinate(currentHomeLatitude)+', '+formatCoordinate(currentHomeLongitude);
                 }
+        pageLocationConfirmed=true;
         closeLocationSelector();
-        update();
+        await update();
       }catch(error){
         locationStatus(error.message||'Could not save location',true);
       }finally{
@@ -3881,7 +4024,7 @@ PAGE = b"""<!doctype html>
         function drawRadar(contacts,radius,trackingActive){
             const items=contacts||[];
             const visualKey=JSON.stringify([radius,Boolean(trackingActive),items.map(c=>[
-                c.aircraft_hex,c.callsign,c.x,c.y,c.track,c.flight,c.selected,c.emergency,
+                c.aircraft_hex,c.callsign,c.x,c.y,c.track,c.flight,c.selected,c.emergency,c.position_state,
             ])]);
             const layer=byId('radar-contacts');
             if(visualKey!==radarRenderKey){
@@ -3889,10 +4032,11 @@ PAGE = b"""<!doctype html>
                 layer.replaceChildren();
             for(const c of items){
         const canTrack=!trackingActive&&Boolean(c.aircraft_hex&&c.callsign);
-        const group=document.createElementNS(svgNS,'g'); group.setAttribute('class','contact'+(canTrack?' trackable':'')+(c.selected?' selected':'')+(c.emergency?' emergency':'')); group.setAttribute('transform','translate('+c.x+' '+c.y+') rotate('+(Number(c.track)||0)+')');
+        const lastKnown=c.position_state==='last_known';
+        const group=document.createElementNS(svgNS,'g'); group.setAttribute('class','contact'+(canTrack?' trackable':'')+(c.selected?' selected':'')+(c.emergency?' emergency':'')+(lastKnown?' last-known':'')); group.setAttribute('transform','translate('+c.x+' '+c.y+') rotate('+(Number(c.track)||0)+')');
         if(canTrack){
           const activate=()=>selectRadarContact(c);
-          group.setAttribute('role','button'); group.setAttribute('tabindex','0'); group.setAttribute('aria-label','Select '+c.callsign+' for tracking');
+          group.setAttribute('role','button'); group.setAttribute('tabindex','0'); group.setAttribute('aria-label','Select '+c.callsign+(lastKnown?' last known position':'')+' for tracking');
           group.addEventListener('click',activate);
           group.addEventListener('keydown',event=>{ if(event.key==='Enter'||event.key===' '){ event.preventDefault(); activate(); } });
         }
@@ -3904,7 +4048,8 @@ PAGE = b"""<!doctype html>
             }
       if(trackingActive){ currentRadarRange=Number(radius)||25; }
       else if(!radarManualOverride){ currentRadarRange=Number(radius)||25; }
-      byId('radar-count').textContent=(contacts||[]).length+' CONTACTS';
+      const lastKnownCount=items.filter(contact=>contact.position_state==='last_known').length;
+      byId('radar-count').textContent=items.length+' CONTACT'+(items.length===1?'':'S')+(lastKnownCount?' \\u00b7 '+lastKnownCount+' LAST KNOWN':'');
       byId('radar-range').textContent=displayRadarRangeValue(trackingActive?radius:currentRadarRange,trackingActive);
       updateRadarRangeControls();
     }
@@ -3920,7 +4065,7 @@ PAGE = b"""<!doctype html>
       settingsButton.setAttribute('aria-label',settingsOpen?'Close settings':'Open settings');
     }
     function afterPanelChange(){
-      requestAnimationFrame(()=>{ fitSingleLine(byId('registration'),18); const logo=byId('operator-logo'); if(logo&&logo.complete&&logo.naturalWidth)fitLogoArtwork(logo); if(routeMap)routeMap.invalidateSize(false); });
+      requestAnimationFrame(()=>{ fitSingleLine(byId('registration'),18); scheduleOperatorNameFit(); const logo=byId('operator-logo'); if(logo&&logo.complete&&logo.naturalWidth)fitLogoArtwork(logo); if(routeMap)routeMap.invalidateSize(false); });
     }
     function setRadar(open){
       const wall=byId('wall');
@@ -4072,7 +4217,8 @@ PAGE = b"""<!doctype html>
         const requestRevision=++statusRequestRevision;
         const rangeRevision=radarRangeRevision;
       try{
-        const statusUrl=snapshotId?'/snapshot-state?id='+encodeURIComponent(snapshotId):'/status?active='+(document.visibilityState==='visible'?'1':'0')+'&t='+Date.now(); const response=await fetch(statusUrl,{cache:'no-store'}); if(!response.ok)throw new Error('status'); const d=await response.json();
+        const activeView=pageLocationConfirmed&&document.visibilityState==='visible';
+        const statusUrl=snapshotId?'/snapshot-state?id='+encodeURIComponent(snapshotId):'/status?active='+(activeView?'1':'0')+(pageLocationConfirmed?'':'&bootstrap=1')+'&t='+Date.now(); const response=await fetch(statusUrl,{cache:'no-store'}); if(!response.ok)throw new Error('status'); const d=await response.json();
             if(requestRevision!==statusRequestRevision)return;
         lastDisplayStatus=d;
         statusFailureCount=0;
@@ -4098,13 +4244,14 @@ PAGE = b"""<!doctype html>
         if(d.logo_available){
           brandBox.style.display='flex';
           logo.onload=()=>{ brandBox.style.display='flex'; logo.style.display='block'; brandName.style.display='none'; requestAnimationFrame(()=>fitLogoArtwork(logo)); };
-          logo.onerror=()=>{ logo.style.display='none'; brandName.style.display=airlineLabel?'block':'none'; brandBox.style.display=airlineLabel?'flex':'none'; };
+          logo.onerror=()=>{ logo.style.display='none'; brandName.style.display=airlineLabel?'block':'none'; brandBox.style.display=airlineLabel?'flex':'none'; scheduleOperatorNameFit(); };
           logo.alt=(airlineLabel||'Airline')+' logo';
           logo.src='/operator-logo?v='+encodeURIComponent(d.logo_revision)+snapshotAssetSuffix;
         }else{
           logo.removeAttribute('src'); logo.style.display='none';
           brandName.style.display=airlineLabel?'block':'none';
           brandBox.style.display=airlineLabel?'flex':'none';
+          scheduleOperatorNameFit();
         }
         renderAltitude(d.altitude); byId('vertical').textContent=vertical(d.vertical_rate);
         renderUnitSensitiveValues(d);
@@ -4182,6 +4329,8 @@ PAGE = b"""<!doctype html>
     byId('settings-location').addEventListener('click',openLocationSelector);
     byId('location-activate').addEventListener('click',()=>useDeviceLocation(true,true));
     byId('location-manual').addEventListener('click',()=>{ locationRequestRevision++; locationLookupInFlight=false; setLocationButtonBusy(false); setLocationMode('manual'); pendingLocationMode='manual'; hideLocationActivation(); setSettings(true); openLocationSelector(); });
+    byId('location-latitude').addEventListener('input',()=>{ locationInputRevision++; });
+    byId('location-longitude').addEventListener('input',()=>{ locationInputRevision++; });
     byId('location-latitude').addEventListener('change',applyManualLocation);
     byId('location-longitude').addEventListener('change',applyManualLocation);
     byId('location-use-device').addEventListener('click',()=>useDeviceLocation(false,true));
@@ -4204,32 +4353,27 @@ PAGE = b"""<!doctype html>
       cursorIdleTimer=setTimeout(()=>document.documentElement.classList.add('cursor-hidden'),10000);
     }
     if(!snapshotId){ document.addEventListener('mousemove',resetCursorIdle,{passive:true}); resetCursorIdle(); }
-    window.addEventListener('resize',()=>requestAnimationFrame(()=>{ fitSingleLine(byId('registration'),18); const logo=byId('operator-logo'); if(logo&&logo.complete&&logo.naturalWidth)fitLogoArtwork(logo); }));
+    window.addEventListener('resize',()=>requestAnimationFrame(()=>{ fitSingleLine(byId('registration'),18); scheduleOperatorNameFit(); const logo=byId('operator-logo'); if(logo&&logo.complete&&logo.naturalWidth)fitLogoArtwork(logo); }));
+    if(typeof ResizeObserver!=='undefined')new ResizeObserver(scheduleOperatorNameFit).observe(byId('route-brand'));
+    function syncLocationViewportHeight(){
+      const height=window.visualViewport?window.visualViewport.height:window.innerHeight;
+      document.documentElement.style.setProperty('--location-viewport-height',Math.max(240,Math.round(height))+'px');
+      if(locationMap&&byId('location-backdrop').classList.contains('open'))requestAnimationFrame(()=>locationMap.invalidateSize(false));
+    }
+    syncLocationViewportHeight();
+    if(window.visualViewport){ window.visualViewport.addEventListener('resize',syncLocationViewportHeight,{passive:true}); window.visualViewport.addEventListener('scroll',syncLocationViewportHeight,{passive:true}); }
+    function resumeActiveView(){
+      if(snapshotId||!pageLocationConfirmed||document.visibilityState!=='visible')return;
+      const now=Date.now(),delay=Math.max(0,750-(now-lastLifecycleUpdateAt));
+      clearTimeout(lifecycleUpdateTimer);
+      lifecycleUpdateTimer=setTimeout(()=>{ lastLifecycleUpdateAt=Date.now(); update(); },delay);
+    }
+    document.addEventListener('visibilitychange',resumeActiveView,{passive:true});
+    window.addEventListener('focus',resumeActiveView,{passive:true});
+    window.addEventListener('pageshow',resumeActiveView,{passive:true});
         if(snapshotId){ update(); }else{
             setInterval(update,2000); setInterval(tickCommentaryCountdown,250); setInterval(rotateIdleMessage,4000); setInterval(advanceRotation,250);
-            update(); loadSnapshotGallery(false);
-            if(dynamicLocationIsDefault()){
-                const previouslyDenied=locationWasDenied();
-                if(navigator.permissions&&navigator.permissions.query){
-                    navigator.permissions.query({name:'geolocation'}).then(permission=>{
-                        if(permission.state==='granted'){
-                            rememberLocationDenied(false);
-                            useDeviceLocation(true);
-                        }
-                        else if(permission.state==='prompt'){
-                            showLocationActivation('Use your location to find nearby aircraft.');
-                              // Attempt the prompt immediately; browsers requiring a gesture leave the visible activation control available.
-                            if(!previouslyDenied&&!locationPermissionUnavailable())useDeviceLocation(true);
-                        }else{ rememberLocationDenied(true); showLocationActivation('Location permission was previously declined. Choose a location manually.'); }
-                    }).catch(()=>{
-                        showLocationActivation('Use your location to find nearby aircraft.');
-                        if(!previouslyDenied&&!locationPermissionUnavailable())useDeviceLocation(true);
-                    });
-                }else if(!locationPermissionUnavailable()){
-                    showLocationActivation('Use your location to find nearby aircraft.');
-                    if(!previouslyDenied)useDeviceLocation(true);
-                }else showLocationActivation('Device location is unavailable here. Choose a location manually.');
-            }
+            update().then(()=>openLocationSelector()); loadSnapshotGallery(false);
         } document.addEventListener('dblclick',toggleFullscreen);
   </script>
 </body>
@@ -5051,7 +5195,9 @@ class FrameState:
             "home_latitude": settings.latitude,
             "home_longitude": settings.longitude,
             "radar_radius_nm": settings.radius_nm,
-            "radar_contacts": radar_contacts(aircraft, settings, plane),
+            "radar_contacts": radar_contacts(
+                aircraft, settings, plane, retained_position_seconds(settings.refresh_seconds),
+            ),
         }
         history_now = time.monotonic()
         current_aircraft_id = str(payload.get("aircraft_id") or "")
@@ -5073,7 +5219,10 @@ class FrameState:
                     display_settings = copy.copy(settings)
                     display_settings.radius_nm = current_radius
                     payload["radar_radius_nm"] = current_radius
-                    payload["radar_contacts"] = radar_contacts(aircraft, display_settings, plane)
+                    payload["radar_contacts"] = radar_contacts(
+                        aircraft, display_settings, plane,
+                        retained_position_seconds(settings.refresh_seconds),
+                    )
             payload["location_revision"] = self.location_revision
             payload["acquisition_status"] = self.payload.get("acquisition_status", "ready")
             payload["acquisition_diagnostics"] = {
@@ -5444,6 +5593,15 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
             cached_acquisition = None
         cached_aircraft = list(state.last_live_aircraft)
         cached_aircraft_received_at = state.last_live_aircraft_received_at
+        previous_selected_aircraft_id = str(state.payload.get("aircraft_id") or "")
+        previous_payload = dict(state.payload)
+        previous_logo = (bytes(state.logo), state.logo_type, str(state.payload.get("logo_source") or "")) if state.logo else None
+        previous_photo = (
+            bytes(state.aircraft_photo), state.aircraft_photo_type,
+            str(state.payload.get("aircraft_photo_revision") or ""),
+        ) if state.aircraft_photo else None
+        previous_origin_flag = bytes(state.origin_flag) if state.origin_flag else None
+        previous_destination_flag = bytes(state.destination_flag) if state.destination_flag else None
         if not demo and cached_acquisition is None and (not tracking_only or perform_tracking_lookup or perform_automatic_tracking):
             state.last_acquisition_attempted_at = time.time()
     tracking = tracker.snapshot() if tracker else {"active": False, "query": "", "candidates": (), "resolved_callsign": "", "last_plane": None, "revision": 0}
@@ -5473,7 +5631,13 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
     elif cached_acquisition is not None and not demo:
         local_position_received_at = float(cached_acquisition["fetched_at"])
         cache_age = max(0.0, time.monotonic() - local_position_received_at)
-        cached_aircraft = list(cached_acquisition["aircraft"])
+        shared_aircraft = list(cached_acquisition["aircraft"])
+        aircraft = merge_recent_aircraft_observations(
+            cached_aircraft, cached_aircraft_received_at,
+            shared_aircraft, local_position_received_at,
+            retained_position_seconds(sample_settings.refresh_seconds),
+        )
+        cached_aircraft = list(aircraft)
         cached_aircraft_received_at = local_position_received_at
         aircraft = aircraft_within_radius(
             age_aircraft_positions(cached_aircraft, cache_age),
@@ -5484,7 +5648,7 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
         mode = "cached"
         with state.lock:
             state.last_live_aircraft = list(cached_aircraft)
-            state.last_live_aircraft_received_at = local_position_received_at
+            state.last_live_aircraft_received_at = cached_aircraft_received_at
             state.last_live_aircraft_query_radius_nm = float(cached_acquisition["radius_nm"])
             state.has_live_success = True
             state.last_acquisition_succeeded_at = float(cached_acquisition["succeeded_at"])
@@ -5542,6 +5706,12 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
             selection_position_age_limit = retained_position_seconds(sample_settings.refresh_seconds)
             mode = "reconnecting"
         else:
+            aircraft = merge_recent_aircraft_observations(
+                cached_aircraft, cached_aircraft_received_at,
+                list(aircraft), local_position_received_at,
+                retained_position_seconds(sample_settings.refresh_seconds),
+            )
+            local_position_received_at = time.monotonic()
             with state.lock:
                 if state.location_revision != location_revision:
                     return
@@ -5664,8 +5834,22 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
             mode = {"rate_limited": "rate_limited", "provider_unavailable": "provider_unavailable", "stale": "position_unavailable"}.get(tracking_outcome, "scanning")
     else:
         plane, distance = select_nearest_within_radius(
-            aircraft, sample_settings, selection_position_age_limit,
+            aircraft, sample_settings,
+            min(selection_position_age_limit, POSITION_FRESHNESS_SECONDS),
         )
+        if plane is None and previous_selected_aircraft_id:
+            retained_previous = [
+                candidate for candidate in aircraft
+                if aircraft_identity(candidate) == previous_selected_aircraft_id
+            ]
+            plane, distance = select_nearest_retained_within_radius(
+                retained_previous, sample_settings,
+                retained_position_seconds(sample_settings.refresh_seconds),
+            )
+        if plane is None and selection_position_age_limit > POSITION_FRESHNESS_SECONDS:
+            plane, distance = select_nearest_retained_within_radius(
+                aircraft, sample_settings, selection_position_age_limit,
+            )
         tracking = {**tracking, "found": False}
         reported_position_observed_at = (
             aircraft_position_observed_at(plane, local_position_received_at)
@@ -5733,6 +5917,14 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
                     )
                     local_position_received_at = acquisition_position_received_at
                 mode = "live" if plane is not None else "scanning"
+                with state.lock:
+                    if state.location_revision == location_revision:
+                        state.last_live_aircraft = merge_recent_aircraft_observations(
+                            state.last_live_aircraft, state.last_live_aircraft_received_at,
+                            [tracked_plane], float(received_at),
+                            retained_position_seconds(sample_settings.refresh_seconds),
+                        )
+                        state.last_live_aircraft_received_at = time.monotonic()
 
     if mode in {"live", "cached"} and plane is None and not tracking.get("active"):
         mode = "scanning"
@@ -5755,6 +5947,28 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
         routes.cached_route(plane)
         if routes is not None and plane is not None and hasattr(routes, "cached_route") else {}
     )
+    selected_aircraft_id = aircraft_identity(plane)
+    preserve_selected_presentation = bool(
+        selected_aircraft_id and selected_aircraft_id == previous_selected_aircraft_id
+    )
+    preserved_identity = {
+        "registration": previous_payload.get("registration", ""),
+        "operator_code": previous_payload.get("operator_code", ""),
+        "aircraft_type": previous_payload.get("aircraft_type", ""),
+        "aircraft_name": previous_payload.get("aircraft_name", ""),
+        "airline_name": previous_payload.get("airline_name", ""),
+        "photo_url": previous_payload.get("aircraft_photo_url", ""),
+        "photo_thumbnail_url": previous_payload.get("aircraft_photo_thumbnail_url", ""),
+    } if preserve_selected_presentation else {}
+    if preserve_selected_presentation and not cached_route and previous_payload.get("route"):
+        cached_route = {
+            key: previous_payload.get(key)
+            for key in (
+                "route", "route_source", "commercial_flight", "origin", "destination",
+                "origin_name", "destination_name", "origin_country", "destination_country",
+                "origin_latitude", "origin_longitude", "destination_latitude", "destination_longitude",
+            )
+        }
     image = render(plane, distance, mode)
     with state.location_lock:
         with state.lock:
@@ -5768,8 +5982,12 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
             save_frame(image, sample_settings)
         state.update(
             image, mode, plane, distance, aircraft, sample_settings,
-            None, {}, cached_route, None, None,
+            previous_logo if preserve_selected_presentation else None,
+            preserved_identity, cached_route,
+            previous_origin_flag if preserve_selected_presentation else None,
+            previous_destination_flag if preserve_selected_presentation else None,
             bool(routes and routes.api_key), tracking, health.snapshot() if health else None, position_observed_at, {},
+            aircraft_photo=previous_photo if preserve_selected_presentation else None,
             expected_location_revision=location_revision,
             reported_position_observed_at=reported_position_observed_at,
             new_position_observation=new_position_observation,
@@ -6200,9 +6418,26 @@ class VisitorSessionStore:
                 if lease_revision > session.active_lease_revision:
                     session.active_lease_revision = lease_revision
                     session.initial_acquisition_granted = False
-                    session.refresh_reasons.add("activation")
-                    if session.refresh_requested_at is None:
-                        session.refresh_requested_at = now
+                    with session.state.lock:
+                        observed_at = session.state.position_observed_at_monotonic
+                    position_fresh = (
+                        observed_at is not None
+                        and 0.0 <= now - observed_at <= POSITION_FRESHNESS_SECONDS
+                    )
+                    # Reuse this visitor's geographically scoped observation
+                    # while it is genuinely fresh instead of spending another
+                    # provider slot whenever a tab regains focus.
+                    if not position_fresh:
+                        session.refresh_reasons.add("activation")
+                        if session.refresh_requested_at is None:
+                            session.refresh_requested_at = now
+                    if session.tracker.snapshot()["active"]:
+                        session.refresh_reasons.add("tracking")
+                        if session.refresh_requested_at is None:
+                            session.refresh_requested_at = now
+                        key = self.tracking_share_key(session)
+                        if key is not None:
+                            self.tracking_next_due[key] = now
                     self.wake.set()
 
     def request_refresh(self, session: VisitorSession, reason: str = "manual") -> None:
@@ -6528,7 +6763,7 @@ class VisitorSessionStore:
                 session.refresh_reasons.clear()
                 self.initial_priority_streak = 0
                 break
-            if session is None and not explicit_geo_due and not any("activation" in item.refresh_reasons for item in due):
+            if session is None and not explicit_geo_due:
                 for candidate in tracking_due:
                     cached_result = self._cached_tracking_unlocked(candidate, current)
                     if cached_result is None:
@@ -7239,10 +7474,12 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                 return
             context = None
             if sessions is not None and path in visitor_get_paths:
-                active_status = parse_qs(request_url.query).get("active", ["0"])[0] == "1"
+                query = parse_qs(request_url.query)
+                active_status = query.get("active", ["0"])[0] == "1"
+                bootstrap_status = path == "/status" and query.get("bootstrap", ["0"])[0] == "1"
                 context = self.visitor_context(
                     touch_activity=path != "/status" or active_status,
-                    create=path == "/status" and active_status,
+                    create=path == "/status" and (active_status or bootstrap_status),
                 )
                 if context is None:
                     return
@@ -7307,7 +7544,7 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                 )
                 snapshot["last_acquisition_attempted_at"] = last_attempted_at
                 snapshot["last_acquisition_succeeded_at"] = last_succeeded_at
-                if snapshot.get("mode") == "live":
+                if snapshot.get("mode") in {"live", "cached"}:
                     if position_state == "last_known":
                         snapshot["mode"] = "last_known"
                     elif position_state == "unavailable" and snapshot.get("aircraft_id"):
@@ -7315,7 +7552,7 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                 if (
                     not snapshot.get("tracking_active")
                     and snapshot.get("aircraft_id")
-                    and position_state != "reported"
+                    and position_state == "unavailable"
                 ):
                     snapshot.update({
                         "mode": "scanning",
@@ -7358,8 +7595,14 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                         contact_age = float(contact.get("position_age_seconds")) + elapsed_since_update
                     except (AttributeError, TypeError, ValueError):
                         continue
-                    if math.isfinite(contact_age) and 0 <= contact_age <= POSITION_FRESHNESS_SECONDS:
-                        contacts.append({**contact, "position_age_seconds": contact_age})
+                    if math.isfinite(contact_age) and 0 <= contact_age <= position_limit:
+                        contacts.append({
+                            **contact,
+                            "position_age_seconds": contact_age,
+                            "position_state": (
+                                "reported" if contact_age <= POSITION_FRESHNESS_SECONDS else "last_known"
+                            ),
+                        })
                 snapshot["radar_contacts"] = contacts
                 if position_state == "last_known":
                     snapshot["tracking_found"] = False if snapshot.get("tracking_active") else snapshot.get("tracking_found", False)
@@ -7697,7 +7940,15 @@ def handler_factory(state: FrameState, settings, refresh_event: threading.Event,
                             "tracking_resolved_callsign": "",
                             "tracking_found": False,
                             "position_state": "unavailable",
-                            "radar_contacts": radar_contacts(state.last_live_aircraft, settings, None),
+                            "radar_contacts": radar_contacts(
+                                age_aircraft_positions(
+                                    state.last_live_aircraft,
+                                    time.monotonic() - state.last_live_aircraft_received_at
+                                    if state.last_live_aircraft_received_at is not None else 0.0,
+                                ),
+                                settings, None,
+                                retained_position_seconds(settings.refresh_seconds),
+                            ),
                             "acquisition_status": "queued",
                         })
                 self.request_refresh(session, "tracking")

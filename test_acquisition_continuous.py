@@ -151,7 +151,10 @@ class ContinuousAcquisitionTests(unittest.TestCase):
                         failure_modes.add(payload['mode'])
                         if payload.get('aircraft_id') and not chosen.tracker.snapshot()['active']:
                             self.assertLess(payload['distance_nm'], chosen.settings.radius_nm)
-                            self.assertLessEqual(clock.return_value - chosen.state.position_observed_at_monotonic, 20)
+                            self.assertLessEqual(
+                                clock.return_value - chosen.state.position_observed_at_monotonic,
+                                monitor.retained_position_seconds(chosen.settings.refresh_seconds),
+                            )
                             if elapsed >= 500:
                                 recovered.add(chosen.session_id)
                     if elapsed == 75:

@@ -618,7 +618,12 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn(b"requestAnimationFrame(()=>fitSingleLine(byId('registration'),18))", PAGE)
 
     def test_radar_toggle_refits_identity_and_map(self):
-        self.assertIn(b"fitSingleLine(byId('registration'),18); const logo=byId('operator-logo'); if(logo&&logo.complete&&logo.naturalWidth)fitLogoArtwork(logo); if(routeMap)routeMap.invalidateSize(false)", PAGE)
+        panel_change = PAGE.split(b"function afterPanelChange(){", 1)[1].split(
+            b"function setRadar(open)", 1
+        )[0]
+        self.assertIn(b"fitSingleLine(byId('registration'),18)", panel_change)
+        self.assertIn(b"scheduleOperatorNameFit()", panel_change)
+        self.assertIn(b"routeMap.invalidateSize(false)", panel_change)
 
     def test_logo_visible_artwork_is_normalised_for_padded_assets(self):
         self.assertIn(b"fitLogoArtwork", PAGE)
@@ -988,26 +993,26 @@ class OverHeadTests(unittest.TestCase):
 
     def test_location_selector_fetches_saved_home_when_needed(self):
         self.assertIn(b"async function openLocationSelector()", PAGE)
-        self.assertIn(b"const response=await fetch('/status?active='+(document.visibilityState==='visible'?'1':'0')+'&t='+Date.now(),{cache:'no-store'})", PAGE)
+        self.assertIn(b"const response=await fetch('/status?active=0&bootstrap=1&t='+Date.now(),{cache:'no-store'})", PAGE)
         self.assertIn(b"lat=Number(status.home_latitude); lon=Number(status.home_longitude)", PAGE)
         self.assertNotIn(b"51.5074", PAGE)
         self.assertNotIn(b"-0.1278", PAGE)
 
     def test_location_save_refreshes_ui_immediately(self):
-        self.assertIn(b"closeLocationSelector();\n        update();", PAGE)
+        self.assertIn(b"pageLocationConfirmed=true;\n        closeLocationSelector();\n        await update();", PAGE)
 
     def test_location_selector_fits_viewport_without_scrolling(self):
         self.assertIn(b".location-backdrop { display:none; position:fixed; inset:0;", PAGE)
         self.assertIn(b"overflow:hidden; background:rgba(0,2,7,.84)", PAGE)
-        self.assertIn(b".location-dialog { width:min(1060px,96vw); height:min(94vh,820px); min-height:0; overflow:hidden;", PAGE)
-        self.assertIn(b"display:grid; grid-template-rows:auto minmax(220px,1fr) auto auto auto", PAGE)
-        self.assertIn(b"#location-map { width:100%; height:100%; min-height:0;", PAGE)
+        self.assertIn(b".location-dialog { width:min(1040px,calc(100vw - 20px)); height:min(720px,calc(var(--location-viewport-height,100dvh) - 20px)); min-height:0; overflow:hidden;", PAGE)
+        self.assertIn(b"display:grid; grid-template-rows:auto minmax(0,1fr)", PAGE)
+        self.assertIn(b"#location-map { width:100%; height:100%; min-height:220px;", PAGE)
         self.assertNotIn(b".location-dialog { width:min(920px,94vw); max-height:92vh; overflow:auto", PAGE)
 
     def test_location_selector_compacts_on_short_screens(self):
         self.assertIn(b"@media (max-height:700px)", PAGE)
-        self.assertIn(b"height:calc(100vh - 16px)", PAGE)
-        self.assertIn(b"grid-template-rows:auto minmax(170px,1fr) auto auto auto", PAGE)
+        self.assertIn(b"height:calc(var(--location-viewport-height,100dvh) - 16px)", PAGE)
+        self.assertIn(b"@media (max-width:768px) and (orientation:landscape)", PAGE)
 
     def test_no_aircraft_uses_scanning_message_not_giant_hyphen(self):
         self.assertIn(b'id="idle-message">Looking out&hellip;</div>', PAGE)
@@ -1023,7 +1028,7 @@ class OverHeadTests(unittest.TestCase):
         self.assertEqual(state.payload["mode"], "scanning")
         self.assertEqual(state.payload["aircraft_id"], "")
 
-    def test_automatic_selection_rejects_stale_cached_position(self):
+    def test_automatic_selection_labels_stale_cached_position_as_last_known(self):
         class EmptyStore:
             def get(self, *_args):
                 return {}
@@ -1039,8 +1044,9 @@ class OverHeadTests(unittest.TestCase):
         with patch("monitor.fetch_aircraft", side_effect=OSError("fixture outage")):
             update_state(state, settings, False, EmptyStore(), EmptyStore(), persist_frame=False)
         self.assertEqual(state.payload["mode"], "reconnecting")
-        self.assertEqual(state.payload["aircraft_id"], "")
-        self.assertIsNone(state.payload["distance_nm"])
+        self.assertEqual(state.payload["aircraft_id"], "408435")
+        self.assertIsNotNone(state.payload["distance_nm"])
+        self.assertEqual(state.payload["radar_contacts"][0]["position_state"], "last_known")
 
     def test_footer_credits_flightaware_conditionally_and_ourairports(self):
         self.assertIn(b'id="flightaware-credit" hidden', PAGE)
@@ -1107,7 +1113,7 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn(b"animation:location-button-pulse 1.6s ease-in-out infinite", PAGE)
         self.assertNotIn(b"location-button-spin", PAGE)
         self.assertIn(b"function setLocationButtonBusy(busy)", PAGE)
-        self.assertIn(b"button.textContent=busy?'LOCATING...':'USE MY LOCATION'", PAGE)
+        self.assertIn(b"button.textContent=busy?'LOCATING...':'USE MY CURRENT LOCATION'", PAGE)
         self.assertIn(b"button.setAttribute('aria-busy',String(busy))", PAGE)
         self.assertIn(b"setLocationButtonBusy(true);", PAGE)
 
@@ -1120,7 +1126,7 @@ class OverHeadTests(unittest.TestCase):
         )[0]
         self.assertIn(b"setLocationButtonBusy(false);", close_handler)
         self.assertIn(b"byId('location-backdrop').classList.remove('open');", close_handler)
-        self.assertIn(b"setRadar(true);", close_handler)
+        self.assertNotIn(b"setRadar(true);", close_handler)
 
     def test_wrong_crl_to_opo_route_is_rejected_for_aircraft_over_wales(self):
         route = {
@@ -1214,7 +1220,7 @@ class OverHeadTests(unittest.TestCase):
     def test_locating_button_uses_gentle_pulse_only(self):
         self.assertIn(b"#location-use-device.locating { color:var(--white)", PAGE)
         self.assertIn(b"animation:location-button-pulse 1.6s ease-in-out infinite", PAGE)
-        self.assertIn(b"button.textContent=busy?'LOCATING...':'USE MY LOCATION'", PAGE)
+        self.assertIn(b"button.textContent=busy?'LOCATING...':'USE MY CURRENT LOCATION'", PAGE)
         self.assertNotIn(b"#location-use-device.locating::after", PAGE)
         self.assertNotIn(b"location-button-spin", PAGE)
 
@@ -1228,21 +1234,20 @@ class OverHeadTests(unittest.TestCase):
         self.assertIn(b"const origin=String(d.origin||'N/A').trim().toUpperCase()||'N/A'", PAGE)
         self.assertIn(b"const destination=String(d.destination||'N/A').trim().toUpperCase()||'N/A'", PAGE)
 
-    def test_every_location_selector_exit_returns_to_radar(self):
+    def test_every_location_selector_exit_preserves_the_current_panel(self):
         close_handler = PAGE.split(b"function closeLocationSelector(){", 1)[1].split(
             b"function setLocationButtonBusy", 1
         )[0]
         self.assertIn(b"setLocationButtonBusy(false);", close_handler)
         self.assertIn(b"byId('location-backdrop').classList.remove('open');", close_handler)
-        self.assertIn(b"setRadar(true);", close_handler)
+        self.assertNotIn(b"setRadar(true);", close_handler)
         self.assertIn(b"byId('location-close').addEventListener('click',closeLocationSelector)", PAGE)
         self.assertIn(b"byId('location-cancel').addEventListener('click',closeLocationSelector)", PAGE)
         self.assertIn(b"if(event.target===byId('location-backdrop'))closeLocationSelector()", PAGE)
         self.assertIn(b"if(byId('location-backdrop').classList.contains('open'))closeLocationSelector()", PAGE)
 
-    def test_saving_location_returns_to_radar_via_close(self):
-        self.assertIn(b"closeLocationSelector();\n        update();", PAGE)
-        self.assertIn(b"setRadar(true);", PAGE)
+    def test_saving_location_confirms_page_and_refreshes_via_close(self):
+        self.assertIn(b"pageLocationConfirmed=true;\n        closeLocationSelector();\n        await update();", PAGE)
 
     def test_radar_closed_moves_entire_header_control_cluster_up(self):
         self.assertIn(
@@ -1781,7 +1786,7 @@ class OverHeadTests(unittest.TestCase):
             self.assertTrue(state.payload["tracking_found"])
             self.assertEqual(point_fetch.call_args.kwargs["radius_nm"], automatic_tracking_radius(state.payload["distance_nm"]))
 
-    def test_last_known_tracked_position_does_not_reappear_as_fresh_radar_contact(self):
+    def test_last_known_tracked_position_is_explicitly_labelled_on_radar(self):
         class EmptyStore:
             def get(self, *args):
                 return None
@@ -1807,7 +1812,9 @@ class OverHeadTests(unittest.TestCase):
                 update_state(state, settings, False, EmptyStore(), EmptyStore(), tracker=tracker)
         self.assertEqual(state.payload["aircraft_latitude"], target["lat"])
         self.assertFalse(state.payload["tracking_found"])
-        self.assertEqual(state.payload["radar_contacts"], [])
+        self.assertEqual(len(state.payload["radar_contacts"]), 1)
+        self.assertEqual(state.payload["radar_contacts"][0]["position_state"], "last_known")
+        self.assertGreaterEqual(state.payload["radar_contacts"][0]["position_age_seconds"], 30)
 
     def test_expired_tracked_position_is_hidden_and_fresh_recovery_restores_it(self):
         class EmptyStore:
@@ -1872,11 +1879,12 @@ class OverHeadTests(unittest.TestCase):
             state.last_acquisition_succeeded_at = 100.0
             with patch("monitor.fetch_aircraft", side_effect=OSError("offline")):
                 update_state(state, settings, False, EmptyStore(), EmptyStore())
-            self.assertEqual(state.payload["callsign"], "")
-            self.assertEqual(state.payload["aircraft_id"], "")
+            self.assertEqual(state.payload["callsign"], "TST123")
+            self.assertEqual(state.payload["aircraft_id"], "ABC123")
             self.assertEqual(state.payload["mode"], "reconnecting")
             self.assertEqual(state.last_acquisition_succeeded_at, 100.0)
-            self.assertIsNone(state.payload["aircraft_latitude"])
+            self.assertEqual(state.payload["aircraft_latitude"], plane["lat"])
+            self.assertEqual(state.payload["radar_contacts"][0]["position_state"], "last_known")
 
             state.last_live_aircraft_received_at = time.monotonic() - monitor.retained_position_seconds(300) - 1
             with patch("monitor.fetch_aircraft", side_effect=OSError("offline")):
@@ -1884,6 +1892,83 @@ class OverHeadTests(unittest.TestCase):
             self.assertEqual(state.payload["aircraft_id"], "")
             self.assertIsNone(state.payload["aircraft_latitude"])
             self.assertIsNone(state.payload["distance_nm"])
+
+    def test_helicopter_contact_survives_omissions_failures_and_out_of_order_results(self):
+        class EmptyStore:
+            def get(self, value, *args):
+                return None if isinstance(value, str) else {}
+
+        helicopter = {
+            "hex": "abc123", "flight": "WDK38", "r": "G-SENS", "t": "EC35",
+            "lat": 51.5133, "lon": -0.1, "seen_pos": 15.0,
+            "alt_baro": 900, "gs": 120, "track": 45,
+        }
+        targeted = {**helicopter, "lat": 51.53, "seen_pos": 2.0, "track": 55}
+        restored = {**helicopter, "lat": 51.54, "seen_pos": 0.0, "track": 60}
+        outside = {**helicopter, "lat": 52.2, "seen_pos": 0.0, "track": 70}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                latitude=51.5, longitude=-0.1, radius_nm=35, refresh_seconds=60,
+                output_rgb=str(Path(tmp) / "frame.rgb"),
+                output_png=str(Path(tmp) / "frame.png"),
+            )
+            state = FrameState()
+
+            def refresh(now, result=None, failure=None, **kwargs):
+                with patch("monitor.time.monotonic", return_value=float(now)), patch(
+                    "monitor.fetch_aircraft",
+                    side_effect=failure,
+                    return_value=result,
+                ):
+                    update_state(state, settings, False, EmptyStore(), EmptyStore(), **kwargs)
+
+            refresh(1000, [helicopter])
+            self.assertEqual(state.payload["callsign"], "WDK38")
+            self.assertAlmostEqual(state.payload["distance_nm"], 0.8, delta=0.1)
+            self.assertEqual(state.payload["radar_contacts"][0]["position_state"], "reported")
+
+            refresh(1005, [])
+            self.assertEqual(state.payload["callsign"], "WDK38")
+            self.assertEqual(len(state.payload["radar_contacts"]), 1)
+            self.assertEqual(state.payload["radar_contacts"][0]["position_state"], "reported")
+
+            refresh(1025, failure=OSError("provider unavailable"))
+            self.assertEqual(state.payload["callsign"], "WDK38")
+            self.assertEqual(state.payload["radar_contacts"][0]["position_state"], "last_known")
+            self.assertAlmostEqual(state.payload["radar_contacts"][0]["position_age_seconds"], 40, delta=0.1)
+
+            refresh(1040, [])
+            self.assertEqual(state.payload["callsign"], "WDK38")
+            self.assertEqual(state.payload["radar_contacts"][0]["position_state"], "last_known")
+
+            with patch("monitor.time.monotonic", return_value=1045.0), patch(
+                "monitor.fetch_tracked_aircraft", return_value=(targeted, "WDK38")
+            ):
+                update_state(
+                    state, settings, False, EmptyStore(), EmptyStore(), tracking_only=True,
+                    automatic_tracking=("ABC123", ("WDK38",)), perform_automatic_tracking=True,
+                )
+            self.assertEqual(state.payload["aircraft_latitude"], targeted["lat"])
+            self.assertEqual(state.payload["radar_contacts"][0]["position_state"], "reported")
+
+            older_geographic = {**helicopter, "lat": 51.515, "seen_pos": 30.0}
+            refresh(1050, [older_geographic])
+            self.assertEqual(state.payload["aircraft_latitude"], targeted["lat"])
+
+            refresh(1060, [restored])
+            self.assertEqual(state.payload["aircraft_latitude"], restored["lat"])
+            self.assertEqual(state.payload["radar_contacts"][0]["position_state"], "reported")
+
+            refresh(1181, failure=OSError("delayed acquisition"))
+            self.assertEqual(state.payload["aircraft_id"], "")
+            self.assertEqual(state.payload["radar_contacts"], [])
+
+            refresh(1200, [restored])
+            self.assertEqual(state.payload["aircraft_id"], "ABC123")
+            refresh(1210, [outside])
+            self.assertEqual(state.payload["aircraft_id"], "")
+            self.assertEqual(state.payload["radar_contacts"], [])
 
     def test_tracked_aircraft_is_merged_into_radar_even_outside_point_query(self):
         local = [{"hex": "near", "flight": "NEAR1"}]
@@ -2694,7 +2779,8 @@ class VisitorSessionTests(unittest.TestCase):
         self.assertEqual(first["last_acquisition_attempted_at"], 100.0)
         self.assertEqual(first["last_acquisition_succeeded_at"], 90.0)
         self.assertIn("browser_status_checked_at", first)
-        self.assertFalse(first["radar_contacts"])
+        self.assertEqual(len(first["radar_contacts"]), 1)
+        self.assertEqual(first["radar_contacts"][0]["position_state"], "last_known")
         original_observation = session.state.position_observed_at_monotonic
         session.state.position_observed_at_monotonic = original_observation - 4
         second = self.get_status(visitor)
@@ -3024,6 +3110,112 @@ class VisitorSessionTests(unittest.TestCase):
         selected, _ = self.sessions.claim_due(now=time.monotonic() + 0.01)
         self.assertIs(selected, session)
         self.assertTrue(session.initial_acquisition_granted)
+
+    def test_reactivated_session_reuses_its_own_fresh_observation_without_provider_work(self):
+        with patch("monitor.time.monotonic", return_value=1000.0) as clock:
+            session, _ = self.sessions.get_or_create()
+            self.sessions.touch(session, active=True)
+            session.refresh_reasons.clear()
+            session.refresh_requested_at = None
+            session.last_fetch_at = 1000.0
+            session.initial_acquisition_granted = True
+            with session.state.lock:
+                session.state.position_observed_at_monotonic = 995.0
+                session.state.position_aircraft_id = "ABC123"
+            with session.lease.lock:
+                session.lease.last_seen = 987.0
+
+            clock.return_value = 1000.1
+            self.sessions.touch(session, active=True)
+
+            self.assertFalse(session.initial_acquisition_granted)
+            self.assertIsNone(session.refresh_requested_at)
+            self.assertNotIn("activation", session.refresh_reasons)
+            self.assertIsNone(self.sessions.claim_due(now=1000.1)[0])
+
+    def test_reactivated_session_with_stale_observation_is_scheduled_immediately_when_eligible(self):
+        with patch("monitor.time.monotonic", return_value=1000.0) as clock:
+            session, _ = self.sessions.get_or_create()
+            self.sessions.touch(session, active=True)
+            session.refresh_reasons.clear()
+            session.refresh_requested_at = None
+            session.last_fetch_at = 1000.0
+            session.initial_acquisition_granted = True
+            with session.state.lock:
+                session.state.position_observed_at_monotonic = 970.0
+            with session.lease.lock:
+                session.lease.last_seen = 987.0
+            self.sessions.next_acquisition_at = 0.0
+
+            clock.return_value = 1000.1
+            self.sessions.touch(session, active=True)
+            selected, wait = self.sessions.claim_due(now=1000.1)
+
+            self.assertIs(selected, session)
+            self.assertEqual(wait, 0.0)
+            self.assertEqual(selected.acquisition_kind, "normal")
+
+    def test_activation_to_scheduling_latency_and_inflight_result_reuse_are_measurable(self):
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "monitor.time.monotonic", return_value=1000.0
+        ) as clock:
+            store = monitor.VisitorSessionStore(
+                Settings(refresh_seconds=300), Path(temporary),
+                global_min_interval_seconds=60,
+            )
+            first, _ = store.get_or_create()
+            second, _ = store.get_or_create()
+            store.touch(first, active=True)
+            store.touch(second, active=True)
+            activation_at = 1000.0
+
+            selected, wait = store.claim_due(now=activation_at)
+            self.assertIs(selected, first)
+            self.assertEqual(wait, 0.0)
+            self.assertEqual(first.last_scheduled_at - activation_at, 0.0)
+
+            pending, provider_wait = store.claim_due(now=activation_at)
+            self.assertIsNone(pending)
+            self.assertAlmostEqual(provider_wait, 60.0, delta=0.001)
+
+            plane = {
+                "hex": "abc123", "flight": "TST123", "lat": first.settings.latitude,
+                "lon": first.settings.longitude, "seen_pos": 0.1,
+            }
+            with first.state.lock:
+                first.state.last_live_aircraft = [plane]
+                first.state.last_live_aircraft_received_at = activation_at
+                first.state.last_live_aircraft_query_radius_nm = first.settings.query_radius_nm
+                first.state.last_acquisition_succeeded_at = time.time()
+            store.remember_shared_result(first)
+
+            clock.return_value = 1000.1
+            reused, wait = store.claim_due(now=1000.1)
+            self.assertIs(reused, second)
+            self.assertEqual(reused.acquisition_kind, "normal_cache")
+            self.assertEqual(wait, 0.0)
+            self.assertAlmostEqual(second.last_scheduled_at - activation_at, 0.1, delta=0.001)
+            self.assertEqual(store.next_acquisition_at, 1060.0)
+
+            third, _ = store.get_or_create()
+            monitor.apply_visitor_location_change(third, -40.0, 120.0)
+            store.touch(third, active=True)
+            selected, wait = store.claim_due(now=1000.1)
+            self.assertIsNone(selected)
+            self.assertAlmostEqual(wait, 59.9, delta=0.001)
+            selected, wait = store.claim_due(now=1060.0)
+            self.assertIs(selected, third)
+            self.assertEqual(wait, 0.0)
+            self.assertAlmostEqual(third.last_scheduled_at - 1000.1, 59.9, delta=0.001)
+
+    def test_bootstrap_status_creates_session_without_starting_active_lease(self):
+        status, cookie_header, body = self.request("GET", "/status?active=0&bootstrap=1")
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(cookie_header)
+        session = self.sessions.sessions[cookie_header.split(";", 1)[0].split("=", 1)[1]]
+        self.assertFalse(session.lease.active())
+        self.assertIsNone(session.refresh_requested_at)
+        self.assertEqual(json.loads(body)["acquisition_status"], "waiting")
 
     def test_automatic_refresh_target_survives_display_freshness_expiry(self):
         with patch("monitor.time.monotonic", return_value=1000.0) as clock:

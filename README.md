@@ -25,9 +25,12 @@ The main display shows:
 - an optional wider-area radar
 - scanning, live, reconnecting, rate-limited, demo and error status
 
-When a successful aircraft response contains no eligible selection, the status
-shows **Scanning** and the idle message rotates. Over-Head never inserts sample
-traffic during live operation.
+When a successful aircraft response contains no eligible current or retained
+selection, the status shows **Scanning** and the idle message rotates. A
+temporary provider omission does not immediately erase a genuinely observed
+contact: its unchanged coordinates may remain as an explicitly labelled
+last-known position for the bounded period described below. Over-Head never
+inserts sample traffic during live operation.
 
 When a live response contains no eligible aircraft, commentary observation timing
 is skipped until an aircraft is selected. This prevents an `AttributeError` from
@@ -112,6 +115,40 @@ browser refreshes display status every 2 seconds; this is not an upstream
 aircraft request. Cadences are minimum intervals, not guaranteed observation
 deadlines: scheduler load, request duration, provider limits and polling budgets
 can delay the next update.
+
+After location confirmation, a newly active visitor is offered the next eligible
+geographic acquisition slot immediately. A geographically covering result less
+than 20 seconds old is reused locally without another provider request. Returning
+tabs similarly reuse their own still-fresh observation; stale observations queue
+a refresh when the shared provider budget permits. Focus, visibility and page-show
+events are debounced and do not bypass provider cooldowns or create parallel
+upstream requests. A request already being processed remains the one serialized
+worker request; other visitors reuse its resulting covered cache or wait for the
+next eligible slot. “Immediate” therefore describes scheduler eligibility, not
+network response time and not an exemption from an upstream `Retry-After` delay.
+
+### Last-known contact continuity
+
+Every provider position is stored with its genuine observation time. On a
+successful empty response, a provider failure or a delayed acquisition, Over-Head
+merges observations by stable aircraft identity: a newer real observation wins,
+and an older response cannot overwrite it. No movement is extrapolated.
+
+Positions up to 20 seconds old are **reported** contacts. Older retained positions
+are shown as **last known**, with their increasing age, reduced radar emphasis and
+unchanged coordinates. They remain subject to the selected visitor's radar range;
+an aircraft with a newer observation outside that range is removed. The radar
+contact count includes both reported and retained contacts and states how many are
+last known, so an empty provider response cannot misleadingly produce `0 CONTACTS`
+while bounded observations remain.
+
+Retention is `max(120 seconds, twice the configured geographic refresh interval)`,
+capped at 15 minutes. This is the existing tracked-position retention policy, now
+applied consistently to geographic contact continuity. After that limit the
+coordinates, radar contact and untracked main-aircraft presentation are removed.
+Explicit TRACK mode retains the aircraft identity while likewise sanitizing an
+expired position. Retention is per visitor and never copies one visitor's private
+location or display state into another.
 
 ## Route resolution
 
@@ -319,6 +356,14 @@ raster fallbacks are not enlarged into the prominent branding position. If a
 suitable wordmark is unavailable, the full airline/registered-owner name is
 shown instead when known; otherwise the branding area remains empty.
 
+Text branding is measured using its actual rendered width. Short operator names
+retain the prominent established size; longer names use the largest size that fits
+the available branding box, down to a readable desktop/mobile minimum. Measurement
+runs when the aircraft changes and when the branding container or viewport changes.
+Exceptionally long names use a bounded single-line ellipsis at the minimum size,
+with the complete value retained as the element title. SVG wordmark sizing is
+unchanged.
+
 Successful wordmarks and the airline index are cached in:
 
 ```text
@@ -385,7 +430,9 @@ When available, radar and aircraft commentary keep their existing presentation
 rotation. The route map and selected aircraft photograph use the same map frame.
 When displayed, the photograph replaces the map rather than appearing as an
 overlay. It is scaled proportionally with `contain`; a dark matte fills any
-unused area, and feathered edges blend it into the panel. The on-image credit
+unused area, and a pronounced four-edge feather blends it into the panel. On
+desktop the photograph is composed farther to the right while preserving its
+aspect ratio; mobile keeps the centred composition. The on-image credit
 identifies Airport-data.com via ADSBDB. After a valid photograph loads, the map
 and photo alternate every 10 seconds. A missing, rejected or failed-to-load
 photograph leaves the map visible, and changing the selected aircraft resets
@@ -468,8 +515,12 @@ Settings currently provide:
 Closing ordinary Settings restores the radar state that was active before
 Settings was opened.
 
-Selecting **CURRENT LOCATION** opens a dedicated Leaflet location chooser that
-fits inside the viewport without scrolling. You can:
+The dedicated Leaflet location chooser opens on every ordinary page load and
+reload. It suggests the visitor's previous session location when available, but
+does not start acquisition until that page confirms a location. Browser current
+location is requested only after the visitor explicitly presses **USE MY CURRENT
+LOCATION**; simply opening the chooser does not prompt for geolocation permission.
+The chooser fits desktop, tablet, portrait and short landscape viewports. You can:
 
 - use high-accuracy browser geolocation
 - click the map
@@ -477,7 +528,7 @@ fits inside the viewport without scrolling. You can:
 - review the selected latitude and longitude
 - save the new home location
 
-**USE MY LOCATION** gently pulses as `LOCATING...` while the browser location
+**USE MY CURRENT LOCATION** gently pulses as `LOCATING...` while the browser location
 request is in progress.
 
 Each browser receives an independent, opaque session. Its selected location,
@@ -492,7 +543,13 @@ Queries share one server-wide acquisition scheduler, so a change can wait for th
 next available provider slot. The status shows when a request is queued. Other
 visitors' locations, tracked aircraft and radar ranges are unchanged. Cancelling,
 closing, clicking the backdrop or pressing Escape exits the location chooser
-back to Radar.
+without changing the underlying Flight/Radar panel.
+
+If a confirmed page returns from the background after its active lease has expired,
+the browser sends a debounced active heartbeat. A still-fresh observation is reused;
+otherwise acquisition is scheduled at the earliest eligible shared slot. The
+location confirmation dialog shown on a new load is distinct from this background
+recovery and is never bypassed by stored geolocation permission.
 
 On first normal startup, if `config.json` is missing, Over-Head opens a dedicated
 location setup page and does not start live tracking until an explicit location

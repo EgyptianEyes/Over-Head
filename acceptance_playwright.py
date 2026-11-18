@@ -449,6 +449,7 @@ class BrowserAcceptanceTests(unittest.TestCase):
     def new_page(
         self, width: int, height: int, geolocation: dict[str, float] | None = None,
         reduced_motion: str | None = None, install_clock: bool = False,
+        confirm_location: bool = True,
     ) -> Page:
         options: dict[str, Any] = {"viewport": {"width": width, "height": height}}
         if reduced_motion:
@@ -481,8 +482,19 @@ class BrowserAcceptanceTests(unittest.TestCase):
             interval_patch = patch.object(monitor, "NORMAL_ACQUISITION_INTERVAL_SECONDS", 0.05)
             interval_patch.start()
             page.goto(self.base_url + "/", wait_until="domcontentloaded")
+            page.locator("#location-backdrop.open").wait_for(state="visible", timeout=5000)
+            if confirm_location:
+                if geolocation:
+                    page.locator("#location-use-device").click()
+                    self.wait_for_input_value(
+                        page, "#location-latitude",
+                        lambda value: bool(value) and abs(float(value) - geolocation["latitude"]) < 0.0001,
+                    )
+                page.locator("#location-save").click()
+                self.wait_for_class(page, "#location-backdrop", "open", present=False)
             try:
-                self.wait_for_text(page, "#mode", lambda text: text.lower() in {"live", "cached observations", "error"}, timeout=10)
+                expected_modes = {"live", "cached observations", "scanning", "error"} if confirm_location else {"starting"}
+                self.wait_for_text(page, "#mode", lambda text: text.lower() in expected_modes, timeout=10)
             except AssertionError as exc:
                 self.fail(f"Initial display did not settle: {exc}; page errors={self.page_errors}; console errors={self.console_errors}; failed requests={self.failed_requests}")
             if (page.locator("#mode").text_content() or "").lower() == "error":
@@ -729,14 +741,41 @@ class BrowserAcceptanceTests(unittest.TestCase):
 
         with self.state.lock:
             self.state.position_observed_at_monotonic = time.monotonic() - monitor.POSITION_FRESHNESS_SECONDS - 1
+            for contact in self.state.payload["radar_contacts"]:
+                contact["position_age_seconds"] = monitor.POSITION_FRESHNESS_SECONDS + 1
+                contact["position_state"] = "last_known"
         stale_status = page.evaluate("""async () => {
           const response=await fetch('/status?active=1',{cache:'no-store'});
           return response.json();
         }""")
-        self.assertEqual(stale_status["aircraft_id"], "")
-        self.assertEqual(stale_status["mode"], "scanning")
-        self.assertEqual(stale_status["position_state"], "unavailable")
+        # The position is 21 seconds old: retain its unchanged coordinates and
+        # selection as last-known, rather than treating it as live or erasing it.
+        self.assertEqual(stale_status["aircraft_id"], "AABB84")
+        self.assertEqual(stale_status["mode"], "last_known")
+        self.assertEqual(stale_status["position_state"], "last_known")
+        self.assertAlmostEqual(stale_status["aircraft_latitude"], relocated["lat"])
+        self.assertEqual(len(stale_status["radar_contacts"]), 1)
+        self.assertEqual(stale_status["radar_contacts"][0]["position_state"], "last_known")
         page.evaluate("update()")
+        self.wait_for_text(page, "#mode", lambda text: text == "Last known position")
+        self.assertFalse(page.locator("#wall").evaluate("element => element.classList.contains('no-aircraft')"))
+
+        # Once the bounded retention window expires, status and UI must both
+        # remove the coordinates and radar contact rather than extend retention.
+        retention_deadline = time.monotonic() - monitor.retained_position_seconds(settings.refresh_seconds) - 1
+        with self.state.lock:
+            self.state.position_observed_at_monotonic = retention_deadline
+            for contact in self.state.payload["radar_contacts"]:
+                contact["position_age_seconds"] = monitor.retained_position_seconds(settings.refresh_seconds) + 1
+        expired_status = page.evaluate("""async () => {
+          const response=await fetch('/status?active=1',{cache:'no-store'});
+          return response.json();
+        }""")
+        self.assertEqual(expired_status["aircraft_id"], "")
+        self.assertEqual(expired_status["mode"], "scanning")
+        self.assertEqual(expired_status["radar_contacts"], [])
+        page.evaluate("update()")
+        self.wait_for_text(page, "#mode", lambda text: text == "Scanning")
         self.wait_for_class(page, "#wall", "no-aircraft")
         self.assertEqual(self.page_errors, [])
         self.assertEqual(self.external_requests, [])
@@ -902,6 +941,195 @@ class BrowserAcceptanceTests(unittest.TestCase):
                 page.screenshot(path=str(screenshot_dir / "populated.png"), full_page=False)
                 self.assertEqual(self.page_errors, [])
 
+    def test_location_chooser_every_load_and_responsive_confirmation_layout(self) -> None:
+        viewports = (
+            ("location-desktop", 1366, 768),
+            ("location-mobile-320", 320, 568),
+            ("location-mobile-375", 375, 812),
+            ("location-mobile-390", 390, 844),
+            ("location-landscape", 844, 390),
+        )
+        for label, width, height in viewports:
+            with self.subTest(viewport=label):
+                page = self.new_page(width, height, confirm_location=False)
+                dialog = page.locator("#location-dialog") if page.locator("#location-dialog").count() else page.locator(".location-dialog")
+                self.assertTrue(page.locator("#location-backdrop").is_visible())
+                geometry = page.evaluate("""() => {
+                  const selectors=['.location-dialog','#location-map','.location-details','.location-status','#location-use-device','#location-cancel','#location-save'];
+                  const boxes=Object.fromEntries(selectors.map(selector=>{const r=document.querySelector(selector).getBoundingClientRect();return [selector,{x:r.x,y:r.y,right:r.right,bottom:r.bottom,width:r.width,height:r.height}]}));
+                  return {width:innerWidth,height:innerHeight,scrollWidth:document.documentElement.scrollWidth,scrollHeight:document.documentElement.scrollHeight,boxes};
+                }""")
+                self.assertLessEqual(geometry["scrollWidth"], width + 1)
+                self.assertLessEqual(geometry["scrollHeight"], height + 1)
+                for selector, box in geometry["boxes"].items():
+                    self.assertGreater(box["width"], 0, selector)
+                    self.assertGreater(box["height"], 0, selector)
+                    self.assertGreaterEqual(box["x"], -1, selector)
+                    self.assertGreaterEqual(box["y"], -1, selector)
+                    self.assertLessEqual(box["right"], width + 1, selector)
+                    self.assertLessEqual(box["bottom"], height + 1, selector)
+                self.assertTrue(page.locator("#location-save").is_visible())
+                artifact = self.ARTIFACT_ROOT / label / "location-chooser.png"
+                artifact.parent.mkdir(parents=True, exist_ok=True)
+                page.screenshot(path=str(artifact), full_page=False)
+                page.reload(wait_until="domcontentloaded")
+                page.locator("#location-backdrop.open").wait_for(state="visible", timeout=5000)
+                self.assertTrue(page.locator("#location-save").is_visible())
+                self.assertEqual(self.page_errors, [])
+
+    def test_location_consent_gates_acquisition_and_focus_events_are_debounced(self) -> None:
+        page = self.new_page(
+            390, 844, {"latitude": 34.0522, "longitude": -118.2437},
+            confirm_location=False,
+        )
+        page.wait_for_timeout(250)
+        self.assertEqual(self.provider.count(), 0)
+        self.assertAlmostEqual(float(page.locator("#location-latitude").input_value()), 51.5, places=3)
+        page.locator("#location-use-device").click()
+        self.wait_for_input_value(page, "#location-latitude", lambda value: bool(value) and abs(float(value) - 34.0522) < .0001)
+        confirmed_at = time.monotonic()
+        page.locator("#location-save").click()
+        self.wait_for_class(page, "#location-backdrop", "open", present=False)
+        self.wait_for_calls(1)
+        first_request_at = self.provider.diagnostic_events[0]["at"]
+        self.assertLess(first_request_at - confirmed_at, 1.0)
+        requests = []
+        page.on("request", lambda request: requests.append(request.url) if "/status?active=1" in request.url else None)
+        page.evaluate("() => { for(let index=0; index<12; index++) window.dispatchEvent(new Event('focus')); }")
+        page.wait_for_timeout(1000)
+        self.assertLessEqual(len(requests), 2)
+        self.assertEqual(self.page_errors, [])
+
+    def test_last_known_contact_is_counted_labelled_and_expires(self) -> None:
+        page = self.new_page(1280, 800)
+        session = next(item for item in self.sessions.sessions.values() if item.state is self.state)
+        with self.sessions.lock:
+            session.refresh_reasons.clear()
+            session.refresh_requested_at = None
+            session.last_fetch_at = time.monotonic() + 600
+            self.sessions.next_acquisition_at = time.monotonic() + 600
+
+        observed_at = time.monotonic() - 30
+        with self.state.lock:
+            for plane in self.state.last_live_aircraft:
+                plane["_position_observed_at_monotonic"] = observed_at
+                plane["seen_pos"] = 30
+            self.state.last_live_aircraft_received_at = time.monotonic()
+            self.state.position_observed_at_monotonic = observed_at
+        self.provider.set_mode("empty")
+        self.update_now()
+        page.evaluate("update()")
+        self.wait_for_text(page, "#mode", lambda text: text == "Last known position")
+        count = page.locator("#radar-count").text_content() or ""
+        self.assertIn("LAST KNOWN", count)
+        self.assertGreater(page.locator("#radar-contacts .contact.last-known").count(), 0)
+        self.assertIn("Last known position", page.locator("#footer-status").text_content() or "")
+        artifact = self.ARTIFACT_ROOT / "continuity-desktop" / "last-known-contact.png"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(artifact), full_page=False)
+
+        expired_at = time.monotonic() - monitor.retained_position_seconds(self.settings.refresh_seconds) - 1
+        with self.state.lock:
+            for plane in self.state.last_live_aircraft:
+                plane["_position_observed_at_monotonic"] = expired_at
+                plane["seen_pos"] = monitor.retained_position_seconds(self.settings.refresh_seconds) + 1
+            self.state.last_live_aircraft_received_at = time.monotonic()
+            self.state.position_observed_at_monotonic = expired_at
+        self.update_now()
+        page.evaluate("update()")
+        self.wait_for_text(page, "#mode", lambda text: text == "Scanning")
+        self.assertEqual(page.locator("#radar-count").text_content(), "0 CONTACTS")
+        self.assertEqual(page.locator("#radar-contacts .contact").count(), 0)
+        self.assertEqual(self.page_errors, [])
+
+    def test_operator_name_fits_complete_text_across_identity_and_layout_changes(self) -> None:
+        page = self.new_page(1366, 768)
+        session = next(item for item in self.sessions.sessions.values() if item.state is self.state)
+        with self.sessions.lock:
+            session.refresh_reasons.clear()
+            session.refresh_requested_at = None
+            session.last_fetch_at = time.monotonic() + 600
+            self.sessions.next_acquisition_at = time.monotonic() + 600
+
+        def publish(name: str, aircraft_id: str) -> None:
+            with self.state.lock:
+                self.state.logo = b""
+                self.state.position_aircraft_id = aircraft_id
+                self.state.position_observed_at_monotonic = time.monotonic()
+                self.state.payload.update({
+                    "mode": "live", "aircraft_id": aircraft_id,
+                    "callsign": aircraft_id, "registration": aircraft_id,
+                    "flight_details": aircraft_id, "airline_name": name,
+                    "logo_available": False, "logo_revision": "",
+                    "aircraft_latitude": self.settings.latitude,
+                    "aircraft_longitude": self.settings.longitude,
+                    "distance_nm": 0.0,
+                })
+            page.evaluate("update()")
+            self.wait_for_text(page, "#route-brand-name", lambda text: text == name)
+            page.wait_for_timeout(80)
+
+        def metrics() -> dict[str, Any]:
+            return page.locator("#route-brand-name").evaluate("""element => {
+              const range=document.createRange(); range.selectNodeContents(element);
+              const box=element.parentElement.getBoundingClientRect();
+              const text=range.getBoundingClientRect();
+              return {fontSize:parseFloat(getComputedStyle(element).fontSize),
+                textWidth:text.width,textHeight:text.height,availableWidth:box.width*.92,
+                availableHeight:box.height*.82,title:element.getAttribute('title'),
+                overflow:getComputedStyle(element).textOverflow};
+            }""")
+
+        artifact_root = self.ARTIFACT_ROOT / "operator-fit"
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        publish("KLM", "ABC123")
+        short = metrics()
+        self.assertIsNone(short["title"])
+        page.screenshot(path=str(artifact_root / "desktop-short.png"), full_page=False)
+
+        publish("British Airways", "DEF456")
+        medium = metrics()
+        self.assertLessEqual(medium["fontSize"], short["fontSize"] + .1)
+        self.assertLessEqual(medium["textWidth"], medium["availableWidth"] + 1)
+
+        publish("Capital Air Services", "ABC123")
+        capital = metrics()
+        self.assertIsNone(capital["title"])
+        self.assertLessEqual(capital["textWidth"], capital["availableWidth"] + 1)
+        self.assertLessEqual(capital["textHeight"], capital["availableHeight"] + 1)
+        page.screenshot(path=str(artifact_root / "desktop-capital-radar-closed.png"), full_page=False)
+        if not page.locator("#wall").evaluate("element => element.classList.contains('radar-open')"):
+            page.locator("#radar-toggle").click()
+            self.wait_for_class(page, "#wall", "radar-open")
+        page.wait_for_timeout(80)
+        self.assertLessEqual(metrics()["textWidth"], metrics()["availableWidth"] + 1)
+        page.screenshot(path=str(artifact_root / "desktop-capital-radar-open.png"), full_page=False)
+
+        exceptionally_long = "The Exceptionally Long International Helicopter Charter and Specialist Aviation Services Company"
+        publish(exceptionally_long, "DEF456")
+        long_metrics = metrics()
+        self.assertGreaterEqual(long_metrics["fontSize"], 18)
+        if long_metrics["textWidth"] > long_metrics["availableWidth"] + 1:
+            self.assertEqual(long_metrics["title"], exceptionally_long)
+            self.assertEqual(long_metrics["overflow"], "ellipsis")
+
+        for label, width, height in (
+            ("tablet", 768, 1024), ("mobile-portrait", 390, 844),
+            ("mobile-landscape", 844, 390),
+        ):
+            with self.subTest(viewport=label):
+                page.set_viewport_size({"width": width, "height": height})
+                if page.locator("#wall").evaluate("element => element.classList.contains('radar-open')"):
+                    page.locator("#radar-toggle").click()
+                    self.wait_for_class(page, "#wall", "radar-open", present=False)
+                publish("Capital Air Services", "ABC123" if label != "tablet" else "DEF456")
+                fitted = metrics()
+                self.assertIsNone(fitted["title"])
+                self.assertLessEqual(fitted["textWidth"], fitted["availableWidth"] + 1)
+                self.assertLessEqual(fitted["textHeight"], fitted["availableHeight"] + 1)
+                page.screenshot(path=str(artifact_root / f"{label}-capital.png"), full_page=False)
+        self.assertEqual(self.page_errors, [])
+
     def test_map_photo_rotation_identity_reset_missing_photo_and_responsive_area(self) -> None:
         svg_photo = b'<svg xmlns="http://www.w3.org/2000/svg" width="400" height="200" viewBox="0 0 400 200"><rect width="400" height="200" fill="#14ecff"/><path d="M0 180L180 20 400 160" fill="none" stroke="#02050a" stroke-width="12"/></svg>'
 
@@ -960,7 +1188,9 @@ class BrowserAcceptanceTests(unittest.TestCase):
                 page.clock.pause_at(page.evaluate("Date.now()") + 100)
                 publish_photo("fixture-one")
                 page.clock.fast_forward(2000)
-                wait_until(page, lambda: page.locator("#aircraft-photo").evaluate("image => image.complete && image.naturalWidth === 400"))
+                wait_until(page, lambda: page.locator("#aircraft-photo").evaluate(
+                    "image => image.complete && image.naturalWidth === 400"
+                ) and page.evaluate("typeof routePhotoTimer !== 'undefined' && routePhotoTimer !== null"))
                 wait_until(page, lambda: page.locator("#route-photo-panel").is_hidden())
                 self.assertTrue(page.locator("#route-photo-panel").is_hidden())
                 self.assertTrue(page.locator("#route-map").evaluate("element => element.classList.contains('visible')"))
@@ -973,7 +1203,20 @@ class BrowserAcceptanceTests(unittest.TestCase):
                     page.clock.fast_forward(9999)
                     self.assertTrue(page.locator("#route-photo-panel").is_hidden())
                     page.clock.fast_forward(1)
-                    self.assertFalse(page.locator("#route-photo-panel").is_hidden())
+                    self.assertFalse(page.locator("#route-photo-panel").is_hidden(), page.evaluate("""() => ({
+                      hidden:document.querySelector('#route-photo-panel').hidden,
+                      source:document.querySelector('#aircraft-photo').getAttribute('src'),
+                      complete:document.querySelector('#aircraft-photo').complete,
+                      naturalWidth:document.querySelector('#aircraft-photo').naturalWidth,
+                      aircraft:document.querySelector('#callsign').textContent,
+                      visibility:document.visibilityState,
+                      panelStyle:getComputedStyle(document.querySelector('#route-photo-panel')).cssText,
+                      panelDisplay:getComputedStyle(document.querySelector('#route-photo-panel')).display,
+                      panelVisibility:getComputedStyle(document.querySelector('#route-photo-panel')).visibility,
+                      panelRect:document.querySelector('#route-photo-panel').getBoundingClientRect().toJSON(),
+                      mapClass:document.querySelector('#route-map').className,
+                      mapRect:document.querySelector('#route-map').getBoundingClientRect().toJSON()
+                    })"""))
                     photo_size = page.locator("#aircraft-photo").evaluate("image => ({width:image.getBoundingClientRect().width,height:image.getBoundingClientRect().height,naturalWidth:image.naturalWidth,naturalHeight:image.naturalHeight,objectFit:getComputedStyle(image).objectFit})")
                     self.assertAlmostEqual(photo_size["width"], map_width, delta=1)
                     self.assertEqual(photo_size["objectFit"], "contain")
@@ -981,11 +1224,26 @@ class BrowserAcceptanceTests(unittest.TestCase):
                     assert_photo_layout(page)
                     self.assertEqual(page.locator(".information").evaluate("element => {const r=element.getBoundingClientRect();return [r.x,r.y,r.width,r.height]}"), information_box)
                     page.screenshot(path=str(screenshot_dir / "route-photo.png"), full_page=False)
-                    page.clock.fast_forward(10000)
+                    page.clock.fast_forward(9999)
+                    self.assertFalse(page.locator("#route-photo-panel").is_hidden())
+                    page.clock.fast_forward(1)
                     self.assertTrue(page.locator("#route-photo-panel").is_hidden())
                     page.screenshot(path=str(screenshot_dir / "route-map-after-photo.png"), full_page=False)
                     page.clock.fast_forward(10000)
-                    self.assertFalse(page.locator("#route-photo-panel").is_hidden())
+                    self.assertFalse(page.locator("#route-photo-panel").is_hidden(), page.evaluate("""() => ({
+                      hidden:document.querySelector('#route-photo-panel').hidden,
+                      source:document.querySelector('#aircraft-photo').getAttribute('src'),
+                      complete:document.querySelector('#aircraft-photo').complete,
+                      naturalWidth:document.querySelector('#aircraft-photo').naturalWidth,
+                      aircraft:document.querySelector('#callsign').textContent,
+                      visibility:document.visibilityState,
+                      panelDisplay:getComputedStyle(document.querySelector('#route-photo-panel')).display,
+                      panelVisibility:getComputedStyle(document.querySelector('#route-photo-panel')).visibility,
+                      panelRect:document.querySelector('#route-photo-panel').getBoundingClientRect().toJSON(),
+                      mapClass:document.querySelector('#route-map').className,
+                      mapDisplay:getComputedStyle(document.querySelector('#route-map')).display,
+                      mapRect:document.querySelector('#route-map').getBoundingClientRect().toJSON()
+                    })"""))
                     page.evaluate("window.__stalePhotoLoad = document.querySelector('#aircraft-photo').onload")
                     with self.state.lock:
                         self.state.payload["aircraft_id"] = "DEF456"
@@ -997,12 +1255,32 @@ class BrowserAcceptanceTests(unittest.TestCase):
                     self.assertTrue(page.locator("#route-photo-panel").is_hidden())
                     self.assertFalse(page.locator("#route-map").evaluate("element => element.classList.contains('photo-active')"))
                 else:
-                    page.clock.fast_forward(10000)
-                    self.assertFalse(page.locator("#route-photo-panel").is_hidden())
+                    for _ in range(25):
+                        if not page.locator("#route-photo-panel").is_hidden():
+                            break
+                        page.clock.fast_forward(500)
+                    self.assertFalse(page.locator("#route-photo-panel").is_hidden(), page.evaluate("""() => ({
+                      hidden:document.querySelector('#route-photo-panel').hidden,
+                      source:document.querySelector('#aircraft-photo').getAttribute('src'),
+                      complete:document.querySelector('#aircraft-photo').complete,
+                      naturalWidth:document.querySelector('#aircraft-photo').naturalWidth,
+                      aircraft:document.querySelector('#callsign').textContent,
+                      visibility:document.visibilityState,
+                      panelDisplay:getComputedStyle(document.querySelector('#route-photo-panel')).display,
+                      panelVisibility:getComputedStyle(document.querySelector('#route-photo-panel')).visibility,
+                      panelRect:document.querySelector('#route-photo-panel').getBoundingClientRect().toJSON(),
+                      mapClass:document.querySelector('#route-map').className,
+                      mapDisplay:getComputedStyle(document.querySelector('#route-map')).display,
+                      mapRect:document.querySelector('#route-map').getBoundingClientRect().toJSON()
+                    })"""))
                     assert_photo_layout(page)
                     self.assertEqual(page.locator(".information").evaluate("element => {const r=element.getBoundingClientRect();return [r.x,r.y,r.width,r.height]}"), information_box)
                     page.screenshot(path=str(screenshot_dir / "route-photo.png"), full_page=False)
-                    page.clock.fast_forward(10000)
+                    # The next map transition is due exactly ten seconds after
+                    # the image-load callback armed the rotation timer.
+                    page.clock.fast_forward(9999)
+                    self.assertFalse(page.locator("#route-photo-panel").is_hidden())
+                    page.clock.fast_forward(1)
                     self.assertTrue(page.locator("#route-photo-panel").is_hidden())
                     self.assertTrue(page.locator("#route-map").evaluate("element => element.classList.contains('visible')"))
                     page.screenshot(path=str(screenshot_dir / "route-map-after-photo.png"), full_page=False)
@@ -1010,6 +1288,8 @@ class BrowserAcceptanceTests(unittest.TestCase):
                 self.assertEqual(page.evaluate("window.__overheadMaps.length"), map_instances)
                 self.assertEqual(page.locator("#route-map").evaluate("element => element.getBoundingClientRect().width"), map_width)
                 if label.startswith("mobile-"):
+                    page.clock.fast_forward(10000)
+                    self.assertFalse(page.locator("#route-photo-panel").is_hidden())
                     publish_photo("", available=False)
                     page.clock.fast_forward(2000)
                     wait_until(page, lambda: page.locator("#route-photo-panel").is_hidden())
@@ -1045,7 +1325,7 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.wait_for_class(page, "#location-backdrop", "open")
         self.assertEqual(page.evaluate("document.activeElement.id"), "location-close")
         page.keyboard.press("Escape")
-        self.assertEqual(page.evaluate("document.activeElement.id"), "settings-toggle")
+        self.assertEqual(page.evaluate("document.activeElement.id"), "settings-location")
         self.assertEqual(self.page_errors, [])
 
     def test_reduced_motion_disables_repeating_tracking_animation(self) -> None:
@@ -1100,6 +1380,8 @@ class BrowserAcceptanceTests(unittest.TestCase):
             page.locator("#settings-location").click()
             page.locator("#location-use-device").click()
             page.locator("#location-save").click()
+            self.wait_for_class(page, "#location-backdrop", "open", present=False)
+            page.locator("#settings-toggle").click()
         deadline = time.monotonic() + 4
         while time.monotonic() < deadline and (
             abs(session_a.settings.latitude - 41.8781) > 0.0001
@@ -1117,6 +1399,7 @@ class BrowserAcceptanceTests(unittest.TestCase):
 
         page_a.locator("#track-flight").fill("TST703")
         page_a.locator("#track-button").click()
+        page_b.locator("#radar-toggle").click()
         page_b.locator("#track-flight").fill("MAN42")
         page_b.locator("#track-button").click()
         self.wait_for_text(page_a, "#track-button", lambda text: text == "STOP")
@@ -1125,6 +1408,9 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.assertEqual(session_b.tracker.snapshot()["query"], "MAN42")
 
         page_a.reload(wait_until="domcontentloaded")
+        page_a.locator("#location-backdrop.open").wait_for(state="visible", timeout=5000)
+        page_a.locator("#location-save").click()
+        self.wait_for_class(page_a, "#location-backdrop", "open", present=False)
         self.wait_for_text(page_a, "#track-button", lambda text: text == "STOP")
         self.assertEqual(session_a.tracker.snapshot()["query"], "TST703")
         self.assertEqual(session_b.tracker.snapshot()["query"], "MAN42")
@@ -1133,13 +1419,11 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.assertEqual(self.external_requests, [])
 
     def test_dynamic_location_prompts_on_load_and_manual_choice_remains_available(self) -> None:
-        page = self.new_page(1280, 800)
-        self.assertTrue(page.locator("#location-activation").is_visible())
-        self.assertEqual(page.evaluate("localStorage.getItem('overhead-location-mode-v1')"), "dynamic")
-        page.locator("#location-manual").click()
-        self.wait_for_class(page, "#location-backdrop", "open")
+        page = self.new_page(1280, 800, confirm_location=False)
+        self.assertTrue(page.locator("#location-backdrop").is_visible())
+        self.assertIn(page.evaluate("localStorage.getItem('overhead-location-mode-v1')"), (None, "dynamic"))
         self.assertTrue(page.locator("#location-latitude").is_visible())
-        self.assertFalse(page.locator("#location-activation").is_visible())
+        self.assertTrue(page.locator("#location-use-device").is_visible())
         self.assertEqual(self.external_requests, [])
 
     def test_previously_granted_location_is_applied_automatically(self) -> None:
@@ -1166,13 +1450,11 @@ class BrowserAcceptanceTests(unittest.TestCase):
         page = context.new_page()
         page.on("pageerror", lambda error: self.page_errors.append(str(error)))
         page.goto(self.base_url + "/", wait_until="domcontentloaded")
-        self.wait_for_text(page, "#mode", lambda text: text.lower() in {"live", "cached observations", "error"}, timeout=10)
+        page.locator("#location-backdrop.open").wait_for(state="visible", timeout=5000)
         self.bind_page_session(page)
-        page.wait_for_selector("#location-activation:not([hidden])")
-        self.assertIn("previously declined", page.locator("#location-activation-message").text_content())
+        self.wait_for_input_value(page, "#location-latitude", lambda value: value == "51.500000")
+        self.wait_for_input_value(page, "#location-longitude", lambda value: value == "-0.100000")
         self.assertEqual(page.evaluate("window.__locationCalls"), 0)
-        page.locator("#location-manual").click()
-        self.wait_for_class(page, "#location-backdrop", "open")
         page.locator("#location-latitude").fill("35")
         page.locator("#location-longitude").fill("-120")
         page.locator("#location-save").click()
@@ -1204,12 +1486,12 @@ class BrowserAcceptanceTests(unittest.TestCase):
         page = context.new_page()
         page.on("pageerror", lambda error: self.page_errors.append(str(error)))
         page.goto(self.base_url + "/", wait_until="domcontentloaded")
-        self.wait_for_text(page, "#mode", lambda text: text.lower() in {"live", "cached observations", "error"}, timeout=10)
+        page.locator("#location-backdrop.open").wait_for(state="visible", timeout=5000)
         self.bind_page_session(page)
-        page.wait_for_selector("#location-activation:not([hidden])")
-        self.assertIn("Could not determine", page.locator("#location-activation-message").text_content())
-        self.assertTrue(page.locator("#location-manual").is_visible())
-        self.assertEqual(page.locator("#mode").text_content(), "Live")
+        page.locator("#location-use-device").click()
+        self.wait_for_text(page, "#location-status", lambda text: "timed out" in text.lower())
+        page.locator("#location-save").click()
+        self.wait_for_class(page, "#location-backdrop", "open", present=False)
         self.assertEqual(self.page_errors, [])
 
     def test_explicit_manual_mode_is_preserved_for_returning_visitor(self) -> None:
@@ -1247,15 +1529,16 @@ class BrowserAcceptanceTests(unittest.TestCase):
         page = context.new_page()
         page.on("pageerror", lambda error: self.page_errors.append(str(error)))
         page.goto(self.base_url + "/", wait_until="domcontentloaded")
-        self.wait_for_text(page, "#mode", lambda text: text.lower() in {"live", "cached observations", "error"}, timeout=10)
+        page.locator("#location-backdrop.open").wait_for(state="visible", timeout=5000)
         self.bind_page_session(page)
-        page.wait_for_selector("#location-activation:not([hidden])")
         self.assertEqual(page.evaluate("localStorage.getItem('overhead-location-mode-v1')"), "dynamic")
+        page.locator("#location-use-device").click()
+        self.wait_for_text(page, "#location-status", lambda text: "declined" in text.lower())
         self.assertEqual(page.evaluate("localStorage.getItem('overhead-location-denied-v1')"), "1")
-        page.locator("#location-activate").click()
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and self.settings.latitude != 35:
-            time.sleep(0.025)
+        page.locator("#location-use-device").click()
+        self.wait_for_input_value(page, "#location-latitude", lambda value: value == "35.000000")
+        page.locator("#location-save").click()
+        self.wait_for_class(page, "#location-backdrop", "open", present=False)
         self.assertEqual(self.settings.latitude, 35)
         self.assertEqual(page.evaluate("localStorage.getItem('overhead-location-mode-v1')"), "dynamic")
         self.assertIsNone(page.evaluate("localStorage.getItem('overhead-location-denied-v1')"))
@@ -1278,13 +1561,15 @@ class BrowserAcceptanceTests(unittest.TestCase):
         page = context.new_page()
         page.on("pageerror", lambda error: self.page_errors.append(str(error)))
         page.goto(self.base_url + "/", wait_until="domcontentloaded")
-        self.wait_for_text(page, "#mode", lambda text: text.lower() in {"live", "cached observations", "error"}, timeout=10)
+        page.locator("#location-backdrop.open").wait_for(state="visible", timeout=5000)
+        self.assertEqual(page.evaluate("window.__locationCalls"), 0)
+        page.locator("#location-use-device").click()
         self.assertEqual(page.evaluate("window.__locationCalls"), 1)
         page.evaluate("window.__pendingGeolocationSuccess({coords:{latitude:35,longitude:-120,accuracy:25}})")
         self.bind_page_session(page)
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and self.settings.latitude != 35:
-            time.sleep(0.025)
+        self.wait_for_input_value(page, "#location-latitude", lambda value: value == "35.000000")
+        page.locator("#location-save").click()
+        self.wait_for_class(page, "#location-backdrop", "open", present=False)
         self.assertEqual(self.settings.latitude, 35)
         self.assertEqual(self.page_errors, [])
 
@@ -1304,8 +1589,8 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.install_location_diagnostics(page)
         page.on("pageerror", lambda error: self.page_errors.append(str(error)))
         page.goto(self.base_url + "/", wait_until="domcontentloaded")
-        self.wait_for_text(page, "#mode", lambda text: text.lower() in {"live", "cached observations", "error"}, timeout=10)
-        self.wait_for_text(page, "#location-activation", lambda _text: True)
+        page.locator("#location-backdrop.open").wait_for(state="visible", timeout=5000)
+        page.locator("#location-use-device").click()
         self.assertTrue(page.evaluate("typeof window.__pendingGeolocationSuccess === 'function'"))
         page.evaluate("document.getElementById('location-activation').hidden=false")
         self.bind_page_session(page)
@@ -1329,9 +1614,7 @@ class BrowserAcceptanceTests(unittest.TestCase):
 
         page.on("request", record_location_request)
         page.on("response", record_location_response)
-        page.locator("#location-manual").click()
-        self.wait_for_class(page, "#location-backdrop", "open")
-        self.wait_for_input_value(page, "#location-latitude", lambda value: value == "51.500000")
+        page.evaluate("() => { locationRequestRevision++; locationLookupInFlight=false; setLocationButtonBusy(false); pendingLocationMode='manual'; }")
         page.locator("#location-latitude").fill("10")
         page.locator("#location-longitude").fill("20")
         page.locator("#location-save").click()
@@ -1392,6 +1675,7 @@ class BrowserAcceptanceTests(unittest.TestCase):
         with self.sessions.lock:
             self.sessions.next_acquisition_at = 0
         page.locator("#location-save").click()
+        self.wait_for_class(page, "#location-backdrop", "open", present=False)
         deadline = time.monotonic() + 4
         while time.monotonic() < deadline and (
             self.state.location_revision < revision_before_location + 1
@@ -1437,10 +1721,10 @@ class BrowserAcceptanceTests(unittest.TestCase):
         interval_patch.start()
         self.addCleanup(interval_patch.stop)
         self.install_claim_due_diagnostics()
+        self.provider.set_mode("empty")
         page = self.new_page(1280, 800, {"latitude": 34.0522, "longitude": -118.2437})
         self.install_status_diagnostics(page)
         self.install_page_lifecycle_diagnostics(page, "initial")
-        self.provider.set_mode("empty")
         self.update_now()
         self.wait_for_text(page, "#mode", lambda text: text == "Scanning")
         self.assertNotEqual(self.state.payload["mode"], "demo")
@@ -1469,6 +1753,9 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.assertTrue(self.state.payload["tracking_active"])
         self.assertGreaterEqual(self.state.payload["radar_radius_nm"], self.state.payload["distance_nm"] * 1.18)
         page.reload(wait_until="domcontentloaded")
+        page.locator("#location-backdrop.open").wait_for(state="visible", timeout=5000)
+        page.locator("#location-save").click()
+        self.wait_for_class(page, "#location-backdrop", "open", present=False)
         self.wait_for_text(page, "#track-button", lambda text: text == "STOP")
         self.assertEqual(self.state.payload["tracking_resolved_callsign"], "TST703")
 
