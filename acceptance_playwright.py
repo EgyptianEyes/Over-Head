@@ -555,6 +555,53 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.tracker = session.tracker
         self.lease = session.lease
 
+    def location_response_predicate(self, page: Page, latitude: float, longitude: float):
+        """Match the exact manual POST and its browser session, not any /location response."""
+        cookies = page.context.cookies(self.base_url)
+        session_id = next((cookie["value"] for cookie in cookies if cookie["name"] == "overhead_session"), None)
+
+        def matches(response) -> bool:
+            if response.url.split("?", 1)[0] != self.base_url + "/location":
+                return False
+            try:
+                request = response.request
+                body = request.post_data_json
+                cookie_header = request.headers.get("cookie", "")
+                request_session = next((part.partition("=")[2] for part in cookie_header.split(";")
+                                        if part.strip().startswith("overhead_session=")), None)
+                return (
+                    isinstance(body, dict)
+                    and body.get("latitude") == latitude and body.get("longitude") == longitude
+                    and request_session == session_id
+                )
+            except Exception:
+                return False
+
+        return matches
+
+    def wait_for_location_commit(self, session: Any, response_data: dict[str, Any],
+                                 latitude: float, longitude: float) -> dict[str, Any]:
+        """Wait for the matching response's revision to appear in that visitor's state."""
+        revision = response_data.get("location_revision")
+        self.assertIsInstance(revision, int)
+        deadline = time.monotonic() + 5
+        observed = {}
+        while time.monotonic() < deadline:
+            with session.state.lock:
+                observed = {
+                    "latitude": session.settings.latitude,
+                    "longitude": session.settings.longitude,
+                    "location_revision": session.state.location_revision,
+                }
+            if (
+                response_data.get("saved") is True
+                and observed["latitude"] == latitude and observed["longitude"] == longitude
+                and observed["location_revision"] == revision
+            ):
+                return observed
+            time.sleep(0.01)
+        self.fail(f"location response was not committed to its visitor state: response={response_data!r}, state={observed!r}")
+
     def _offline_route(self, route) -> None:
         url = route.request.url
         if url.startswith(self.base_url + "/"):
@@ -1440,6 +1487,13 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.contexts.append(context)
         context.add_init_script(LEAFLET_SHIM)
         context.add_init_script("""
+          if(localStorage.getItem('overhead-distance-unit')===null)localStorage.setItem('overhead-distance-unit','nm');
+          if(localStorage.getItem('overhead-radar-range-nm')===null)localStorage.setItem('overhead-radar-range-nm','25');
+          if(localStorage.getItem('overhead-radar-range-mi')===null)localStorage.setItem('overhead-radar-range-mi','35');
+          if(localStorage.getItem('overhead-radar-range-km')===null)localStorage.setItem('overhead-radar-range-km','45');
+          if(localStorage.getItem('overhead-sound')===null)localStorage.setItem('overhead-sound','muted');
+        """)
+        context.add_init_script("""
           localStorage.setItem('overhead-location-mode-v1','dynamic');
           localStorage.setItem('overhead-location-denied-v1','1');
           Object.defineProperty(navigator,'permissions',{value:{query:()=>Promise.resolve({state:'denied'})}});
@@ -1455,16 +1509,16 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.wait_for_input_value(page, "#location-latitude", lambda value: value == "51.500000")
         self.wait_for_input_value(page, "#location-longitude", lambda value: value == "-0.100000")
         self.assertEqual(page.evaluate("window.__locationCalls"), 0)
+        session = next(item for item in self.sessions.sessions.values() if item.state is self.state)
         page.locator("#location-latitude").fill("35")
         page.locator("#location-longitude").fill("-120")
-        page.locator("#location-save").click()
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and (
-            self.settings.latitude != 35
-            or self.settings.longitude != -120
-            or self.state.location_revision < 1
-        ):
-            time.sleep(0.025)
+        with page.expect_response(self.location_response_predicate(page, 35, -120)) as location_response:
+            page.locator("#location-save").click()
+        response = location_response.value
+        self.assertEqual(response.status, 200)
+        response_data = response.json()
+        self.assertTrue(response_data["saved"])
+        self.wait_for_location_commit(session, response_data, 35, -120)
         self.assertEqual(
             (self.settings.latitude, self.settings.longitude), (35, -120),
             f"manual save did not update visitor session: revision={self.state.location_revision}; "
@@ -1594,40 +1648,22 @@ class BrowserAcceptanceTests(unittest.TestCase):
         self.assertTrue(page.evaluate("typeof window.__pendingGeolocationSuccess === 'function'"))
         page.evaluate("document.getElementById('location-activation').hidden=false")
         self.bind_page_session(page)
-        self.install_location_diagnostics(page)
-        location_post = {"submitted": False, "response_received": False}
-        location_response = threading.Event()
-
-        def record_location_request(request) -> None:
-            if request.url.split("?", 1)[0] == self.base_url + "/location":
-                location_post["submitted"] = True
-
-        def record_location_response(response) -> None:
-            if response.url.split("?", 1)[0] == self.base_url + "/location":
-                location_post["response_received"] = True
-                location_post["status"] = response.status
-                try:
-                    location_post["result"] = response.json()
-                except Exception as exc:
-                    location_post["result_error"] = type(exc).__name__
-                location_response.set()
-
-        page.on("request", record_location_request)
-        page.on("response", record_location_response)
-        page.evaluate("() => { locationRequestRevision++; locationLookupInFlight=false; setLocationButtonBusy(false); pendingLocationMode='manual'; }")
+        session = next(item for item in self.sessions.sessions.values() if item.state is self.state)
         page.locator("#location-latitude").fill("10")
         page.locator("#location-longitude").fill("20")
-        page.locator("#location-save").click()
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and (
-            (self.settings.latitude, self.settings.longitude) != (10, 20)
-            or self.state.location_revision < 1
-        ):
-            time.sleep(0.025)
+        with page.expect_response(self.location_response_predicate(page, 10, 20)) as location_response:
+            page.locator("#location-save").click()
+        response = location_response.value
+        self.assertEqual(response.status, 200)
+        response_data = response.json()
+        self.assertTrue(response_data["saved"])
+        observed_state = self.wait_for_location_commit(session, response_data, 10, 20)
+        self.assertEqual((self.settings.latitude, self.settings.longitude), (10, 20))
+        self.assertGreaterEqual(self.state.location_revision, 1)
         self.record_diagnostic(
             "manual_save_assertion_state",
-            post=dict(location_post),
-            response_event_set=location_response.is_set(),
+            response=response_data,
+            committed_state=observed_state,
             session_id_suffix=self.session_id_suffix_for(self.state),
             server_location={"latitude": self.settings.latitude, "longitude": self.settings.longitude,
                              "location_revision": self.state.location_revision},
@@ -1637,13 +1673,13 @@ class BrowserAcceptanceTests(unittest.TestCase):
             self.diagnostic_failure(
                 f"manual save failed: revision={self.state.location_revision}; "
                 f"server_location=({self.settings.latitude},{self.settings.longitude}); "
-                f"session_id_suffix={self.session_id_suffix_for(self.state)}; "
-                f"location_post={location_post!r}; response_event_set={location_response.is_set()}; "
+                f"session_id_suffix={self.session_id_suffix_for(self.state)}; response={response_data!r}; "
+                f"committed_state={observed_state!r}; "
                 f"page_errors={self.page_errors!r}; button_disabled={page.locator('#location-save').is_disabled()}"
             ),
         )
         page.evaluate("window.__pendingGeolocationSuccess({coords:{latitude:35,longitude:-120,accuracy:5}})")
-        page.wait_for_timeout(100)
+        page.wait_for_function("() => document.getElementById('location-latitude').value === '10.000000' && document.getElementById('location-longitude').value === '20.000000'")
         self.assertEqual((self.settings.latitude, self.settings.longitude), (10, 20))
         self.assertEqual(page.evaluate("localStorage.getItem('overhead-location-mode-v1')"), "manual")
         self.assertEqual(self.page_errors, [])
@@ -1768,10 +1804,13 @@ class BrowserAcceptanceTests(unittest.TestCase):
         with self.sessions.lock:
             self.sessions.next_acquisition_at = 0
         self.state.payload.update({"tracking_active": True, "tracking_query": "TST703", "tracking_resolved_callsign": "TST703"})
-        page.locator("#location-save").click()
-        deadline = time.monotonic() + 4
-        while time.monotonic() < deadline and self.state.location_revision == revision_before_location:
-            time.sleep(0.025)
+        with page.expect_response(
+            lambda response: response.url.split("?", 1)[0] == self.base_url + "/location"
+        ) as location_response:
+            page.locator("#location-save").click()
+        response = location_response.value
+        self.assertEqual(response.status, 200)
+        self.assertTrue(response.json()["saved"])
         self.assertGreaterEqual(self.state.location_revision, revision_before_location + 1)
         # This is the same covered geographic area, so a fresh shared-cache hit
         # is valid and should not require an additional provider request.

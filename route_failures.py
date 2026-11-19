@@ -8,6 +8,7 @@ import math
 import sqlite3
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,14 @@ class RouteFailureLog:
                     PRIMARY KEY (flight_key, lookup_id)
                 )
             """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS diagnostics (
+                    flight_key TEXT NOT NULL, event_id TEXT NOT NULL,
+                    timestamp_utc TEXT NOT NULL, event TEXT NOT NULL,
+                    details TEXT NOT NULL,
+                    PRIMARY KEY (flight_key, event_id)
+                )
+            """)
             return connection
         except (OSError, sqlite3.Error):
             connection.close()
@@ -92,6 +101,20 @@ class RouteFailureLog:
                 value = candidate.get(key)
                 if isinstance(value, (int, float)) and math.isfinite(float(value)) and value >= 0:
                     attempt[key] = float(value) if isinstance(value, float) else int(value)
+            if "geographical_validation_passed" in candidate and isinstance(
+                candidate["geographical_validation_passed"], bool,
+            ):
+                attempt["geographical_validation_passed"] = candidate["geographical_validation_passed"]
+            if isinstance(candidate.get("validation"), dict):
+                attempt["validation"] = {
+                    key: cls._text(candidate["validation"].get(key))
+                    for key in ("reason", "basis")
+                    if key in candidate["validation"]
+                }
+                for key in ("direct_nm", "from_origin_nm", "to_destination_nm", "nearest_endpoint_nm", "route_excess_nm", "allowed_excess_nm"):
+                    value = candidate["validation"].get(key)
+                    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                        attempt["validation"][key] = round(float(value), 1)
             attempt["callsign"] = cls._identifier(candidate.get("callsign"))
             status = candidate.get("http_status")
             if isinstance(status, int):
@@ -105,6 +128,8 @@ class RouteFailureLog:
                  **({"error": cls._text(request["error"])} if request.get("error") else {})}
                 for request in candidate.get("requests", [])[:16] if isinstance(request, dict)
             ] if isinstance(candidate.get("requests"), list) else []
+            attempt["requested"] = bool(candidate.get("requested"))
+            attempt["skipped"] = bool(candidate.get("skipped"))
             raw = candidate.get("raw")
             if isinstance(raw, dict):
                 attempt["airports"] = {
@@ -134,6 +159,7 @@ class RouteFailureLog:
             )
         """, (self.max_records,))
         connection.execute("DELETE FROM attempts WHERE flight_key NOT IN (SELECT flight_key FROM flights)")
+        connection.execute("DELETE FROM diagnostics WHERE flight_key NOT IN (SELECT flight_key FROM flights)")
 
     def observe(self, plane: dict[str, Any], route: dict[str, Any],
                 debug: dict[str, Any], now: float | None = None) -> None:
@@ -147,6 +173,101 @@ class RouteFailureLog:
                 if current - self._last_error_at >= 60:
                     LOGGER.error("Route failure history unavailable (%s)", type(exc).__name__)
                     self._last_error_at = current
+
+    def record_event(self, plane: dict[str, Any], event: str, details: dict[str, Any] | None = None,
+                     now: float | None = None) -> None:
+        """Persist a bounded retry/decision diagnostic without counting a provider request."""
+        with self._lock:
+            try:
+                self._record_event(plane, event, details or {}, time.time() if now is None else now)
+            except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+                current = time.monotonic()
+                if current - self._last_error_at >= 60:
+                    LOGGER.error("Route failure history unavailable (%s)", type(exc).__name__)
+                    self._last_error_at = current
+
+    def _record_event(self, plane: dict[str, Any], event: str,
+                      details: dict[str, Any], now: float) -> None:
+        stamp = datetime.fromtimestamp(now, timezone.utc).isoformat()
+        operating_date = stamp[:10]
+        callsign = self._identifier(plane.get("flight"))
+        registration = "".join(character for character in str(plane.get("r") or "").upper()
+                               if character in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-")[:32]
+        icao_hex = self._identifier(plane.get("hex"))
+        if not (callsign or registration or icao_hex):
+            return
+        key = f"{operating_date}|{callsign}|{icao_hex or registration}"
+        safe_event = self._text(event) or "decision"
+        safe_details = self._safe_details(details)
+        encoded = json.dumps(safe_details, separators=(",", ":"), sort_keys=True)
+        if len(encoded.encode("utf-8")) > 8192:
+            safe_details = {"truncated": True, "summary": self._text(details.get("decision") or event)}
+            encoded = json.dumps(safe_details, separators=(",", ":"), sort_keys=True)
+        event_id = uuid.uuid4().hex
+        connection = self._connect()
+        try:
+            with connection:
+                self._prune(connection, now)
+                existing = connection.execute("SELECT 1 FROM flights WHERE flight_key=?", (key,)).fetchone()
+                resolved = bool(details.get("resolved"))
+                if existing is None and resolved:
+                    return
+                recent = connection.execute(
+                    "SELECT timestamp_utc FROM diagnostics WHERE flight_key=? AND event=? "
+                    "ORDER BY timestamp_utc DESC,rowid DESC LIMIT 1",
+                    (key, safe_event),
+                ).fetchone()
+                if recent is not None:
+                    last_event_at = datetime.fromisoformat(recent["timestamp_utc"]).timestamp()
+                    if 0 <= now - last_event_at < 30:
+                        return
+                if existing is None:
+                    connection.execute("""
+                        INSERT INTO flights (flight_key, operating_date, callsign, registration,
+                            icao_hex, first_failure_utc, last_seen_utc, last_seen_epoch,
+                            classification, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'missing_both', 'unresolved')
+                    """, (key, operating_date, callsign, registration, icao_hex, stamp, stamp, now))
+                else:
+                    connection.execute("UPDATE flights SET last_seen_utc=?,last_seen_epoch=? WHERE flight_key=?",
+                                       (stamp, now, key))
+                connection.execute("INSERT OR IGNORE INTO diagnostics VALUES (?, ?, ?, ?, ?)",
+                                   (key, event_id, stamp, safe_event, encoded))
+                connection.execute("""
+                    DELETE FROM diagnostics WHERE flight_key=? AND event_id NOT IN (
+                        SELECT event_id FROM diagnostics WHERE flight_key=?
+                        ORDER BY timestamp_utc DESC, rowid DESC LIMIT ?
+                    )
+                """, (key, key, self.history_limit * 4))
+                self._prune(connection, now)
+        finally:
+            connection.close()
+
+    @classmethod
+    def _safe_details(cls, value: Any, depth: int = 0) -> Any:
+        """Keep diagnostic JSON bounded and omit coordinates/session-like fields."""
+        if depth >= 5:
+            return "[truncated]"
+        if isinstance(value, dict):
+            result = {}
+            for key, item in list(value.items())[:12]:
+                name = str(key)[:64]
+                if any(token in name.casefold() for token in (
+                    "latitude", "longitude", "coordinates", "session", "visitor", "location",
+                    "aircraft_position", "plane_position", "position", "private_ip",
+                )):
+                    continue
+                result[name] = cls._safe_details(item, depth + 1)
+            return result
+        if isinstance(value, list):
+            return [cls._safe_details(item, depth + 1) for item in value[:12]]
+        if isinstance(value, str):
+            return cls._text(value)
+        if isinstance(value, (bool, int)) or value is None:
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        return cls._text(value)
 
     def _observe(self, plane: dict[str, Any], route: dict[str, Any],
                  debug: dict[str, Any], now: float) -> None:
@@ -163,6 +284,7 @@ class RouteFailureLog:
         classification = ("missing_both" if not origin and not destination else
                           "missing_origin" if not origin else "missing_destination" if not destination else "")
         attempts = self._attempts(debug)
+        diagnostics = self._attempts({"attempts": debug.get("diagnostic_attempts", [])})
         requested = [attempt for attempt in attempts if attempt.get("requested")]
         alternative = self._identifier(debug.get("alternative_callsign"))
         fallback = bool(alternative and any(attempt["callsign"] == alternative for attempt in requested))
@@ -213,7 +335,13 @@ class RouteFailureLog:
                             if isinstance(debug.get("retry_in_seconds"), (int, float))
                             and math.isfinite(float(debug["retry_in_seconds"])) else None
                         ),
+                        "retry_delay_seconds": (
+                            max(0, int(debug["retry_delay_seconds"]))
+                            if isinstance(debug.get("retry_delay_seconds"), (int, float))
+                            and math.isfinite(float(debug["retry_delay_seconds"])) else None
+                        ),
                         "attempts": attempts,
+                        "diagnostic_attempts": diagnostics,
                     })))
                     if cursor.rowcount:
                         connection.execute("""
@@ -244,9 +372,18 @@ class RouteFailureLog:
                     record = dict(row)
                     record["history"] = [
                         {"timestamp_utc": attempt["timestamp_utc"], "failed": bool(attempt["failed"]),
-                         **json.loads(attempt["details"])}
+                         **json.loads(attempt["details"]),
+                         "diagnostic_attempts": json.loads(attempt["details"]).get("diagnostic_attempts", [])}
                         for attempt in connection.execute(
                             "SELECT * FROM attempts WHERE flight_key = ? ORDER BY timestamp_utc, rowid",
+                            (row["flight_key"],),
+                        )
+                    ]
+                    record["diagnostics"] = [
+                        {"timestamp_utc": event["timestamp_utc"], "event": event["event"],
+                         **json.loads(event["details"])}
+                        for event in connection.execute(
+                            "SELECT * FROM diagnostics WHERE flight_key=? ORDER BY timestamp_utc,rowid",
                             (row["flight_key"],),
                         )
                     ]

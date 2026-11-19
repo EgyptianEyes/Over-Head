@@ -1612,7 +1612,7 @@ class OverHeadTests(unittest.TestCase):
             )
 
         self.assertIsNone(state.last_enrichment_future)
-        self.assertEqual(state.payload["route_resolution_status"], "unavailable")
+        self.assertEqual(state.payload["route_resolution_status"], "queued")
         self.assertTrue(tracker.snapshot()["active"])
         self.assertEqual(tracker.snapshot()["query"], "BAW49N")
 
@@ -1651,10 +1651,10 @@ class OverHeadTests(unittest.TestCase):
             plane = {"hex": "406b82", "flight": "BAW5", "r": "G-YMMO", "lat": 51, "lon": 0}
             key = store._cache_key(plane)
             store._failures[key] = 1000
-            with patch("monitor.time.time", return_value=1000 + monitor.ROUTE_FAILURE_RETRY_SECONDS - 1):
+            with patch("monitor.time.time", return_value=1000 + monitor.ROUTE_RETRY_BASE_SECONDS - 1):
                 self.assertEqual(store.get(plane), {})
             self.assertEqual(store.calls, 0)
-            with patch("monitor.time.time", return_value=1000 + monitor.ROUTE_FAILURE_RETRY_SECONDS + 1):
+            with patch("monitor.time.time", return_value=1000 + monitor.ROUTE_RETRY_BASE_SECONDS + 1):
                 self.assertEqual(store.get(plane), {})
             self.assertEqual(store.calls, 3)
 

@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timezone
@@ -7,7 +8,10 @@ from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
-from monitor import FlightRouteStore, FlightTrackingState, FrameState, VisitorSessionStore, update_state
+from monitor import (
+    FlightRouteStore, FlightTrackingState, FrameState, VisitorSessionStore,
+    schedule_route_retry, update_state,
+)
 from overhead import Settings
 import route_failures
 from route_failures import RouteFailureLog, report
@@ -189,6 +193,306 @@ class RouteFailureLogTests(unittest.TestCase):
             with patch.object(self.log, "_connect", side_effect=OSError("disk unavailable")):
                 self.log.observe(self.plane, {}, self.debug())
         self.assertEqual(self.log.records(), [])
+
+    def test_diagnostic_events_are_bounded_private_and_do_not_count_requests(self):
+        self.log.record_event(self.plane, "retry_deferred_cooldown", {
+            "retry_in_seconds": 15, "provider_cooldown": True,
+            "aircraft_latitude": 51.5, "aircraft_longitude": -0.1,
+            "visitor_session_id": "private", "reason": "standing provider cooling down",
+        }, now=1_800_000_000)
+        record = self.log.records(now=1_800_000_000)[0]
+        self.assertEqual(record["provider_requests"], 0)
+        self.assertEqual(record["failed_attempts"], 0)
+        self.assertEqual(record["diagnostics"][0]["event"], "retry_deferred_cooldown")
+        serialized = json.dumps(record)
+        self.assertNotIn("51.5", serialized)
+        self.assertNotIn("private", serialized)
+
+    def test_resolved_event_without_existing_failure_does_not_create_unresolved_record(self):
+        self.log.record_event(self.plane, "background_lookup_completed", {"resolved": True})
+        self.assertEqual(self.log.records(), [])
+
+    def test_retry_status_respects_backoff_and_first_available_provider(self):
+        routes = FlightRouteStore(self.path.with_name("routes.json"))
+        plane = dict(self.plane, lat=51.5, lon=-0.1)
+        routes._failures[routes._cache_key(plane)] = 1000
+        routes._failure_counts[routes._cache_key(plane)] = 2
+        routes._adsblol_disabled_until.update({"standing": 1400, "api": 1100})
+        routes._flightaware_disabled_until = 2000
+        routes.api_key = "configured"
+        status = routes.retry_status(plane, now=1000)
+        self.assertFalse(status["eligible"])
+        self.assertEqual(status["retry_at_epoch"], 1120)
+        self.assertEqual(status["retry_in_seconds"], 120)
+        self.assertTrue(routes.retry_status(plane, now=1120)["eligible"])
+
+    def test_retry_waits_for_all_usable_provider_cooldowns(self):
+        routes = FlightRouteStore(self.path.with_name("cooldown-routes.json"))
+        plane = dict(self.plane, lat=51.5, lon=-0.1)
+        key = routes._cache_key(plane)
+        routes._failures[key] = 1000
+        routes._failure_counts[key] = 1
+        routes._adsblol_disabled_until.update({"standing": 1100, "api": 1080})
+        status = routes.retry_status(plane, now=1050)
+        self.assertFalse(status["eligible"])
+        self.assertEqual(status["retry_at_epoch"], 1080)
+        self.assertEqual(status["retry_in_seconds"], 30)
+
+    def test_retry_status_reports_unusable_aircraft_provider_set(self):
+        routes = FlightRouteStore(self.path.with_name("unsupported-routes.json"))
+        plane = {"hex": "0d0001", "lat": 51.5, "lon": -0.1}
+        key = routes._cache_key(plane)
+        routes._failures[key] = 1000
+        routes._failure_counts[key] = 1
+        status = routes.retry_status(plane, now=1000)
+        self.assertFalse(status["provider_available"])
+
+    def test_provider_cooldown_and_geographical_rejection_are_recorded_as_diagnostics(self):
+        class Response(BytesIO):
+            status = 200
+
+            def __init__(self, value):
+                super().__init__(json.dumps(value).encode())
+
+        routes = FlightRouteStore(self.path.with_name("provider-events.json"))
+        routes._adsblol_disabled_until["standing"] = time.time() + 60
+        plane = dict(self.plane, lat=51.5, lon=-0.1)
+        with patch.object(routes, "_adsblol_routeset", return_value={}), \
+             patch.object(routes, "_adsblol", return_value={}), \
+             patch("monitor.urllib.request.urlopen", return_value=Response({
+                 "airport_codes": "JFK-SYD", "_airports": [],
+             })):
+            routes.get(plane)
+        debug = routes._current_lookup_debug()
+        diagnostic_names = [item.get("source") for item in debug.get("diagnostic_attempts", [])]
+        self.assertIn("ADSB.lol standing route", diagnostic_names)
+        routes._lookup_local.diagnostics = []
+        key = routes._cache_key(plane)
+        routes._failures.pop(key, None)
+        routes._failure_counts.pop(key, None)
+        with patch.object(routes, "_adsblol_standing", return_value={}), \
+             patch.object(routes, "_adsblol_routeset", return_value={
+                 "airport_codes": "JFK-SYD", "_airports": [],
+             }), \
+             patch.object(routes, "_adsblol", return_value={}), \
+             patch.object(routes, "_normalise_routeset", return_value={
+                 "route": "JFK to SYD", "origin": "JFK", "destination": "SYD",
+             }), \
+             patch.object(routes, "_plausibility", return_value=(False, {"reason": "outside route corridor"})):
+            routes.get(plane)
+        debug = routes._current_lookup_debug()
+        self.assertTrue(any(
+            item.get("geographical_validation_passed") is False
+            for item in debug.get("diagnostic_attempts", [])
+        ))
+
+    def test_background_retry_runs_route_only_and_publishes_validated_recovery(self):
+        class FakeRoutes:
+            def __init__(self):
+                self.calls = 0
+
+            def retry_status(self, _plane):
+                return {"eligible": True, "retry_in_seconds": 0, "retry_at_epoch": None}
+
+            def can_lookup(self, _plane):
+                return True
+
+            def get(self, _plane):
+                self.calls += 1
+                return {"route": "LHR to MEX", "origin": "LHR", "destination": "MEX",
+                        "route_source": "validated provider", "origin_country": "GB",
+                        "destination_country": "MX"}
+
+            def _current_lookup_debug(self):
+                return {"attempts": [{"requested": True, "request_count": 1}], "decision": "validated"}
+
+        state = FrameState()
+        plane = dict(self.plane, lat=51.5, lon=-0.1)
+        with state.lock:
+            state.payload["aircraft_id"] = "0D0001"
+            state.location_revision = 3
+            state.position_observed_at_monotonic = time.monotonic()
+        routes = FakeRoutes()
+        schedule_route_retry(state, routes, plane, 0.01, 3, 0, None, None, None)
+        future = None
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with state.lock:
+                future = state.route_retry_future
+                published = state.payload.get("route")
+            if published:
+                break
+            time.sleep(0.01)
+        if future is not None:
+            future.result(timeout=2)
+        self.assertEqual(routes.calls, 1)
+        self.assertEqual(state.payload["route"], "LHR to MEX")
+        self.assertEqual(state.payload["route_resolution_status"], "resolved")
+
+    def test_retry_is_cancelled_after_selected_identity_changes(self):
+        class FakeRoutes:
+            def retry_status(self, _plane):
+                return {"eligible": True, "retry_in_seconds": 0, "retry_at_epoch": None}
+
+            def get(self, _plane):
+                raise AssertionError("obsolete selection must not trigger a lookup")
+
+        state = FrameState()
+        plane = dict(self.plane, lat=51.5, lon=-0.1)
+        with state.lock:
+            state.payload["aircraft_id"] = "0D0001"
+            state.position_observed_at_monotonic = time.monotonic()
+        schedule_route_retry(state, FakeRoutes(), plane, 0.05, 0, 0, None, None, None)
+        with state.lock:
+            state.payload["aircraft_id"] = "0D0002"
+        timer = state.route_retry_timer
+        if timer is not None:
+            timer.join(timeout=1)
+        self.assertEqual(state.payload["aircraft_id"], "0D0002")
+
+    def test_background_retry_is_cancelled_when_viewer_lease_expires(self):
+        class FakeRoutes:
+            def retry_status(self, _plane):
+                return {
+                    "eligible": self.calls == 0,
+                    "retry_in_seconds": 0 if self.calls == 0 else 60,
+                    "retry_at_epoch": None,
+                    "provider_available": True,
+                }
+
+            def can_lookup(self, _plane):
+                return True
+
+            def get(self, _plane):
+                raise AssertionError("inactive viewer must not trigger a lookup")
+
+        class InactiveLease:
+            def active(self):
+                return False
+
+        state = FrameState()
+        plane = dict(self.plane, lat=51.5, lon=-0.1)
+        with state.lock:
+            state.payload["aircraft_id"] = "0D0001"
+            state.position_observed_at_monotonic = time.monotonic()
+        schedule_route_retry(state, FakeRoutes(), plane, 0.01, 0, 0, None, InactiveLease(), None)
+        timer = state.route_retry_timer
+        if timer is not None:
+            timer.join(timeout=1)
+        self.assertEqual(state.route_retry_identity, "")
+
+    def test_background_retry_retries_after_worker_saturation(self):
+        class FakeRoutes:
+            def __init__(self):
+                self.calls = 0
+
+            def retry_status(self, _plane):
+                return {"eligible": True, "retry_in_seconds": 0}
+
+            def can_lookup(self, _plane):
+                return True
+
+            def get(self, _plane):
+                self.calls += 1
+                return {"route": "LHR to MEX", "origin": "LHR", "destination": "MEX"}
+
+            def _current_lookup_debug(self):
+                return {"attempts": []}
+
+        state = FrameState()
+        plane = dict(self.plane, lat=51.5, lon=-0.1)
+        with state.lock:
+            state.payload["aircraft_id"] = "0D0001"
+            state.position_observed_at_monotonic = time.monotonic()
+        routes = FakeRoutes()
+        with patch("monitor._enrichment_slots.acquire", side_effect=[False, True]):
+            schedule_route_retry(state, routes, plane, 0.01, 0, 0, None, None, None)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                with state.lock:
+                    future = state.route_retry_future
+                    resolved = state.payload.get("route_resolution_status") == "resolved"
+                if resolved:
+                    break
+                time.sleep(0.01)
+        self.assertEqual(routes.calls, 1)
+        self.assertEqual(state.payload["route_resolution_status"], "resolved")
+
+    def test_two_visitors_share_one_route_lookup_and_each_publish_recovery(self):
+        routes = FlightRouteStore(self.path.with_name("shared-visitor-routes.json"))
+        provider_calls = []
+        provider_lock = threading.Lock()
+
+        def mocked_routeset(_callsign, _plane):
+            with provider_lock:
+                provider_calls.append("routeset")
+            routes._lookup_local.request_count += 1
+            routes._lookup_local.provider_requests += 1
+            time.sleep(0.05)
+            return {"airport_codes": "LHR-MEX", "_airports": []}
+
+        states = [FrameState(), FrameState()]
+        plane = dict(self.plane, lat=51.5, lon=-0.1)
+        with patch.object(routes, "_adsblol_standing", return_value={}), \
+             patch.object(routes, "_adsblol_routeset", side_effect=mocked_routeset), \
+             patch.object(routes, "_normalise_routeset", return_value={
+                 "route": "LHR to MEX", "origin": "LHR", "destination": "MEX",
+                 "route_source": "ADSB.lol routeset", "cached_at": time.time(),
+             }), \
+             patch.object(routes, "_plausibility", return_value=(True, {"reason": "valid"})):
+            for state in states:
+                with state.lock:
+                    state.payload["aircraft_id"] = "0D0001"
+                    state.position_observed_at_monotonic = time.monotonic()
+                schedule_route_retry(state, routes, plane, 0.01, 0, 0, None, None, None)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if all(state.payload.get("route_resolution_status") == "resolved" for state in states):
+                    break
+                time.sleep(0.01)
+        self.assertEqual(len(provider_calls), 1)
+        self.assertTrue(all(state.payload.get("route") == "LHR to MEX" for state in states))
+
+    def test_background_provider_failure_reschedules_with_backoff(self):
+        class FailingRoutes:
+            def __init__(self):
+                self.calls = 0
+
+            def retry_status(self, _plane):
+                return {
+                    "eligible": self.calls == 0,
+                    "retry_in_seconds": 0 if self.calls == 0 else 60,
+                    "retry_at_epoch": None,
+                }
+
+            def can_lookup(self, _plane):
+                return True
+
+            def get(self, _plane):
+                self.calls += 1
+                return {}
+
+            def _current_lookup_debug(self):
+                return {"attempts": [{"requested": True, "request_count": 1}],
+                        "decision": "provider returned no route"}
+
+        state = FrameState()
+        plane = dict(self.plane, lat=51.5, lon=-0.1)
+        with state.lock:
+            state.payload["aircraft_id"] = "0D0001"
+            state.position_observed_at_monotonic = time.monotonic()
+        routes = FailingRoutes()
+        schedule_route_retry(state, routes, plane, 0.01, 0, 0, None, None, None)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with state.lock:
+                timer = state.route_retry_timer
+                status = state.payload.get("route_resolution_status")
+            if routes.calls and timer is not None and status == "unresolved":
+                break
+            time.sleep(0.01)
+        self.assertEqual(routes.calls, 1)
+        self.assertIsNotNone(state.route_retry_timer)
 
     def test_report_and_csv_include_summary_and_attempt_history(self):
         now = time.time()

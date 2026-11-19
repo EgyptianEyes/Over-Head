@@ -85,6 +85,8 @@ ADSLOL_HEX_URL = "https://api.adsb.lol/v2/hex/{hex_code}"
 OURAIRPORTS_URL = "https://davidmegginson.github.io/ourairports-data/airports.csv"
 ROUTE_CACHE_TTL_SECONDS = 900
 ROUTE_FAILURE_RETRY_SECONDS = 300
+ROUTE_RETRY_BASE_SECONDS = 60
+ROUTE_RETRY_MAX_SECONDS = 300
 ROUTE_IDENTITY_LOCK_STRIPES = 64
 OURAIRPORTS_TTL_SECONDS = 7 * 24 * 60 * 60
 API_HEALTH_INTERVAL_SECONDS = 30
@@ -1304,6 +1306,7 @@ class FlightRouteStore:
         self._debug_lock = threading.Lock()
         self._identity_locks = tuple(threading.Lock() for _ in range(ROUTE_IDENTITY_LOCK_STRIPES))
         self._failures: dict[str, float] = {}
+        self._failure_counts: dict[str, int] = {}
         self._flightaware_disabled_until = 0.0
         # The standing-data host and api.adsb.lol are separate services. Keep
         # their cooldowns isolated while sharing one pause across the two API
@@ -1475,6 +1478,7 @@ class FlightRouteStore:
         self._lookup_local.aeroapi_requests.append(event)
         try:
             self._lookup_local.request_count = getattr(self._lookup_local, "request_count", 0) + 1
+            self._lookup_local.provider_requests = getattr(self._lookup_local, "provider_requests", 0) + 1
             with urllib.request.urlopen(request, timeout=8) as response:
                 self._lookup_local.http_status = getattr(response, "status", None)
                 event["http_status"] = self._lookup_local.http_status
@@ -1587,6 +1591,13 @@ class FlightRouteStore:
                     requests[-1]["error"] = type(exc).__name__
                     if isinstance(exc, urllib.error.HTTPError):
                         requests[-1]["http_status"] = exc.code
+                diagnostic = {
+                    "source": "FlightAware AeroAPI", "requested": bool(self._lookup_local.request_count),
+                    "error": type(exc).__name__,
+                }
+                if isinstance(exc, urllib.error.HTTPError):
+                    diagnostic.update(http_status=int(exc.code), error=str(exc.code))
+                self._record_diagnostic(diagnostic)
                 # Registration lookup failure should not suppress a separate
                 # callsign lookup that may identify the active flight.
                 continue
@@ -1670,6 +1681,7 @@ class FlightRouteStore:
             method="POST",
         )
         self._lookup_local.request_count = getattr(self._lookup_local, "request_count", 0) + 1
+        self._lookup_local.provider_requests = getattr(self._lookup_local, "provider_requests", 0) + 1
         with urllib.request.urlopen(request, timeout=6) as response:
             self._lookup_local.http_status = getattr(response, "status", None)
             body = response.read()
@@ -1692,6 +1704,7 @@ class FlightRouteStore:
         )
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
         self._lookup_local.request_count = getattr(self._lookup_local, "request_count", 0) + 1
+        self._lookup_local.provider_requests = getattr(self._lookup_local, "provider_requests", 0) + 1
         with urllib.request.urlopen(request, timeout=6) as response:
             self._lookup_local.http_status = getattr(response, "status", None)
             body = response.read()
@@ -1712,6 +1725,7 @@ class FlightRouteStore:
         )
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         self._lookup_local.request_count = getattr(self._lookup_local, "request_count", 0) + 1
+        self._lookup_local.provider_requests = getattr(self._lookup_local, "provider_requests", 0) + 1
         with urllib.request.urlopen(request, timeout=6) as response:
             self._lookup_local.http_status = getattr(response, "status", None)
             payload = json.load(response)
@@ -1817,10 +1831,54 @@ class FlightRouteStore:
             self._prune_failures(now)
             return self._failures.get(key, 0.0)
 
+    def retry_status(self, plane: dict[str, Any] | None, now: float | None = None) -> dict[str, Any]:
+        """Return process-local negative-cache eligibility for an aircraft."""
+        key = self._cache_key(plane)
+        callsign = self.callsign(plane)
+        provider_groups = []
+        if callsign and ADSLOL_STANDING_CALLSIGN_RE.fullmatch(callsign):
+            provider_groups.append("standing")
+        if callsign and self._plane_position(plane) is not None:
+            provider_groups.append("api")
+        if self.api_key and (callsign or self.registration(plane)):
+            provider_groups.append("flightaware")
+        available_provider = bool(provider_groups)
+        current = time.time() if now is None else float(now)
+        with self._lock:
+            self._prune_failures(current)
+            failed_at = self._failures.get(key, 0.0)
+            count = self._failure_counts.get(key, 0)
+        delay = min(
+            ROUTE_RETRY_MAX_SECONDS,
+            ROUTE_RETRY_BASE_SECONDS * (2 ** max(0, count - 1)),
+        )
+        retry_at = failed_at + delay if failed_at else current
+        with self._lock:
+            provider_deadlines = []
+            if "standing" in provider_groups:
+                provider_deadlines.append(self._adsblol_disabled_until["standing"])
+            if "api" in provider_groups:
+                provider_deadlines.append(self._adsblol_disabled_until["api"])
+            if "flightaware" in provider_groups:
+                provider_deadlines.append(self._flightaware_disabled_until)
+        # Providers are tried in fallback order. Wait only if every available
+        # provider is cooling down; once one opens, get() may still use the rest.
+        provider_retry_at = min(provider_deadlines, default=current)
+        retry_at = max(retry_at, provider_retry_at)
+        return {
+            "eligible": (not failed_at or current >= failed_at + delay) and current >= provider_retry_at,
+            "retry_at_epoch": retry_at,
+            "retry_in_seconds": max(0, int(math.ceil(max(0.0, retry_at - current)))),
+            "failure_count": count,
+            "retry_delay_seconds": delay,
+            "provider_available": available_provider,
+        }
+
     def _remember_route(self, key: str, route: dict[str, Any]) -> None:
         with self._lock:
             self._records[key] = dict(route)
             self._failures.pop(key, None)
+            self._failure_counts.pop(key, None)
         try:
             self._save()
         except OSError:
@@ -1832,11 +1890,15 @@ class FlightRouteStore:
         for key, failed_at in list(self._failures.items()):
             if failed_at <= expired_before:
                 self._failures.pop(key, None)
+                self._failure_counts.pop(key, None)
 
     def _set_debug(self, debug: dict[str, Any]) -> None:
         started_at = debug.pop("_started_at", None)
         if started_at is not None:
             debug["elapsed_seconds"] = round(max(0.0, time.monotonic() - started_at), 3)
+        debug["provider_request_count"] = int(getattr(self._lookup_local, "provider_requests", 0))
+        if getattr(self._lookup_local, "diagnostics", None):
+            debug["diagnostic_attempts"] = list(self._lookup_local.diagnostics[:64])
         for attempt in debug.get("attempts", []):
             if attempt.get("source") == "FlightAware AeroAPI" and attempt.get("requested"):
                 attempt["requests"] = json.loads(json.dumps(
@@ -1854,7 +1916,32 @@ class FlightRouteStore:
         self._lookup_local.debug = snapshot
 
     def _current_lookup_debug(self) -> dict[str, Any]:
-        return getattr(self._lookup_local, "debug", {})
+        debug = dict(getattr(self._lookup_local, "debug", {}) or {})
+        if debug:
+            debug["diagnostic_attempts"] = self._diagnostic_attempts(debug)
+            return debug
+        return {"attempts": [], "diagnostic_attempts": list(getattr(self._lookup_local, "diagnostics", []))}
+
+    def _record_diagnostic(self, attempt: dict[str, Any]) -> None:
+        diagnostics = getattr(self._lookup_local, "diagnostics", None)
+        if diagnostics is None:
+            diagnostics = []
+            self._lookup_local.diagnostics = diagnostics
+        if len(diagnostics) < 64:
+            diagnostics.append(dict(attempt))
+
+    def _diagnostic_attempts(self, debug: dict[str, Any]) -> list[dict[str, Any]]:
+        attempts = list(debug.get("attempts") or [])
+        existing = {
+            (item.get("source"), item.get("callsign"), item.get("reason"), item.get("requested"))
+            for item in attempts if isinstance(item, dict)
+        }
+        for item in getattr(self._lookup_local, "diagnostics", []):
+            key = (item.get("source"), item.get("callsign"), item.get("reason"), item.get("requested"))
+            if key not in existing:
+                attempts.append(item)
+                existing.add(key)
+        return attempts[:96]
 
     def debug_snapshot(self, plane: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._debug_lock:
@@ -1862,7 +1949,8 @@ class FlightRouteStore:
             if plane is not None:
                 identity_key = f"{self.callsign(plane)}|{self.registration(plane)}"
                 debug = self._debug_by_identity.get(identity_key, debug)
-            return json.loads(json.dumps(debug, default=str))
+            snapshot = json.loads(json.dumps(debug, default=str))
+        return snapshot
 
     def cached_route(self, plane: dict[str, Any] | None) -> dict[str, Any]:
         callsign = self.callsign(plane)
@@ -1918,6 +2006,8 @@ class FlightRouteStore:
         self._lookup_local.request_count = 0
         self._lookup_local.http_status = None
         self._lookup_local.aeroapi_requests = []
+        self._lookup_local.diagnostics = []
+        self._lookup_local.provider_requests = 0
         callsign = self.callsign(plane)
         registration = self.registration(plane)
         position = self._plane_position(plane)
@@ -1968,12 +2058,25 @@ class FlightRouteStore:
                     self._set_debug(debug)
                     return cached
                 self._set_debug(debug)
+            retry_status = self.retry_status(plane)
             failed_at = self._failed_at(key, time.time())
-            if failed_at and time.time() - failed_at < ROUTE_FAILURE_RETRY_SECONDS:
-                debug["retry_in_seconds"] = max(0, int(math.ceil(
-                    ROUTE_FAILURE_RETRY_SECONDS - (time.time() - failed_at)
-                )))
+            if not retry_status["eligible"]:
+                debug.update(retry_status)
+                self._record_diagnostic({
+                    "source": "negative cache", "requested": False, "skipped": True,
+                    "reason": "route retry backoff",
+                    "retry_in_seconds": retry_status["retry_in_seconds"],
+                })
                 debug["decision"] = f"Recent route lookup failed; cooldown {debug['retry_in_seconds']}s, waiting before retry"
+                debug["attempts"].append({
+                    "source": "negative cache",
+                    "callsign": callsign,
+                    "requested": False,
+                    "skipped": True,
+                    "reason": "route retry backoff",
+                    "retry_in_seconds": debug["retry_in_seconds"],
+                    "retry_delay_seconds": debug["retry_delay_seconds"],
+                })
                 self._set_debug(debug)
                 return {}
 
@@ -2058,12 +2161,40 @@ class FlightRouteStore:
                     debug["attempts"].append(attempt)
                     cooldown_key = "standing" if source_name == "ADSB.lol standing route" else "api"
                     if time.time() < self._adsblol_disabled_until[cooldown_key]:
-                        attempt.update(skipped=True, reason="ADSB.lol provider cooldown")
+                        self._record_diagnostic({
+                            "source": source_name, "requested": False, "skipped": True,
+                            "reason": "provider cooldown",
+                            "cooldown_seconds": max(0, int(math.ceil(
+                                self._adsblol_disabled_until[cooldown_key] - time.time()
+                            ))),
+                        })
+                        attempt.update(
+                            skipped=True,
+                            requested=False,
+                            reason="ADSB.lol provider cooldown",
+                            cooldown_seconds=max(0, int(math.ceil(
+                                self._adsblol_disabled_until[cooldown_key] - time.time()
+                            ))),
+                        )
                         continue
+                    self._lookup_local.http_status = None
+                    raw: dict[str, Any] = {}
                     try:
                         self._lookup_local.request_count = 0
                         self._lookup_local.http_status = None
                         raw = lookup(lookup_callsign, plane)
+                    except urllib.error.HTTPError as exc:
+                        attempt.update(error=type(exc).__name__, reason="provider request failed")
+                        attempt["http_status"] = int(exc.code)
+                        retry = _retry_after_seconds(exc.headers.get("Retry-After") if exc.headers else None)
+                        if exc.code in (403, 429) or retry is not None:
+                            minimum = 300 if exc.code == 403 else ROUTE_FAILURE_RETRY_SECONDS
+                            self._adsblol_disabled_until[cooldown_key] = time.time() + max(minimum, retry or 0)
+                        self._record_diagnostic({
+                            "source": source_name, "requested": bool(self._lookup_local.request_count),
+                            "http_status": int(exc.code), "error": type(exc).__name__,
+                            "reason": "provider request failed",
+                        })
                     except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
                         attempt.update(error=type(exc).__name__, reason="provider request failed")
                         if isinstance(exc, urllib.error.HTTPError):
@@ -2072,14 +2203,35 @@ class FlightRouteStore:
                             if exc.code in (403, 429) or retry is not None:
                                 minimum = 300 if exc.code == 403 else ROUTE_FAILURE_RETRY_SECONDS
                                 self._adsblol_disabled_until[cooldown_key] = time.time() + max(minimum, retry or 0)
+                        diagnostic = {
+                            "source": source_name,
+                            "requested": bool(self._lookup_local.request_count),
+                            "error": type(exc).__name__,
+                            "reason": "provider request failed",
+                        }
+                        if isinstance(exc, urllib.error.HTTPError):
+                            diagnostic["http_status"] = int(exc.code)
+                            diagnostic["error"] = str(exc.code)
+                        self._record_diagnostic(diagnostic)
                         continue
-                    finally:
+                    else:
+                        attempt["requested"] = bool(self._lookup_local.request_count)
+                        attempt["request_count"] = self._lookup_local.request_count
+                        if self._lookup_local.http_status is not None:
+                            attempt["http_status"] = self._lookup_local.http_status
+                    if "requested" not in attempt:
                         attempt["requested"] = bool(self._lookup_local.request_count)
                         attempt["request_count"] = self._lookup_local.request_count
                         if self._lookup_local.http_status is not None:
                             attempt["http_status"] = self._lookup_local.http_status
                     if not raw:
                         attempt["reason"] = "provider returned no route data"
+                        self._record_diagnostic({
+                            "source": source_name,
+                            "requested": bool(attempt.get("requested")),
+                            "reason": attempt["reason"],
+                            "http_status": attempt.get("http_status"),
+                        })
                         continue
                     route = self._normalise_routeset(raw, source_name)
                     airport_codes = (
@@ -2105,6 +2257,12 @@ class FlightRouteStore:
                     }
                     if not route:
                         attempt["reason"] = f"{source_name} returned no usable airport pair"
+                        self._record_diagnostic({
+                            "source": source_name,
+                            "requested": bool(attempt.get("requested")),
+                            "reason": attempt["reason"],
+                            "http_status": attempt.get("http_status"),
+                        })
                         continue
                     plausible, detail = self._plausibility(route, plane)
                     attempt.update(
@@ -2117,11 +2275,34 @@ class FlightRouteStore:
                         debug["decision"] = f"Accepted {source_name} after independent live-position validation"
                         self._set_debug(debug)
                         return route
+                    self._record_diagnostic({
+                        "source": source_name,
+                        "requested": bool(attempt.get("requested")),
+                        "reason": detail.get("reason", "geographical validation rejected route"),
+                        "geographical_validation_passed": False,
+                        "validation": detail,
+                    })
 
+            failed_at = time.time()
             with self._lock:
-                self._prune_failures(time.time())
-                self._failures[key] = time.time()
-            debug["decision"] = "No trustworthy route. Display N/A to N/A."
+                self._prune_failures(failed_at)
+                self._failures[key] = failed_at
+                failure_count = self._failure_counts.get(key, 0) + 1
+                self._failure_counts[key] = failure_count
+            retry_delay = min(
+                ROUTE_RETRY_MAX_SECONDS,
+                ROUTE_RETRY_BASE_SECONDS * (2 ** max(0, failure_count - 1)),
+            )
+            debug.update({
+                "retry_delay_seconds": retry_delay,
+                "retry_at_epoch": failed_at + retry_delay,
+                "retry_in_seconds": retry_delay,
+                "failure_count": failure_count,
+                "eligible": False,
+                "decision": "No trustworthy route. Display N/A to N/A.",
+            })
+            if getattr(self._lookup_local, "diagnostics", None):
+                debug["diagnostic_attempts"] = list(self._lookup_local.diagnostics[:64])
             self._set_debug(debug)
             return {}
 
@@ -3756,6 +3937,14 @@ PAGE = b"""<!doctype html>
       button.textContent=busy?'LOCATING...':'USE MY CURRENT LOCATION';
       button.setAttribute('aria-busy',String(busy));
     }
+        function noteManualLocationEdit(){
+            // Editing coordinates is an explicit choice that supersedes any
+            // outstanding geolocation callback or automatic location POST.
+            locationRequestRevision++;
+            locationLookupInFlight=false;
+            setLocationButtonBusy(false);
+            pendingLocationMode='manual';
+        }
         function applyManualLocation(){
             const latitude=Number(byId('location-latitude').value),longitude=Number(byId('location-longitude').value);
             if(!Number.isFinite(latitude)||!Number.isFinite(longitude)||latitude < -90||latitude > 90||longitude < -180||longitude > 180){
@@ -4329,8 +4518,8 @@ PAGE = b"""<!doctype html>
     byId('settings-location').addEventListener('click',openLocationSelector);
     byId('location-activate').addEventListener('click',()=>useDeviceLocation(true,true));
     byId('location-manual').addEventListener('click',()=>{ locationRequestRevision++; locationLookupInFlight=false; setLocationButtonBusy(false); setLocationMode('manual'); pendingLocationMode='manual'; hideLocationActivation(); setSettings(true); openLocationSelector(); });
-    byId('location-latitude').addEventListener('input',()=>{ locationInputRevision++; });
-    byId('location-longitude').addEventListener('input',()=>{ locationInputRevision++; });
+    byId('location-latitude').addEventListener('input',()=>{ locationInputRevision++; noteManualLocationEdit(); });
+    byId('location-longitude').addEventListener('input',()=>{ locationInputRevision++; noteManualLocationEdit(); });
     byId('location-latitude').addEventListener('change',applyManualLocation);
     byId('location-longitude').addEventListener('change',applyManualLocation);
     byId('location-use-device').addEventListener('click',()=>useDeviceLocation(false,true));
@@ -5085,6 +5274,15 @@ class FrameState:
         self.lock = threading.Lock()
         self.route_failure_log: RouteFailureLog | None = None
         self.last_enrichment_future: concurrent.futures.Future[Any] | None = None
+        self.route_retry_future: concurrent.futures.Future[Any] | None = None
+        self.route_retry_inflight = False
+        self.route_retry_identity = ""
+        self.route_retry_last_event: dict[str, float] = {}
+        self.route_retry_timer: threading.Timer | None = None
+        self.active_lease: ActiveMonitorLease | None = None
+        self.route_retry_busy = False
+        self.route_retry_generation = 0
+        self.route_retry_context: dict[str, Any] | None = None
         self.location_lock = threading.Lock()
         self.location_revision = 0
         self.png = b""
@@ -5149,6 +5347,7 @@ class FrameState:
             "tracking_found": bool(tracking.get("found")),
             "tracking_acquisition_outcome": tracking.get("acquisition_outcome", "waiting"),
             "acquisition_outcome": mode if mode in {"stale", "invalid_data"} else tracking.get("acquisition_outcome", mode),
+            "route_resolution_status": "unavailable" if not plane else "pending",
             "acquisition_interval_seconds": (TRACKING_ACQUISITION_INTERVAL_SECONDS if tracking.get("active") else AUTOMATIC_ACQUISITION_INTERVAL_SECONDS if plane else NORMAL_ACQUISITION_INTERVAL_SECONDS),
             "observation_source": plane.get("source"),
             "observation_timestamp": plane.get("observed_at"),
@@ -6008,21 +6207,153 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
         if automatic_result_to_remember is not None:
             with state.lock:
                 state.last_automatic_tracking_result = automatic_result_to_remember
-    if demo or plane is None:
+    if plane is None:
+        with state.lock:
+            pending_timer = state.route_retry_timer
+            state.route_retry_generation += 1
+            state.route_retry_timer = None
+            state.route_retry_identity = ""
+            state.route_retry_context = None
+            if not state.route_retry_inflight:
+                state.route_retry_busy = False
+        if pending_timer is not None:
+            pending_timer.cancel()
+        return
+    if demo:
         return
 
+    def route_identity() -> str:
+        return aircraft_identity(plane)
+
+    if isinstance(routes, FlightRouteStore):
+        with state.lock:
+            retry_future = state.route_retry_future
+            retry_inflight = state.route_retry_inflight or state.route_retry_busy
+            retry_identity = state.route_retry_identity
+        if retry_future is not None and retry_future.done():
+            with state.lock:
+                if state.route_retry_future is retry_future:
+                    state.route_retry_future = None
+                    if retry_identity == aircraft_identity(plane):
+                        state.route_retry_inflight = False
+                        state.route_retry_busy = False
+            retry_inflight = False
+        if retry_inflight and retry_identity == route_identity():
+            retry_status = routes.retry_status(plane)
+            with state.lock:
+                still_current = (
+                    state.location_revision == location_revision
+                    and str(state.payload.get("aircraft_id") or "") == route_identity()
+                    and (not tracker or int(tracker.snapshot().get("revision") or 0) == tracking_revision)
+                )
+                if still_current:
+                    state.payload["route_resolution_status"] = "cooldown" if not retry_status["eligible"] else "queued"
+                    state.payload["route_retry_in_seconds"] = retry_status["retry_in_seconds"]
+                    state.payload["route_retry_at"] = retry_status["retry_at_epoch"]
+            if not retry_status["eligible"]:
+                schedule_route_retry(
+                    state, routes, plane, max(1.0, retry_status["retry_in_seconds"]),
+                    location_revision, tracking_revision, tracker, state.active_lease, flags,
+                )
+            return
+        retry_status = routes.retry_status(plane)
+        if retry_status["failure_count"] and not retry_status["eligible"]:
+            route_debug = routes.debug_snapshot(plane)
+            with state.lock:
+                still_current = (
+                    state.location_revision == location_revision
+                    and str(state.payload.get("aircraft_id") or "") == route_identity()
+                    and (not tracker or int(tracker.snapshot().get("revision") or 0) == tracking_revision)
+                )
+                if still_current:
+                    state.payload["route_resolution_status"] = "cooldown"
+                    state.payload["route_retry_in_seconds"] = retry_status["retry_in_seconds"]
+                    state.payload["route_retry_at"] = retry_status["retry_at_epoch"]
+            logger = state.route_failure_log
+            if logger is not None:
+                now_mono = time.monotonic()
+                with state.lock:
+                    previous = state.route_retry_last_event.get(route_identity(), 0.0)
+                    record_event = now_mono - previous >= 30.0
+                    if record_event:
+                        state.route_retry_last_event[route_identity()] = now_mono
+                if record_event:
+                    logger.record_event(plane, "retry_deferred_cooldown", {
+                        "retry_eligible_at": retry_status["retry_at_epoch"],
+                        "retry_in_seconds": retry_status["retry_in_seconds"],
+                        "retry_delay_seconds": retry_status["retry_delay_seconds"],
+                        "failure_count": retry_status["failure_count"],
+                        "provider_cooldown": True,
+                        "attempts": route_debug.get("attempts", []),
+                    })
+            schedule_route_retry(
+                state, routes, plane, max(1.0, retry_status["retry_in_seconds"]),
+                location_revision, tracking_revision, tracker, state.active_lease, flags,
+            )
+            return
+        elif retry_status["failure_count"] and retry_status["eligible"]:
+            logger = state.route_failure_log
+            if logger is not None:
+                logger.record_event(plane, "retry_eligible", {
+                    "retry_eligible_at": retry_status["retry_at_epoch"],
+                    "failure_count": retry_status["failure_count"],
+                    "retry_delay_seconds": retry_status["retry_delay_seconds"],
+                })
+
     def mark_route_enrichment_unavailable() -> None:
+        pending_timer = None
         with state.lock:
             if (
                 state.location_revision == location_revision
                 and str(state.payload.get("aircraft_id") or "") == aircraft_identity(plane)
                 and (not tracker or int(tracker.snapshot().get("revision") or 0) == tracking_revision)
             ):
+                pending_timer = state.route_retry_timer
+                state.route_retry_generation += 1
+                state.route_retry_timer = None
+                state.route_retry_identity = ""
+                state.route_retry_context = None
+                if not state.route_retry_inflight:
+                    state.route_retry_busy = False
                 state.payload["route_resolution_status"] = "unavailable"
+        if pending_timer is not None:
+            pending_timer.cancel()
 
-    if not _enrichment_slots.acquire(blocking=False):
+    if isinstance(routes, FlightRouteStore) and not routes.can_lookup(plane):
         mark_route_enrichment_unavailable()
         return
+
+    if not _enrichment_slots.acquire(blocking=False):
+        route_debug = routes.debug_snapshot(plane) if isinstance(routes, FlightRouteStore) else {}
+        retry_status = routes.retry_status(plane) if isinstance(routes, FlightRouteStore) else {}
+        with state.lock:
+            if state.location_revision == location_revision and str(state.payload.get("aircraft_id") or "") == aircraft_identity(plane):
+                state.payload["route_resolution_status"] = "queued"
+                state.payload["route_retry_in_seconds"] = retry_status.get("retry_in_seconds", 1)
+                state.payload["enrichment_status"] = "queued"
+        if state.route_failure_log is not None:
+            state.route_failure_log.record_event(plane, "worker_saturated", {
+                "queued": True, "retry_status": retry_status,
+                "decision": "Route enrichment slot unavailable; retry retained for active selected aircraft",
+            })
+        with state.lock:
+            state.route_retry_busy = False
+            state.route_retry_identity = route_identity()
+        if isinstance(routes, FlightRouteStore):
+            schedule_route_retry(
+                state, routes, plane, 1.0, location_revision,
+                tracking_revision, tracker, state.active_lease, flags,
+            )
+        return
+
+    with state.lock:
+        state.route_retry_inflight = True
+        state.route_retry_busy = True
+        state.route_retry_identity = route_identity()
+        state.route_retry_context = {
+            "plane": dict(plane), "location_revision": location_revision,
+            "tracking_revision": tracking_revision,
+        }
 
     def enrich_and_publish() -> None:
         try:
@@ -6034,6 +6365,16 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
             route_failure_log = state.route_failure_log
             if route_failure_log is not None:
                 route_failure_log.observe(plane, route, route_debug)
+                route_failure_log.record_event(plane, "lookup_completed", {
+                    "resolved": bool(route),
+                        "requested_provider_calls": int(getattr(routes._lookup_local, "provider_requests", 0)),
+                    "decision": route_debug.get("decision", ""),
+                    "retry_eligible_at": route_debug.get("retry_at_epoch"),
+                    "retry_in_seconds": route_debug.get("retry_in_seconds"),
+                    "failure_count": route_debug.get("failure_count"),
+                    "attempts": route_debug.get("attempts", []),
+                    "diagnostic_attempts": route_debug.get("diagnostic_attempts", []),
+                })
             identity = identities.get(plane) or {} if identities is not None else {}
             aircraft_photo = identities.photo_asset(identity, plane) if identities is not None and hasattr(identities, "photo_asset") else None
             aircraft_photo_debug = identities.photo_debug(identity, plane) if identities is not None and hasattr(identities, "photo_debug") else {}
@@ -6080,6 +6421,15 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
                 )
                 with state.lock:
                     state.payload["route_resolution_status"] = "resolved" if route else "unresolved"
+                    state.payload.pop("route_retry_in_seconds", None)
+                    state.payload["route_retry_at"] = route_debug.get("retry_at_epoch") if not route else None
+                if not route:
+                    retry_status = routes.retry_status(plane) if isinstance(routes, FlightRouteStore) else {}
+                    if isinstance(routes, FlightRouteStore) and retry_status:
+                        schedule_route_retry(
+                            state, routes, plane, max(1.0, retry_status["retry_in_seconds"]),
+                            location_revision, tracking_revision, tracker, state.active_lease, flags,
+                        )
         except Exception:
             with state.lock:
                 if state.location_revision == location_revision and state.payload.get("aircraft_id") == aircraft_identity(plane):
@@ -6090,13 +6440,45 @@ def update_state(state: FrameState, settings, demo: bool, logos: LogoStore, iden
         future = _enrichment_executor.submit(enrich_and_publish)
     except RuntimeError:
         _enrichment_slots.release()
-        mark_route_enrichment_unavailable()
+        route_debug = routes.debug_snapshot(plane) if isinstance(routes, FlightRouteStore) else {}
+        if state.route_failure_log is not None:
+            state.route_failure_log.record_event(plane, "executor_rejected", {
+                "queued": True,
+                "decision": "Executor rejected route enrichment; retry retained for active selected aircraft",
+                "retry_eligible_at": route_debug.get("retry_at_epoch"),
+            })
+        with state.lock:
+            state.route_retry_inflight = False
+            if state.location_revision == location_revision and str(state.payload.get("aircraft_id") or "") == aircraft_identity(plane):
+                state.payload["route_resolution_status"] = "queued"
+        if isinstance(routes, FlightRouteStore):
+            schedule_route_retry(
+                state, routes, plane, 1.0, location_revision,
+                tracking_revision, tracker, state.active_lease, flags,
+            )
         return
     with state.lock:
         state.last_enrichment_future = future
+        state.route_retry_future = future
 
     def finish_enrichment(completed: concurrent.futures.Future[Any]) -> None:
         _enrichment_slots.release()
+        with state.lock:
+            state.route_retry_busy = False
+            if state.route_retry_future is completed:
+                state.route_retry_inflight = False
+                state.route_retry_future = None
+                retry_context = state.route_retry_context
+                if state.route_retry_timer is None and retry_context is not None:
+                    still_selected = (
+                        state.location_revision == retry_context["location_revision"]
+                        and str(state.payload.get("aircraft_id") or "")
+                        == aircraft_identity(retry_context["plane"])
+                    )
+                    if not still_selected:
+                        state.route_retry_generation += 1
+                    state.route_retry_identity = ""
+                    state.route_retry_context = None
 
     future.add_done_callback(finish_enrichment)
 
@@ -6188,6 +6570,280 @@ class ActiveMonitorLease:
             return self.activation_revision
 
 
+def schedule_route_retry(
+    state: FrameState,
+    routes: FlightRouteStore,
+    plane: dict[str, Any],
+    delay_seconds: float,
+    location_revision: int,
+    tracking_revision: int,
+    tracker: FlightTrackingState | None,
+    lease: ActiveMonitorLease | None,
+    flags: FlagStore | None,
+) -> None:
+    """Queue a route-only retry while this aircraft remains selected and relevant."""
+    identity = aircraft_identity(plane)
+    if not identity:
+        return
+
+    def retry_context_current() -> bool:
+        with state.lock:
+            valid = (
+                state.location_revision == location_revision
+                and str(state.payload.get("aircraft_id") or "") == identity
+            )
+        return valid and (not tracker or int(tracker.snapshot().get("revision") or 0) == tracking_revision)
+
+    with state.lock:
+        if state.location_revision != location_revision or state.payload.get("aircraft_id") != identity:
+            return
+        existing = state.route_retry_timer
+        existing_identity = state.route_retry_identity
+        if existing is not None and existing.is_alive() and existing_identity == identity:
+            return
+        state.route_retry_generation += 1
+        generation = state.route_retry_generation
+        state.route_retry_identity = identity
+        state.route_retry_timer = None
+        state.route_retry_context = {
+            "plane": dict(plane), "location_revision": location_revision,
+            "tracking_revision": tracking_revision,
+        }
+
+    def dispatch() -> None:
+        with state.lock:
+            if generation != state.route_retry_generation:
+                return
+            state.route_retry_timer = None
+            relevant = (
+                state.location_revision == location_revision
+                and str(state.payload.get("aircraft_id") or "") == identity
+            )
+            observed_at = state.position_observed_at_monotonic
+        if not relevant or (lease is not None and not lease.active()):
+            if state.route_failure_log is not None:
+                state.route_failure_log.record_event(plane, "retry_cancelled_obsolete", {
+                    "reason": "selection_changed_or_no_active_viewer",
+                })
+            with state.lock:
+                if generation == state.route_retry_generation:
+                    state.route_retry_identity = ""
+                    state.route_retry_context = None
+            return
+        can_lookup = (
+            routes.can_lookup(plane) if hasattr(routes, "can_lookup")
+            else not hasattr(routes, "callsign") or bool(routes.callsign(plane))
+        )
+        if not can_lookup:
+            with state.lock:
+                if generation == state.route_retry_generation:
+                    state.route_retry_identity = ""
+                    state.route_retry_context = None
+                    state.payload["route_resolution_status"] = "unavailable"
+            return
+        if tracker and int(tracker.snapshot().get("revision") or 0) != tracking_revision:
+            with state.lock:
+                if generation == state.route_retry_generation:
+                    state.route_retry_identity = ""
+                    state.route_retry_context = None
+            return
+        with state.lock:
+            schedule_again = state.route_retry_busy or state.route_retry_inflight
+        if schedule_again:
+            schedule_route_retry(
+                state, routes, plane, 1.0, location_revision,
+                tracking_revision, tracker, lease, flags,
+            )
+            return
+        if observed_at is None or time.monotonic() - observed_at > POSITION_FRESHNESS_SECONDS:
+            if state.route_failure_log is not None:
+                state.route_failure_log.record_event(plane, "retry_cancelled_obsolete", {
+                    "reason": "aircraft_position_expired",
+                })
+            with state.lock:
+                if generation == state.route_retry_generation:
+                    state.route_retry_identity = ""
+                    state.route_retry_context = None
+            return
+        retry_status = routes.retry_status(plane)
+        if not retry_status["eligible"]:
+            if not retry_status.get("provider_available", True):
+                with state.lock:
+                    if generation == state.route_retry_generation:
+                        state.route_retry_identity = ""
+                        state.route_retry_context = None
+                        state.payload["route_resolution_status"] = "unavailable"
+                return
+            with state.lock:
+                if generation == state.route_retry_generation:
+                    state.route_retry_busy = False
+            logger = state.route_failure_log
+            if logger is not None:
+                now_mono = time.monotonic()
+                with state.lock:
+                    previous = state.route_retry_last_event.get(identity, 0.0)
+                    should_log = now_mono - previous >= 30.0
+                    if should_log:
+                        state.route_retry_last_event[identity] = now_mono
+                if should_log:
+                    logger.record_event(plane, "retry_deferred_cooldown", {
+                        "retry_in_seconds": retry_status["retry_in_seconds"],
+                        "retry_eligible_at": retry_status["retry_at_epoch"],
+                        "failure_count": retry_status["failure_count"],
+                    })
+            schedule_route_retry(
+                state, routes, plane, max(1.0, retry_status["retry_in_seconds"]),
+                location_revision, tracking_revision, tracker, lease, flags,
+            )
+            return
+        if not _enrichment_slots.acquire(blocking=False):
+            with state.lock:
+                if generation == state.route_retry_generation:
+                    state.route_retry_busy = False
+            logger = state.route_failure_log
+            if logger is not None:
+                now_mono = time.monotonic()
+                with state.lock:
+                    previous = state.route_retry_last_event.get(identity, 0.0)
+                    should_log = now_mono - previous >= 30.0
+                    if should_log:
+                        state.route_retry_last_event[identity] = now_mono
+                if should_log:
+                    logger.record_event(plane, "worker_saturated", {"queued": True})
+            schedule_route_retry(
+                state, routes, plane, 1.0, location_revision,
+                tracking_revision, tracker, lease, flags,
+            )
+            return
+        if not retry_context_current():
+            _enrichment_slots.release()
+            return
+        with state.lock:
+            if generation != state.route_retry_generation or state.route_retry_busy or state.route_retry_inflight:
+                _enrichment_slots.release()
+                schedule_again = True
+            else:
+                schedule_again = False
+                state.route_retry_busy = True
+                state.payload["route_resolution_status"] = "pending"
+        logger = state.route_failure_log
+        if logger is not None:
+            logger.record_event(plane, "retry_started", {
+                "retry_at_epoch": retry_status.get("retry_at_epoch"),
+                "failure_count": retry_status.get("failure_count"),
+            })
+        if schedule_again:
+            schedule_route_retry(
+                state, routes, plane, 1.0, location_revision,
+                tracking_revision, tracker, lease, flags,
+            )
+            return
+
+        def resolve() -> None:
+            route: dict[str, Any] = {}
+            try:
+                # FlightRouteStore.get() serializes each lookup identity and
+                # coalesces repeat calls through its cache/backoff state.
+                route = routes.get(plane) or {}
+                debug = routes._current_lookup_debug()
+                logger = state.route_failure_log
+                if logger is not None:
+                    logger.observe(plane, route, debug)
+                    logger.record_event(plane, "background_lookup_completed", {
+                        "resolved": bool(route),
+                        "requested_provider_calls": int(getattr(routes._lookup_local, "provider_requests", 0)),
+                        "decision": debug.get("decision", ""),
+                        "attempts": debug.get("attempts", []),
+                        "diagnostic_attempts": debug.get("diagnostic_attempts", []),
+                    })
+                with state.lock:
+                    current = (
+                        generation == state.route_retry_generation
+                        and state.location_revision == location_revision
+                        and str(state.payload.get("aircraft_id") or "") == identity
+                        and state.position_observed_at_monotonic is not None
+                        and time.monotonic() - state.position_observed_at_monotonic <= POSITION_FRESHNESS_SECONDS
+                        and (lease is None or lease.active())
+                        and (not tracker or int(tracker.snapshot().get("revision") or 0) == tracking_revision)
+                    )
+                    if current:
+                        if route:
+                            for key in (
+                                "route", "route_source", "commercial_flight", "origin", "destination",
+                                "origin_name", "destination_name", "origin_country", "destination_country",
+                                "origin_latitude", "origin_longitude", "destination_latitude", "destination_longitude",
+                            ):
+                                state.payload[key] = route.get(key, "")
+                            state.payload["route_resolution_status"] = "resolved"
+                            state.payload.pop("route_retry_in_seconds", None)
+                            state.payload["route_retry_at"] = None
+                        else:
+                            state.payload["route_resolution_status"] = "unresolved"
+                            state.payload["route_retry_in_seconds"] = routes.retry_status(plane)["retry_in_seconds"]
+                            state.payload["route_retry_at"] = routes.retry_status(plane)["retry_at_epoch"]
+                    elif generation == state.route_retry_generation:
+                        state.route_retry_identity = ""
+                        state.route_retry_context = None
+                if current and route and flags is not None:
+                    origin_flag = flags.get(route.get("origin_country", ""))
+                    destination_flag = flags.get(route.get("destination_country", ""))
+                    with state.lock:
+                        if generation == state.route_retry_generation and state.payload.get("aircraft_id") == identity:
+                            state.origin_flag = origin_flag or b""
+                            state.destination_flag = destination_flag or b""
+                            state.payload["origin_flag_available"] = bool(origin_flag)
+                            state.payload["destination_flag_available"] = bool(destination_flag)
+                if current and not route:
+                    retry_status = routes.retry_status(plane)
+                    if retry_status.get("provider_available", True):
+                        schedule_route_retry(
+                            state, routes, plane, max(1.0, retry_status["retry_in_seconds"]),
+                            location_revision, tracking_revision, tracker, lease, flags,
+                        )
+                    else:
+                        with state.lock:
+                            if generation == state.route_retry_generation:
+                                state.route_retry_identity = ""
+                                state.route_retry_context = None
+                                state.payload["route_resolution_status"] = "unavailable"
+                elif current:
+                    with state.lock:
+                        if generation == state.route_retry_generation:
+                            state.route_retry_identity = ""
+                            state.route_retry_context = None
+            except Exception:
+                with state.lock:
+                    if state.payload.get("aircraft_id") == identity:
+                        state.payload["route_resolution_status"] = "unresolved"
+            finally:
+                _enrichment_slots.release()
+                with state.lock:
+                    state.route_retry_busy = False
+                    if generation == state.route_retry_generation:
+                        state.route_retry_future = None
+
+        try:
+            future = _enrichment_executor.submit(resolve)
+            with state.lock:
+                state.route_retry_future = future
+        except RuntimeError:
+            _enrichment_slots.release()
+            with state.lock:
+                state.route_retry_busy = False
+            schedule_route_retry(
+                state, routes, plane, 1.0, location_revision,
+                tracking_revision, tracker, lease, flags,
+            )
+
+    timer = threading.Timer(max(0.1, float(delay_seconds)), dispatch)
+    timer.daemon = True
+    with state.lock:
+        if generation != state.route_retry_generation:
+            return
+        state.route_retry_timer = timer
+    timer.start()
+
+
 VISITOR_SESSION_TTL_SECONDS = 30 * 60
 VISITOR_SNAPSHOT_RETENTION_SECONDS = VISITOR_SESSION_TTL_SECONDS
 SNAPSHOT_RECONCILE_INTERVAL_SECONDS = 60.0
@@ -6215,6 +6871,7 @@ class VisitorSession:
         self.state = FrameState()
         self.tracker = FlightTrackingState(self.settings.radius_nm)
         self.lease = ActiveMonitorLease()
+        self.state.active_lease = self.lease
         self.active_lease_revision = 0
         self.last_access_at = time.monotonic()
         self.cookie_issued_at = self.last_access_at
